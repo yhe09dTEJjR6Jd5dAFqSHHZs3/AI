@@ -4,7 +4,7 @@
 
 在一切开始前，只有main.py。
 
-运行过程中需要用到的所有文件，均存放于main.py所在的文件夹内（类似Mozilla Firefox Portable Edition）。
+所有文件均存放于main.py所在的文件夹内（类似Mozilla Firefox Portable Edition）。
 
 控制面板配色：红、橙、黄、绿、青、蓝、紫、黑、白、灰。
 
