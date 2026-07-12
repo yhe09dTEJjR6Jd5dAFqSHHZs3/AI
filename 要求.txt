@@ -4,19 +4,14 @@
 
 在一切开始前，只有一个.py文件。
 
-运行AnyGameAI.exe所需的所有文件均位于AnyGameAI文件夹内。
-
-AnyGameAI文件夹需要具备可移植性，类似Mozilla Firefox Portable Edition。
-
-控制面板配色：红、橙、黄、绿、青、蓝、紫、黑、白、灰。
-
 用户只会做这些事情：
 ①运行.py文件；
-②点击“浏览”按钮，选择AnyGameAI文件夹位置；
-③点击“安装”按钮，开始安装；
-④安装成功后，点击“确认”按钮；
+②看到窗口A；
+③点击“浏览”按钮，选择AnyGameAI文件夹位置（AnyGameAI文件夹需要具备可移植性，类似Mozilla Firefox Portable Edition）；
+④点击“安装”按钮，开始安装；
+安装成功后，点击“确认”按钮；
 
-①运行AnyGameAI.exe文件；
+①运行AnyGameAI.exe文件（运行AnyGameAI.exe所需的所有文件均位于AnyGameAI文件夹内）；
 ②看到控制面板（配色：红、橙、黄、绿、青、蓝、紫、黑、白、灰）；
 ③新建、编辑、删除、选择游戏名称；
 ④点击“选择窗口”按钮，选择窗口（一般是雷电模拟器的窗口，也可以是其他窗口）；
