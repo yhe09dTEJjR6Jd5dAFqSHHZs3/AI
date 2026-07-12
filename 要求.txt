@@ -1,6 +1,6 @@
 实现通用游戏AI。
 
-提供install.exe和代码压缩包。
+初始状态下，仅提供install.exe和代码压缩包。
 
 用户只做：
 ①运行install.exe→屏幕上出现安装窗口；
