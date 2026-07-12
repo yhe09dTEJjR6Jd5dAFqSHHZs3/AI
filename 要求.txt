@@ -1,6 +1,6 @@
 实现通用游戏AI。
 
-初始状态下，只有：一台已经安装好Python的Windows 11电脑、main.py（main.py中不能有任何注释或解释性文本）。
+初始状态下，只有：一台已经安装好Python的Windows 11电脑、install.py（install.py中不能有任何注释或解释性文本）。
 
 用户只做：
 ①运行main.py→屏幕上出现控制面板；
