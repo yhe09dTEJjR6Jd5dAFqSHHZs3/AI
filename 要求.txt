@@ -6,10 +6,10 @@
 
 用户只会做这些事情：
 ①运行.py文件；
-②看到安装窗口；
-③点击“浏览”按钮，选择AnyGameAI文件夹位置（AnyGameAI文件夹需具备可移植性，类似Mozilla Firefox Portable Edition）；
+②屏幕上出现安装窗口；
+③点击“浏览”按钮，选择安装位置（需具备可移植性，类似Mozilla Firefox Portable Edition）；
 ④点击“安装”按钮，开始安装；
-⑤安装成功后，点击“确认”按钮；
+⑤安装成功后，点击“确认”按钮，关闭安装窗口；
 
 ①运行AnyGameAI.exe文件（运行AnyGameAI.exe所需的所有文件均位于AnyGameAI文件夹内）；
 ②看到控制面板（配色：红、橙、黄、绿、青、蓝、紫、黑、白、灰）；
