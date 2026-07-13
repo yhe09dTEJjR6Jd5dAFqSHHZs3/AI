@@ -1,4 +1,4 @@
-初始状态下，只有：一台已经安装好Python的Windows 11电脑、main.py。
+初始状态下，只有：main.py。
 
 实现通用游戏AI。
 
