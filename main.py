@@ -1,4 +1,5 @@
 import os
+import ast
 import sys
 import json
 import time
@@ -14,6 +15,9 @@ import statistics
 import sqlite3
 import zlib
 import base64
+import io
+import tokenize
+import tempfile
 from pathlib import Path
 from collections import deque,Counter,defaultdict
 import tkinter as tk
@@ -41,6 +45,18 @@ MAX_PROTOTYPES=320
 SUPPORTED_BUTTONS={"left","right","middle"}
 SUPPORTED_KINDS={"no_op","click","double_click","long_press","drag","scroll_v","scroll_h","move","hover"}
 REPEAT_POLICIES={"one_shot","repeatable","hold_until_change","rate_limited"}
+MODE_IDLE="IDLE"
+MODE_STARTING="STARTING"
+MODE_RUNNING="RUNNING"
+MODE_STOPPING="STOPPING"
+MODE_STATES={MODE_IDLE,MODE_STARTING,MODE_RUNNING,MODE_STOPPING}
+ASK_CANVAS_W=672
+ASK_CANVAS_H=378
+ASK_PREVIEW_W=640
+ASK_PREVIEW_H=360
+ASK_PREVIEW_X=16
+ASK_PREVIEW_Y=9
+CAPTURE_RETRY_DELAYS=(2.0,10.0,60.0)
 class POINT(ctypes.Structure):
     _fields_=[("x",wintypes.LONG),("y",wintypes.LONG)]
 class RECT(ctypes.Structure):
@@ -89,6 +105,158 @@ class CaptureUnavailable(RuntimeError):
     pass
 class InputStopped(RuntimeError):
     pass
+class ModeResult:
+    def __init__(self,status,summary,details=None):
+        value=str(status)
+        if value not in {"completed","stopped","failed"}:
+            raise ValueError("模式结果状态无效")
+        self.status=value
+        self.summary=str(summary)
+        self.details=dict(details) if isinstance(details,dict) else {}
+class ModeLifecycle:
+    def __init__(self):
+        self.lock=threading.RLock()
+        self.state=MODE_IDLE
+        self.name=None
+        self.stop_event=None
+        self.requested_status="stopped"
+        self.reason=""
+    def begin(self,name):
+        with self.lock:
+            if self.state!=MODE_IDLE:
+                raise RuntimeError("当前已有操作正在运行，请先停止")
+            self.state=MODE_STARTING
+            self.name=str(name)
+            self.stop_event=threading.Event()
+            self.requested_status="completed"
+            self.reason=""
+            return self.stop_event
+    def mark_running(self):
+        with self.lock:
+            if self.state==MODE_STARTING:
+                self.state=MODE_RUNNING
+            return self.state
+    def request_stop(self,status="stopped",reason=""):
+        with self.lock:
+            if self.state==MODE_IDLE:
+                return False
+            if status in {"completed","stopped","failed"}:
+                if status=="failed" or self.requested_status!="failed":
+                    self.requested_status=status
+            if reason:
+                self.reason=str(reason)
+            self.state=MODE_STOPPING
+            if self.stop_event is not None:
+                self.stop_event.set()
+            return True
+    def mark_stopping(self,status=None,reason=""):
+        return self.request_stop(status or self.requested_status,reason)
+    def finish(self):
+        with self.lock:
+            self.state=MODE_IDLE
+            self.name=None
+            self.stop_event=None
+            self.requested_status="stopped"
+            self.reason=""
+    def snapshot(self):
+        with self.lock:
+            return self.state,self.name,self.stop_event,self.requested_status,self.reason
+class StrictInputIsolation:
+    def __init__(self,stop_event):
+        self.stop_event=stop_event
+        self.lock=threading.Lock()
+        self.kind=""
+        self.stamp=0.0
+    def signal(self,kind,stamp=None):
+        with self.lock:
+            if not self.kind:
+                self.kind=str(kind)
+                self.stamp=float(time.time() if stamp is None else stamp)
+            if self.stop_event is not None:
+                self.stop_event.set()
+    def tripped(self):
+        with self.lock:
+            return bool(self.kind)
+    def can_automate(self):
+        return not self.tripped() and self.stop_event is not None and not self.stop_event.is_set()
+class PreviewCoordinateMapper:
+    canvas_width=ASK_CANVAS_W
+    canvas_height=ASK_CANVAS_H
+    preview_width=ASK_PREVIEW_W
+    preview_height=ASK_PREVIEW_H
+    offset_x=ASK_PREVIEW_X
+    offset_y=ASK_PREVIEW_Y
+    @classmethod
+    def to_normalized(cls,x,y):
+        px=float(x)
+        py=float(y)
+        if px<cls.offset_x or py<cls.offset_y or px>cls.offset_x+cls.preview_width-1 or py>cls.offset_y+cls.preview_height-1:
+            return None
+        return [(px-cls.offset_x)/max(1,cls.preview_width-1),(py-cls.offset_y)/max(1,cls.preview_height-1)]
+    @classmethod
+    def to_canvas(cls,point):
+        return [cls.offset_x+max(0.0,min(1.0,float(point[0])))*(cls.preview_width-1),cls.offset_y+max(0.0,min(1.0,float(point[1])))*(cls.preview_height-1)]
+class ResourceShutdownBarrier:
+    def __init__(self,label,timeout=4.0):
+        self.label=str(label)
+        self.timeout=max(0.5,float(timeout))
+        self.entries=[]
+        self.deadline=None
+        self.forced=[]
+        self.errors=[]
+        self.lock=threading.RLock()
+    def add(self,name,stopper,alive,forcer=None):
+        with self.lock:
+            self.entries.append({"name":str(name),"stop":stopper,"alive":alive,"force":forcer})
+    def request_stop(self):
+        with self.lock:
+            if self.deadline is None:
+                self.deadline=time.monotonic()+self.timeout
+            entries=list(self.entries)
+        for entry in entries:
+            try:
+                entry["stop"](0.0)
+            except Exception as error:
+                self.errors.append(entry["name"]+"："+str(error))
+    def poll(self):
+        self.request_stop()
+        now=time.monotonic()
+        with self.lock:
+            entries=list(self.entries)
+        remaining=[]
+        for entry in entries:
+            alive=True
+            try:
+                alive=bool(entry["alive"]())
+            except Exception as error:
+                self.errors.append(entry["name"]+"状态："+str(error))
+            if alive:
+                try:
+                    entry["stop"](0.0)
+                except Exception as error:
+                    self.errors.append(entry["name"]+"停止："+str(error))
+                try:
+                    alive=bool(entry["alive"]())
+                except Exception:
+                    alive=True
+            if alive and self.deadline is not None and now>=self.deadline and entry.get("force") is not None:
+                try:
+                    entry["force"]()
+                    self.forced.append(entry["name"])
+                except Exception as error:
+                    self.errors.append(entry["name"]+"强制停止："+str(error))
+                try:
+                    alive=bool(entry["alive"]())
+                except Exception:
+                    alive=True
+            if alive:
+                remaining.append(entry)
+        with self.lock:
+            self.entries=remaining
+        return not remaining
+    def pending_names(self):
+        with self.lock:
+            return [entry["name"] for entry in self.entries]
 def finite_number(value):
     try:
         return math.isfinite(float(value))
@@ -143,6 +311,26 @@ def verify_checksum(data):
     item=dict(data)
     item.pop("checksum",None)
     return hashlib.sha256(canonical_bytes(item)).hexdigest()==expected
+def binomial_error_upper(errors,total,confidence=0.95):
+    n=max(0,int(total))
+    k=max(0,min(n,int(errors)))
+    if n<1:
+        return 1.0
+    if k==0:
+        return 1.0-(1.0-float(confidence))**(1.0/n)
+    z=1.6448536269514722 if confidence<=0.95 else 1.959963984540054
+    phat=k/n
+    denominator=1.0+z*z/n
+    center=(phat+z*z/(2.0*n))/denominator
+    radius=z*math.sqrt(phat*(1.0-phat)/n+z*z/(4.0*n*n))/denominator
+    return min(1.0,center+radius)
+def checksum_set(samples):
+    return {str(item.get("checksum","")) for item in samples if str(item.get("checksum",""))}
+def assert_disjoint_checksums(train,holdout):
+    overlap=checksum_set(train)&checksum_set(holdout)
+    if overlap:
+        raise RuntimeError("训练集与留出集checksum发生重叠："+str(len(overlap)))
+    return True
 def quantile(values,q):
     if not values:
         return 0.0
@@ -553,22 +741,27 @@ class CaptureProcessWorker:
             if ok:
                 return value
             raise CaptureUnavailable(str(value))
-    def terminate(self):
+    def terminate(self,timeout=0.2):
         self.retired=True
+        wait=max(0.0,float(timeout))
         try:
             if self.process.is_alive():
                 self.process.terminate()
-                self.process.join(1.0)
+                if wait>0:
+                    self.process.join(wait)
             if self.process.is_alive() and hasattr(self.process,"kill"):
                 self.process.kill()
-                self.process.join(1.0)
+                if wait>0:
+                    self.process.join(wait)
         except Exception:
             pass
-        try:
-            self.connection.close()
-        except Exception:
-            pass
-        return not self.process.is_alive()
+        stopped=not self.process.is_alive()
+        if stopped:
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+        return stopped
     def stop(self,timeout=1.0):
         with self.lock:
             if not self.retired:
@@ -577,17 +770,19 @@ class CaptureProcessWorker:
                 except Exception:
                     pass
             self.retired=True
-            try:
-                self.process.join(max(0.0,float(timeout)))
-            except Exception:
-                pass
-            if self.process.is_alive():
-                return self.terminate()
-            try:
-                self.connection.close()
-            except Exception:
-                pass
-            return True
+            wait=max(0.0,float(timeout))
+            if wait>0:
+                try:
+                    self.process.join(wait)
+                except Exception:
+                    pass
+            stopped=not self.process.is_alive()
+            if stopped:
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
+            return stopped
 class WindowsGraphicsCapture:
     def __init__(self,bridge):
         self.bridge=bridge
@@ -1142,43 +1337,124 @@ class WinBridge:
                 self.gdi32.DeleteObject(bitmap)
             if memory:
                 self.gdi32.DeleteDC(memory)
-    def _isolated_capture(self,key,command,timeout=0.55):
-        backend_key=(safe_int(key[0],0),str(key[1]))
+    def _capture_identity_key(self,target):
+        item={"hwnd":safe_int(target.get("hwnd",0),0),"pid":safe_int(target.get("pid",0),0),"class":str(target.get("class","")),"thread":safe_int(target.get("window_thread_id",0),0),"path":os.path.normcase(str(target.get("process_path",""))),"created":safe_int(target.get("process_created",0),0)}
+        return hashlib.sha256(canonical_bytes(item)).hexdigest()
+    def _circuit_allows(self,key):
         with self.capture_task_lock:
-            disabled=self.capture_disabled.get(backend_key)
-            if disabled:
-                raise CaptureUnavailable(str(key[1])+"采集后端已禁用："+str(disabled))
+            state=self.capture_disabled.get(tuple(key))
+        if not state:
+            return True,""
+        remaining=float(state.get("next_probe",0.0))-time.monotonic()
+        if remaining<=0:
+            return True,"冷却结束，允许探测"
+        return False,str(state.get("reason","超时"))+"，约"+str(round(remaining,1))+"秒后重试"
+    def _record_backend_timeout(self,key,reason):
+        with self.capture_task_lock:
+            previous=dict(self.capture_disabled.get(tuple(key),{}))
+            failures=safe_int(previous.get("failures",0),0)+1
+            delay=0.0 if failures<2 else CAPTURE_RETRY_DELAYS[min(len(CAPTURE_RETRY_DELAYS)-1,failures-2)]
+            state={"failures":failures,"next_probe":time.monotonic()+delay,"reason":str(reason),"updated":time.time()}
+            self.capture_disabled[tuple(key)]=state
+            return dict(state)
+    def _record_backend_success(self,key):
+        with self.capture_task_lock:
+            self.capture_disabled.pop(tuple(key),None)
+    def reset_capture_backends(self,target=None):
+        identity=self._capture_identity_key(target) if isinstance(target,dict) else None
+        with self.capture_task_lock:
+            keys=[key for key in self.capture_disabled if identity is None or key[0]==identity]
+            for key in keys:
+                self.capture_disabled.pop(key,None)
+            worker_items=[(key,worker) for key,worker in self.capture_processes.items() if identity is None or key[0]==identity]
+        for key,worker in worker_items:
+            try:
+                stopped=worker.terminate(0.05)
+            except Exception:
+                stopped=False
+            if stopped:
+                with self.capture_task_lock:
+                    if self.capture_processes.get(key) is worker:
+                        self.capture_processes.pop(key,None)
+        return len(keys)
+    def stop_capture_processes(self,timeout=0.0,force=False):
+        with self.capture_task_lock:
+            items=list(self.capture_processes.items())
+        alive=[]
+        for key,worker in items:
+            try:
+                stopped=worker.terminate(timeout) if force else worker.stop(timeout)
+            except Exception:
+                stopped=False
+            if stopped:
+                with self.capture_task_lock:
+                    if self.capture_processes.get(key) is worker:
+                        self.capture_processes.pop(key,None)
+            else:
+                alive.append(str(key[1]))
+        return alive
+    def live_capture_processes(self):
+        with self.capture_task_lock:
+            return [str(key[1]) for key,worker in self.capture_processes.items() if worker.process.is_alive()]
+    def _isolated_capture(self,key,command,timeout=0.55):
+        backend_key=(str(key[0]),str(key[1]))
+        allowed,reason=self._circuit_allows(backend_key)
+        if not allowed:
+            raise CaptureUnavailable(str(key[1])+"采集后端冷却中："+reason)
+        with self.capture_task_lock:
             worker=self.capture_processes.get(backend_key)
-            if worker is None or worker.retired or not worker.process.is_alive():
-                if worker is not None:
-                    worker.stop(0.2)
-                worker=CaptureProcessWorker(self,backend_key)
-                self.capture_processes[backend_key]=worker
+        if worker is not None and (worker.retired or not worker.process.is_alive()):
+            if worker.process.is_alive():
+                worker.terminate(0.05)
+            if worker.process.is_alive():
+                raise CaptureUnavailable(str(key[1])+"旧采集进程正在退出，请稍后重试")
+            with self.capture_task_lock:
+                if self.capture_processes.get(backend_key) is worker:
+                    self.capture_processes.pop(backend_key,None)
+            worker=None
+        if worker is None:
+            created=CaptureProcessWorker(self,backend_key)
+            with self.capture_task_lock:
+                current=self.capture_processes.get(backend_key)
+                if current is None:
+                    self.capture_processes[backend_key]=created
+                    worker=created
+                else:
+                    worker=current
+            if worker is not created:
+                created.terminate(0.05)
         try:
-            return worker.request(command,timeout)
+            value=worker.request(command,timeout)
+            self._record_backend_success(backend_key)
+            return value
         except CaptureUnavailable as error:
             if worker.timed_out:
-                reason="该采集后端已因超时禁用"
-                with self.capture_task_lock:
-                    self.capture_disabled[backend_key]=reason
-                    if self.capture_processes.get(backend_key) is worker:
-                        self.capture_processes.pop(backend_key,None)
-                self.capture_reports[backend_key[0]]=str(key[1])+"："+reason+"；将改用剩余已验证后端"
-            elif worker.retired:
+                state=self._record_backend_timeout(backend_key,str(error))
+                if not worker.process.is_alive():
+                    with self.capture_task_lock:
+                        if self.capture_processes.get(backend_key) is worker:
+                            self.capture_processes.pop(backend_key,None)
+                self.capture_reports[safe_int(command.get("hwnd",0),0)]=str(key[1])+"超时第"+str(state["failures"])+"次；"+("进入冷却" if state.get("next_probe",0)>time.monotonic() else "下次允许立即重试")
+            elif worker.retired and not worker.process.is_alive():
                 with self.capture_task_lock:
                     if self.capture_processes.get(backend_key) is worker:
                         self.capture_processes.pop(backend_key,None)
             raise error
     def abort_capture_processes(self):
         with self.capture_task_lock:
-            workers=list(self.capture_processes.values())
-            self.capture_processes.clear()
-        for worker in workers:
+            items=list(self.capture_processes.items())
+        stopped=True
+        for key,worker in items:
             try:
-                worker.terminate()
+                done=worker.terminate(0.2)
             except Exception:
-                pass
-        return not any(worker.process.is_alive() for worker in workers)
+                done=False
+            stopped=done and stopped
+            if done:
+                with self.capture_task_lock:
+                    if self.capture_processes.get(key) is worker:
+                        self.capture_processes.pop(key,None)
+        return stopped and not self.live_capture_processes()
     def valid(self,hwnd):
         return bool(hwnd and self.user32.IsWindow(wintypes.HWND(hwnd)))
     def class_name(self,hwnd):
@@ -1283,7 +1559,7 @@ class WinBridge:
             return False
         result=bool(self.user32.SetForegroundWindow(wintypes.HWND(hwnd)))
         return result and self.foreground_hwnd()==int(hwnd)
-    def validate_target(self,target,require_foreground=True):
+    def validate_target_identity(self,target,require_foreground=True):
         if not isinstance(target,dict):
             raise TargetUnavailable("目标窗口身份信息无效")
         hwnd=safe_int(target.get("hwnd",0),0)
@@ -1310,13 +1586,6 @@ class WinBridge:
             raise TargetUnavailable("目标窗口已最小化")
         if require_foreground and self.foreground_hwnd()!=hwnd:
             raise TargetUnavailable("目标窗口失去焦点，等待恢复")
-        rect=self.client_rect(hwnd)
-        expected_size=target.get("client_size")
-        if isinstance(expected_size,(list,tuple)) and len(expected_size)>=2 and [int(rect[2]),int(rect[3])]!=[safe_int(expected_size[0],-1),safe_int(expected_size[1],-1)]:
-            raise TargetUnavailable("目标窗口客户区尺寸已变化，请重新选择窗口")
-        expected_dpi=target.get("selected_dpi",target.get("dpi"))
-        if expected_dpi is not None and self.dpi_for_window(hwnd)!=safe_int(expected_dpi,-1):
-            raise TargetUnavailable("目标窗口DPI已变化，请重新选择窗口")
         rule=target.get("title_rule")
         if isinstance(rule,dict):
             mode=str(rule.get("mode",""))
@@ -1328,6 +1597,15 @@ class WinBridge:
                 raise TargetUnavailable("目标窗口标题不再符合包含规则")
             if mode=="prefix" and not title.startswith(value):
                 raise TargetUnavailable("目标窗口标题不再符合前缀规则")
+        return self.client_rect(hwnd),self.dpi_for_window(hwnd)
+    def validate_target(self,target,require_foreground=True):
+        rect,dpi=self.validate_target_identity(target,require_foreground)
+        expected_size=target.get("client_size")
+        if isinstance(expected_size,(list,tuple)) and len(expected_size)>=2 and [int(rect[2]),int(rect[3])]!=[safe_int(expected_size[0],-1),safe_int(expected_size[1],-1)]:
+            raise TargetUnavailable("目标窗口客户区尺寸或DPI已变化，正在暂停并自动重新校准")
+        expected_dpi=target.get("selected_dpi",target.get("dpi"))
+        if expected_dpi is not None and int(dpi)!=safe_int(expected_dpi,-1):
+            raise TargetUnavailable("目标窗口客户区尺寸或DPI已变化，正在暂停并自动重新校准")
         return rect
     def cursor(self):
         point=POINT()
@@ -1393,18 +1671,31 @@ class WinBridge:
         except Exception:
             source=b""
         if not source or len(source)%3:
-            return {"mean":0.0,"std":0.0,"spread":0,"black":True,"black_frame":True,"solid":True,"flat_frame":True,"low_information":False,"valid":False,"protected_or_black":True}
-        gray=[(source[index]*77+source[index+1]*150+source[index+2]*29)>>8 for index in range(0,len(source),3)]
-        mean=sum(gray)/len(gray)
-        variance=sum((value-mean)*(value-mean) for value in gray)/len(gray)
-        std=math.sqrt(variance)
-        minimum=min(gray)
-        maximum=max(gray)
+            return {"mean":0.0,"std":0.0,"spread":0,"black":True,"black_frame":True,"solid":True,"flat_frame":True,"low_information":False,"valid":False,"protected_or_black":True,"histogram":[0]*16}
+        count=0
+        mean=0.0
+        m2=0.0
+        minimum=255
+        maximum=0
+        histogram=[0]*16
+        for index in range(0,len(source),3):
+            value=(source[index]*77+source[index+1]*150+source[index+2]*29)>>8
+            count+=1
+            delta=value-mean
+            mean+=delta/count
+            m2+=delta*(value-mean)
+            if value<minimum:
+                minimum=value
+            if value>maximum:
+                maximum=value
+            histogram[min(15,value>>4)]+=1
+        variance=m2/max(1,count)
+        std=math.sqrt(max(0.0,variance))
         spread=maximum-minimum
-        black=bool(maximum<12 or mean<3.0 or (mean<9.0 and spread<10 and std<3.0))
+        black=bool(maximum<12 or mean<3.0 or mean<9.0 and spread<10 and std<3.0)
         solid=bool(std<0.9 or spread<3)
         flat=bool(not black and solid)
-        return {"mean":mean,"std":std,"spread":spread,"black":black,"black_frame":black,"solid":solid,"flat_frame":flat,"low_information":flat,"valid":True,"protected_or_black":black}
+        return {"mean":mean,"std":std,"spread":spread,"black":black,"black_frame":black,"solid":solid,"flat_frame":flat,"low_information":flat,"valid":True,"protected_or_black":black,"histogram":histogram}
     def feature_from_rgb(self,rgb,previous_rgb=None):
         source=rgb_bytes(rgb)
         if source is None:
@@ -1495,12 +1786,21 @@ class WinBridge:
         validated_methods=set(str(value) for value in calibration.get("validated_backends",[]) if str(value))
         if validated_method:
             validated_methods.add(validated_method)
-        if validated_method and self.capture_disabled.get((hwnd,validated_method)):
-            alternatives=[name for name in validated_methods if name!=validated_method and not self.capture_disabled.get((hwnd,name))]
-            if alternatives:
-                validated_method=sorted(alternatives)[0]
-                calibration["validated_backend"]=validated_method
-                self.calibrations[hwnd]=calibration
+        identity_key=self._capture_identity_key(target)
+        if validated_method:
+            allowed,_=self._circuit_allows((identity_key,validated_method))
+            if not allowed:
+                alternatives=[]
+                for name in validated_methods:
+                    if name==validated_method:
+                        continue
+                    candidate_allowed,_=self._circuit_allows((identity_key,name))
+                    if candidate_allowed:
+                        alternatives.append(name)
+                if alternatives:
+                    validated_method=sorted(alternatives)[0]
+                    calibration["validated_backend"]=validated_method
+                    self.calibrations[hwnd]=calibration
         backend_names=["Windows Graphics Capture","PrintWindow客户区","窗口DC"]
         if not require_foreground_for_desktop or self.foreground_hwnd()==hwnd:
             backend_names.append("前台桌面裁剪")
@@ -1511,13 +1811,13 @@ class WinBridge:
         identity_valid=self.calibration_identity_matches(target,calibration,rect)
         need_comparison=bool(validation_mode)
         for priority,name in enumerate(backend_names):
-            disabled=self.capture_disabled.get((hwnd,name))
-            if disabled:
-                attempts.append(name+"已跳过："+str(disabled))
+            allowed,reason=self._circuit_allows((identity_key,name))
+            if not allowed:
+                attempts.append(name+"已跳过："+reason)
                 continue
             try:
                 command={"backend":name,"hwnd":hwnd,"rect":list(rect),"out_w":out_w,"out_h":out_h}
-                raw=self._isolated_capture((hwnd,name),command,0.55)
+                raw=self._isolated_capture((identity_key,name),command,0.55)
                 rgb=bytes(raw)
                 expected=int(out_w)*int(out_h)*3
                 if len(rgb)!=expected:
@@ -1616,13 +1916,14 @@ class WinBridge:
         invalid_frames=0
         while time.monotonic()<deadline:
             if stop_event is not None and stop_event.is_set():
-                raise RuntimeError("窗口采集验收已取消")
+                raise InputStopped("窗口采集验收已取消")
             self.validate_target(target,False)
             try:
                 captured=self.capture_gray(target,True,True,False)
             except CaptureUnavailable:
                 invalid_frames+=1
-                time.sleep(0.06)
+                if stop_event is not None and stop_event.wait(0.06):
+                    raise InputStopped("窗口采集验收已取消")
                 continue
             candidates=captured.get("validation_candidates")
             if not isinstance(candidates,list):
@@ -1646,7 +1947,9 @@ class WinBridge:
                 records[method].append({"feature":feature,"stamp":stamp,"quality":quality,"stale":bool(candidate.get("stale"))})
             if progress:
                 progress(min(1.0,1.0-max(0.0,deadline-time.monotonic())/actual_duration))
-            time.sleep(0.05)
+            if stop_event is not None and stop_event.wait(0.05):
+                raise InputStopped("窗口采集验收已取消")
+            time.sleep(0.0)
         minimum_nonblack=3 if actual_duration<1.2 else 4
         eligible={}
         for method,items in records.items():
@@ -1806,17 +2109,17 @@ def _capture_process_main(connection):
 class KeyboardMonitor:
     def __init__(self,bridge,on_escape=None,on_other=None):
         self.bridge=bridge
-        self.on_escape=on_escape
-        self.on_other=on_other
-        self.events=deque(maxlen=2000)
-        self.lock=threading.RLock()
-        self.held=set()
+        self.events=queue.Queue(maxsize=2048)
+        self.escape_event=threading.Event()
+        self.other_event=threading.Event()
         self.thread=None
         self.thread_id=0
         self.hook=None
         self.callback=None
         self.ready=threading.Event()
         self.error=None
+        self.escape_down=False
+        self.non_escape_active=False
         self.non_escape_count=0
     def start(self):
         self.thread=threading.Thread(target=self._run,name="UniversalGameAI-KeyboardHook",daemon=True)
@@ -1828,36 +2131,35 @@ class KeyboardMonitor:
         if not self.hook:
             raise RuntimeError("无法安装键盘监听器")
         return self
+    def _put(self,event):
+        try:
+            self.events.put_nowait(event)
+        except queue.Full:
+            pass
     def _run(self):
         try:
             self.thread_id=int(self.bridge.kernel32.GetCurrentThreadId())
             def callback(code,wparam,lparam):
                 if code>=0 and int(wparam) in {0x0100,0x0101,0x0104,0x0105}:
                     data=ctypes.cast(lparam,ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                    vk=int(data.vkCode)
+                    is_escape=int(data.vkCode)==0x1B
                     down=int(wparam) in {0x0100,0x0104}
-                    now=time.time()
-                    event={"vk":vk,"down":down,"time":now,"injected":bool(int(data.flags)&0x12)}
-                    first_down=False
-                    with self.lock:
+                    stamp=time.time()
+                    if is_escape:
+                        first=down and not self.escape_down
+                        self.escape_down=down
+                        if first:
+                            self.escape_event.set()
+                            self._put({"kind":"escape","down":True,"time":stamp})
+                    else:
                         if down:
-                            first_down=vk not in self.held
-                            self.held.add(vk)
-                        else:
-                            self.held.discard(vk)
-                        self.events.append(event)
-                        if first_down and vk!=0x1B:
+                            self.non_escape_active=True
                             self.non_escape_count+=1
-                    if first_down and vk==0x1B and self.on_escape:
-                        try:
-                            self.on_escape(event)
-                        except Exception:
-                            pass
-                    elif first_down and vk!=0x1B and self.on_other:
-                        try:
-                            self.on_other(event)
-                        except Exception:
-                            pass
+                            self.other_event.set()
+                            self._put({"kind":"other","down":True,"time":stamp})
+                        else:
+                            self.non_escape_active=False
+                            self._put({"kind":"other","down":False,"time":stamp})
                 return self.bridge.user32.CallNextHookEx(self.hook,code,wparam,lparam)
             self.callback=self.bridge.HOOKPROC(callback)
             module=self.bridge.kernel32.GetModuleHandleW(None)
@@ -1880,28 +2182,35 @@ class KeyboardMonitor:
                     pass
                 self.hook=None
     def drain(self):
-        with self.lock:
-            result=list(self.events)
-            self.events.clear()
+        result=[]
+        while True:
+            try:
+                result.append(self.events.get_nowait())
+            except queue.Empty:
+                break
+        if not any(item.get("kind")=="other" and item.get("down") for item in result):
+            self.other_event.clear()
+        if not any(item.get("kind")=="escape" for item in result):
+            self.escape_event.clear()
         return result
     def all_released(self):
-        with self.lock:
-            return not any(vk!=0x1B for vk in self.held)
+        return not self.non_escape_active
     def stop(self,timeout=1.0):
         if self.thread_id:
             try:
                 self.bridge.user32.PostThreadMessageW(self.thread_id,0x0012,0,0)
             except Exception:
                 pass
-        if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread():
+        if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread() and timeout>0:
             self.thread.join(max(0.0,float(timeout)))
         return not bool(self.thread and self.thread.is_alive())
+    def alive(self):
+        return bool(self.thread and self.thread.is_alive())
 class MouseMonitor:
     def __init__(self,bridge,on_input=None):
         self.bridge=bridge
-        self.on_input=on_input
-        self.events=deque(maxlen=6000)
-        self.lock=threading.Lock()
+        self.events=queue.Queue(maxsize=6000)
+        self.input_event=threading.Event()
         self.held=set()
         self.thread=None
         self.thread_id=0
@@ -1920,9 +2229,12 @@ class MouseMonitor:
             raise RuntimeError(self.error)
         if not self.hook:
             raise RuntimeError("无法安装鼠标监听器")
-    def _append(self,event):
-        with self.lock:
-            self.events.append(event)
+        return self
+    def _put(self,event):
+        try:
+            self.events.put_nowait(event)
+        except queue.Full:
+            pass
     def _run(self):
         try:
             self.thread_id=int(self.bridge.kernel32.GetCurrentThreadId())
@@ -1932,27 +2244,22 @@ class MouseMonitor:
                     data=ctypes.cast(lparam,ctypes.POINTER(MSLLHOOKSTRUCT)).contents
                     if int(data.flags)&0x00000003:
                         return self.bridge.user32.CallNextHookEx(self.hook,code,wparam,lparam)
-                    now=time.time()
+                    stamp=time.time()
                     kind=messages[int(wparam)]
-                    if kind!="move" or now-self.last_move>=0.018:
+                    if kind!="move" or stamp-self.last_move>=0.018:
                         if kind=="move":
-                            self.last_move=now
-                        event={"type":kind,"x":int(data.pt.x),"y":int(data.pt.y),"time":now}
+                            self.last_move=stamp
+                        event={"type":kind,"x":int(data.pt.x),"y":int(data.pt.y),"time":stamp}
                         if kind in {"wheel","hwheel"}:
                             raw=(int(data.mouseData)>>16)&0xffff
                             event["delta"]=raw-0x10000 if raw&0x8000 else raw
-                        with self.lock:
-                            if kind.endswith("_down"):
-                                self.held.add(kind.split("_",1)[0])
-                            elif kind.endswith("_up"):
-                                self.held.discard(kind.split("_",1)[0])
-                            self.last_input_time=now
-                            self.events.append(event)
-                        if self.on_input:
-                            try:
-                                self.on_input(event)
-                            except Exception:
-                                pass
+                        if kind.endswith("_down"):
+                            self.held.add(kind.split("_",1)[0])
+                        elif kind.endswith("_up"):
+                            self.held.discard(kind.split("_",1)[0])
+                        self.last_input_time=stamp
+                        self.input_event.set()
+                        self._put(event)
                 return self.bridge.user32.CallNextHookEx(self.hook,code,wparam,lparam)
             self.callback=self.bridge.HOOKPROC(callback)
             module=self.bridge.kernel32.GetModuleHandleW(None)
@@ -1975,32 +2282,36 @@ class MouseMonitor:
                     pass
                 self.hook=None
     def drain(self):
-        with self.lock:
-            result=list(self.events)
-            self.events.clear()
+        result=[]
+        while True:
+            try:
+                result.append(self.events.get_nowait())
+            except queue.Empty:
+                break
+        if self.events.empty():
+            self.input_event.clear()
         return result
     def all_released(self):
-        with self.lock:
-            return not self.held
+        return not self.held
     def stable_for(self,seconds):
-        with self.lock:
-            last=self.last_input_time
-            released=not self.held
-        return released and time.time()-last>=max(0.0,float(seconds))
+        return not self.held and time.time()-self.last_input_time>=max(0.0,float(seconds))
     def stop(self,timeout=1.0):
         if self.thread_id:
             try:
                 self.bridge.user32.PostThreadMessageW(self.thread_id,0x0012,0,0)
             except Exception:
                 pass
-        if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread():
+        if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread() and timeout>0:
             self.thread.join(max(0.0,float(timeout)))
         return not bool(self.thread and self.thread.is_alive())
+    def alive(self):
+        return bool(self.thread and self.thread.is_alive())
 class FrameBuffer:
-    def __init__(self,bridge,target,hz=20.0,seconds=2.0,motion_interval=0.1,purpose=None):
+    def __init__(self,bridge,target,hz=20.0,seconds=2.0,motion_interval=0.1,purpose=None,on_geometry=None):
         self.bridge=bridge
-        self.target=dict(target)
-        self.interval=1.0/max(5.0,float(hz))
+        self.target=target if isinstance(target,dict) else dict(target)
+        self.base_interval=1.0/max(5.0,float(hz))
+        self.interval=self.base_interval
         self.motion_interval=max(0.05,min(0.25,float(motion_interval)))
         self.purpose=str(purpose or "")
         self.need_preview=self.purpose=="teaching"
@@ -2016,6 +2327,10 @@ class FrameBuffer:
         self.thread=None
         self.last_error=""
         self.last_preview=None
+        self.on_geometry=on_geometry
+        self.pending_geometry=None
+        self.geometry_since=0.0
+        self.resume_confirmations=0
     def set_preview_active(self,active):
         if active:
             self.preview_active.set()
@@ -2027,6 +2342,48 @@ class FrameBuffer:
         self.thread=threading.Thread(target=self._run,name="UniversalGameAI-FrameBuffer",daemon=True)
         self.thread.start()
         return self
+    def _geometry_ready(self):
+        rect,dpi=self.bridge.validate_target_identity(self.target,False)
+        expected=self.target.get("client_size")
+        expected_dpi=self.target.get("selected_dpi",self.target.get("dpi"))
+        changed=bool(isinstance(expected,(list,tuple)) and len(expected)>=2 and [int(rect[2]),int(rect[3])]!=[safe_int(expected[0],-1),safe_int(expected[1],-1)] or expected_dpi is not None and int(dpi)!=safe_int(expected_dpi,-1))
+        if not changed:
+            self.pending_geometry=None
+            self.geometry_since=0.0
+            return True
+        self.bridge.block_input()
+        geometry=(int(rect[2]),int(rect[3]),int(dpi))
+        now=time.monotonic()
+        if geometry!=self.pending_geometry:
+            self.pending_geometry=geometry
+            self.geometry_since=now
+            with self.condition:
+                self.frames.clear()
+                self.sequence+=1
+                self.last_error="窗口尺寸或DPI变化，等待几何稳定后重新校准"
+                self.condition.notify_all()
+            return False
+        if now-self.geometry_since<0.75:
+            return False
+        self.target["selected_rect"]=list(rect)
+        self.target["client_size"]=[int(rect[2]),int(rect[3])]
+        self.target["selected_dpi"]=int(dpi)
+        self.target["dpi"]=int(dpi)
+        self.bridge.calibrations.pop(int(self.target["hwnd"]),None)
+        self.bridge.reset_capture_backends(self.target)
+        self.bridge.reset_frame_history(self.target.get("hwnd"))
+        calibration=self.bridge.calibrate(self.target,1.2,self.stop_event)
+        with self.condition:
+            self.frames.clear()
+            self.sequence+=1
+            self.last_error="窗口几何已稳定，重新校准完成，等待连续有效帧"
+            self.condition.notify_all()
+        self.resume_confirmations=max(3,int(calibration.get("confirm_frames",3)))
+        self.pending_geometry=None
+        self.geometry_since=0.0
+        if self.on_geometry:
+            self.on_geometry(self.target,calibration)
+        return False
     def _run(self):
         thread_id=threading.get_ident()
         next_time=time.monotonic()
@@ -2034,6 +2391,9 @@ class FrameBuffer:
         try:
             while not self.stop_event.is_set():
                 try:
+                    if not self._geometry_ready():
+                        self.stop_event.wait(0.05)
+                        continue
                     now=time.monotonic()
                     preview_due=bool(self.need_preview and self.preview_active.is_set() and now>=next_preview)
                     captured=self.bridge.capture_gray(self.target,True,False,preview_due)
@@ -2047,23 +2407,35 @@ class FrameBuffer:
                     gray=captured["gray"]
                     with self.lock:
                         previous=None
+                        previous_feature=None
                         for old_frame in reversed(self.frames):
+                            if previous_feature is None:
+                                previous_feature=old_frame.get("f")
                             if old_frame["time"]<=stamp-self.motion_interval:
                                 previous=old_frame["rgb"]
                                 break
                     feature=self.bridge.feature_from_rgb(rgb,previous)
+                    if previous_feature is not None:
+                        change=visual_distance(previous_feature,feature)
+                        noise=float(self.bridge.calibration_for(self.target).get("noise",4.0))
+                        self.interval=min(0.2,self.base_interval*2.5) if change<=max(1.0,noise*1.5) else self.base_interval
                     rect=self.bridge.validate_target(self.target,False)
                     preview_rgb=captured.get("preview_rgb")
                     preview_width=captured.get("preview_width",0)
                     preview_height=captured.get("preview_height",0)
                     if preview_rgb is None and self.last_preview is not None:
                         preview_rgb,preview_width,preview_height=self.last_preview
-                    frame={"time":stamp,"f":feature,"coarse":coarse_feature(feature),"gray":gray,"rgb":rgb,"preview_rgb":preview_rgb,"preview_width":preview_width,"preview_height":preview_height,"method":captured["method"],"quality":captured["quality"],"motion_valid":previous is not None,"rect":rect,"dpi":self.bridge.dpi_for_window(int(self.target["hwnd"])),"capture_valid":bool(captured.get("capture_valid")),"backend_validated":bool(captured.get("backend_validated")),"usable_for_learning":bool(captured.get("usable_for_learning")),"usable_for_training":bool(captured.get("usable_for_training")),"usable_for_teaching":bool(captured.get("usable_for_teaching")),"stale":bool(captured.get("stale")),"stable_frame":bool(captured.get("stable_frame")),"black_frame":bool(captured.get("black_frame")),"protected_or_black":bool(captured.get("protected_or_black")),"capture_frozen":bool(captured.get("capture_frozen")),"frozen_backend":bool(captured.get("frozen_backend")),"backend_changed":bool(captured.get("backend_changed"))}
+                    confirmed=self.resume_confirmations<=0
+                    if captured.get("capture_valid") and captured.get("backend_validated") and self.resume_confirmations>0:
+                        self.resume_confirmations-=1
+                    frame={"time":stamp,"f":feature,"coarse":coarse_feature(feature),"gray":gray,"rgb":rgb,"preview_rgb":preview_rgb,"preview_width":preview_width,"preview_height":preview_height,"method":captured["method"],"quality":captured["quality"],"motion_valid":previous is not None,"rect":rect,"dpi":self.bridge.dpi_for_window(int(self.target["hwnd"])),"capture_valid":bool(captured.get("capture_valid")),"backend_validated":bool(captured.get("backend_validated")),"usable_for_learning":bool(captured.get("usable_for_learning") and confirmed),"usable_for_training":bool(captured.get("usable_for_training") and confirmed),"usable_for_teaching":bool(captured.get("usable_for_teaching") and confirmed),"stale":bool(captured.get("stale")),"stable_frame":bool(captured.get("stable_frame")),"black_frame":bool(captured.get("black_frame")),"protected_or_black":bool(captured.get("protected_or_black")),"capture_frozen":bool(captured.get("capture_frozen")),"frozen_backend":bool(captured.get("frozen_backend")),"backend_changed":bool(captured.get("backend_changed"))}
                     with self.condition:
                         self.frames.append(frame)
                         self.sequence+=1
-                        self.last_error="" if frame.get("usable_for_"+self.purpose,frame["capture_valid"]) else "画面无效、黑屏、冻结、受保护或后端未验收"
+                        self.last_error="" if frame.get("usable_for_"+self.purpose,frame["capture_valid"]) else "画面无效、黑屏、冻结、受保护、后端未验收或正在重新确认"
                         self.condition.notify_all()
+                except InputStopped:
+                    break
                 except Exception as error:
                     with self.condition:
                         self.last_error=str(error)
@@ -2106,7 +2478,7 @@ class FrameBuffer:
         self.stop_event.set()
         with self.condition:
             self.condition.notify_all()
-        if wait and self.thread and self.thread.is_alive() and self.thread is not threading.current_thread():
+        if wait and self.thread and self.thread.is_alive() and self.thread is not threading.current_thread() and timeout>0:
             self.thread.join(max(0.0,float(timeout)))
         return not bool(self.thread and self.thread.is_alive())
     def wait_for_usable(self,purpose,timeout=3.0,external_stop=None):
@@ -2138,45 +2510,435 @@ class FrameBuffer:
 class ModeSession:
     def __init__(self,app,target):
         self.app=app
-        self.target=dict(target)
-        self.resources=[]
+        self.target=target if isinstance(target,dict) else dict(target)
+        self.barrier=ResourceShutdownBarrier("模式资源",4.0)
         self.frame_buffer=None
         self.mouse_monitor=None
         self.keyboard_monitor=None
+    def _geometry_updated(self,target,calibration):
+        try:
+            self.app.store.save_capture_calibration(target,calibration)
+        except Exception:
+            pass
+        self.app.set_status("窗口尺寸或DPI变化后已自动重新校准，正在连续确认画面")
     def start_frames(self,hz,seconds,motion_interval,purpose):
-        buffer=FrameBuffer(self.app.api,self.target,hz,seconds,motion_interval,purpose)
-        self.resources.append(("frame",buffer))
+        buffer=FrameBuffer(self.app.api,self.target,hz,seconds,motion_interval,purpose,self._geometry_updated)
+        self.barrier.add("FrameBuffer",lambda timeout:buffer.stop(False,timeout),buffer.alive)
         buffer.start()
-        buffer.wait_for_usable(purpose,3.0,self.app.stop_event)
+        buffer.wait_for_usable(purpose,4.0,self.app.stop_event)
         self.frame_buffer=buffer
         return buffer
     def start_keyboard(self,on_other=None):
-        monitor=KeyboardMonitor(self.app.api,self.app._keyboard_escape,on_other)
-        self.resources.append(("keyboard",monitor))
+        monitor=KeyboardMonitor(self.app.api)
+        self.barrier.add("KeyboardHook",monitor.stop,monitor.alive)
         monitor.start()
         self.keyboard_monitor=monitor
         return monitor
     def start_mouse(self,on_input=None):
-        monitor=MouseMonitor(self.app.api,on_input)
-        self.resources.append(("mouse",monitor))
+        monitor=MouseMonitor(self.app.api)
+        self.barrier.add("MouseHook",monitor.stop,monitor.alive)
         monitor.start()
         self.mouse_monitor=monitor
         return monitor
-    def close(self):
-        deadline=time.monotonic()+1.5
-        for kind,resource in reversed(self.resources):
-            remaining=max(0.0,deadline-time.monotonic())
-            try:
-                resource.stop(min(1.0,remaining)) if kind!="frame" else resource.stop(True,min(1.0,remaining))
-            except Exception:
-                pass
-        self.resources.clear()
+    def add_resource(self,name,resource,stopper=None,alive=None,forcer=None):
+        stop=stopper or resource.stop
+        check=alive or resource.alive
+        self.barrier.add(name,stop,check,forcer)
+        return resource
+    def request_stop(self):
+        self.barrier.request_stop()
         self.app.api.block_input()
+    def close(self,timeout=0.0):
+        self.request_stop()
+        done=self.barrier.poll()
+        if timeout>0 and not done:
+            deadline=time.monotonic()+float(timeout)
+            while time.monotonic()<deadline and not done:
+                time.sleep(0.02)
+                done=self.barrier.poll()
+        if done and self.app.active_session is self:
+            self.app.active_session=None
+        return done
+    def pending_names(self):
+        return self.barrier.pending_names()
     def __enter__(self):
+        self.app.active_session=self
         return self
     def __exit__(self,exc_type,exc_value,exc_traceback):
-        self.close()
+        self.close(0.0)
         return False
+class AskQuestionProducer:
+    def __init__(self,app,frame_buffer,prototypes,historical,sources,game_id,model_version):
+        self.app=app
+        self.frame_buffer=frame_buffer
+        self.prototypes=list(prototypes)
+        self.historical=list(historical)
+        self.sources=list(sources)
+        self.game_id=str(game_id)
+        self.model_version=str(model_version)
+        self.requests=queue.Queue(maxsize=1)
+        self.results=queue.Queue(maxsize=2)
+        self.stop_event=threading.Event()
+        self.thread=None
+        self.counter=0
+    def start(self):
+        self.thread=threading.Thread(target=self._run,name="UniversalGameAI-TeachingQuestions",daemon=True)
+        self.thread.start()
+        return self
+    def request(self,recent_actions,state_since):
+        payload={"recent_actions":list(recent_actions)[-4:],"state_since":float(state_since)}
+        try:
+            while True:
+                self.requests.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self.requests.put_nowait(payload)
+        except queue.Full:
+            pass
+    def _put_result(self,value):
+        try:
+            while self.results.qsize()>=1:
+                self.results.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self.results.put_nowait(value)
+        except queue.Full:
+            pass
+    def _select_frame(self,payload):
+        frames=self.frame_buffer.snapshot(1.8)
+        usable=[frame for frame in frames if frame.get("usable_for_teaching")]
+        if not usable:
+            raise CaptureUnavailable(self.frame_buffer.last_error or "没有可用于请教的画面")
+        selected=usable[-1]
+        selected_ranked=[]
+        selected_priority=float("inf")
+        candidates=usable[-28:]
+        if not self.prototypes:
+            return selected,[]
+        for candidate_frame in candidates:
+            if self.stop_event.is_set() or self.app.should_stop():
+                raise InputStopped("请教题目生成已停止")
+            temporal=self.app.build_temporal_context(self.frame_buffer,candidate_frame,payload["recent_actions"],payload["state_since"])
+            temporal["previous_action_changed_frame"]=True
+            ranked=self.app.rank_action_candidates(candidate_frame["f"],self.prototypes,"",18,temporal,candidate_frame.get("coarse"))
+            if not ranked:
+                priority=-2.0
+            else:
+                decision=self.app.evaluate_action_candidates(ranked)
+                gap=(ranked[1]["score"]-ranked[0]["score"])/max(1.0,ranked[0]["score"]) if len(ranked)>1 else 10.0
+                priority=gap-3.0 if decision.get("ambiguous") else gap-1.0 if not decision.get("accepted") else gap
+            if priority<selected_priority:
+                selected_priority=priority
+                selected=candidate_frame
+                selected_ranked=ranked
+        return selected,selected_ranked
+    def _make_choices(self,question_frame,ranked):
+        choices=[]
+        signatures=set()
+        for item in ranked[:4]:
+            action=normalize_action(item["a"])
+            signature=action_signature(action)
+            if signature and signature not in signatures:
+                signatures.add(signature)
+                choices.append({"a":action,"repeat_policy":str(item["proto"].get("repeat_policy","one_shot")),"cluster_id":item["cluster_id"]})
+            if len(choices)>=3:
+                break
+        if not choices and self.historical:
+            query=question_frame.get("coarse")
+            if not isinstance(query,(bytes,bytearray)) or len(query)!=COARSE_LEN:
+                query=coarse_feature(question_frame["f"])
+            rough=sorted((coarse_distance(query,item["coarse"]),item) for item in self.historical)[:20]
+            exact=sorted((feature_distance(question_frame["f"],item["f"]),item) for _,item in rough)
+            for _,item in exact:
+                signature=action_signature(item["a"])
+                if signature and signature not in signatures:
+                    signatures.add(signature)
+                    choices.append({"a":item["a"],"repeat_policy":item.get("repeat_policy","one_shot"),"cluster_id":item["cluster_id"]})
+                if len(choices)>=2:
+                    break
+        seed_text=self.game_id+"|"+self.model_version+"|"+str(self.counter)
+        generator=random.Random(int(hashlib.sha256(seed_text.encode("utf-8","replace")).hexdigest()[:16],16))
+        distractors=list(self.sources)
+        generator.shuffle(distractors)
+        for entry in distractors:
+            signature=action_signature(entry["a"])
+            if signature and signature not in signatures:
+                signatures.add(signature)
+                choices.append(dict(entry))
+            if len(choices)>=4:
+                break
+        generator.shuffle(choices)
+        choices=choices[:4]
+        candidates=[{"cluster_id":entry.get("cluster_id",""),"canonical_action_signature":action_signature(entry["a"]),"a":entry["a"]} for entry in choices]
+        return choices,candidates
+    def _run(self):
+        while not self.stop_event.is_set():
+            try:
+                payload=self.requests.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                frame,ranked=self._select_frame(payload)
+                choices,candidates=self._make_choices(frame,ranked)
+                self.counter+=1
+                self._put_result({"frame":frame,"choices":choices,"candidates":candidates,"error":""})
+            except InputStopped:
+                break
+            except Exception as error:
+                self._put_result({"frame":None,"choices":[],"candidates":[],"error":str(error)})
+    def get_result(self,timeout=0.0):
+        try:
+            return self.results.get(timeout=max(0.0,float(timeout)))
+        except queue.Empty:
+            return None
+    def stop(self,timeout=1.0):
+        self.stop_event.set()
+        if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread() and timeout>0:
+            self.thread.join(max(0.0,float(timeout)))
+        return not bool(self.thread and self.thread.is_alive())
+    def alive(self):
+        return bool(self.thread and self.thread.is_alive())
+class LearningController:
+    def __init__(self,app):
+        self.app=app
+    def run(self):
+        return self.app._learning_worker_impl()
+class ReviewController:
+    def __init__(self,app):
+        self.app=app
+    def session_of(self,item):
+        return str(item.get("session_id") or item.get("context",{}).get("session_id") or "legacy")
+    def method_of(self,item):
+        return str(item.get("capture_method") or item.get("context",{}).get("capture_method") or "unknown")
+    def stratum_of(self,item):
+        return (action_family_key(item["a"]),action_signature(item["a"]),self.method_of(item))
+    def decorrelate(self,valid):
+        result=[]
+        previous={}
+        removed=0
+        ordered=sorted(valid,key=lambda item:(self.session_of(item),float(item.get("created",0.0)),str(item.get("checksum",""))))
+        for index,item in enumerate(ordered):
+            if index%32==0 and self.app.should_stop():
+                raise InputStopped("复习已停止")
+            key=(self.session_of(item),self.stratum_of(item))
+            old=previous.get(key)
+            keep=True
+            if old is not None:
+                gap=float(item.get("created",0.0))-float(old.get("created",0.0))
+                if 0.0<=gap<0.75 and coarse_distance(item.get("coarse"),old.get("coarse"))<=5.0:
+                    threshold=max(2.0,safe_float(item.get("context",{}).get("duplicate_threshold",3.0),3.0)*1.5)
+                    if feature_distance(item["f"],old["f"])<=threshold:
+                        keep=False
+            if keep:
+                result.append(item)
+                previous[key]=item
+            else:
+                removed+=1
+        return result,removed
+    def split(self,valid):
+        session_groups=defaultdict(list)
+        for item in valid:
+            session_groups[self.session_of(item)].append(item)
+        sessions=sorted(session_groups,key=lambda key:hashlib.sha256(key.encode("utf-8","replace")).hexdigest())
+        totals=Counter(self.stratum_of(item) for item in valid)
+        if len(sessions)<2:
+            return list(valid),[],{"complete":False,"mode":"independent_session","holdout_sessions":[],"reason":"只有一个完整学习session，只能生成临时模型","strata":len(totals),"session_count":len(sessions)}
+        session_counts={session:Counter(self.stratum_of(item) for item in items) for session,items in session_groups.items()}
+        session_sizes={session:len(items) for session,items in session_groups.items()}
+        target=max(150,round(len(valid)*0.25))
+        best=None
+        best_score=None
+        def consider(chosen):
+            nonlocal best,best_score
+            if not chosen or len(chosen)>=len(sessions):
+                return
+            hold_counts=Counter()
+            hold_count=0
+            for session in chosen:
+                hold_counts.update(session_counts[session])
+                hold_count+=session_sizes[session]
+            complete=all(0<hold_counts[key]<totals[key] for key in totals)
+            score=(0 if complete else 1,0 if hold_count>=150 else 1,abs(hold_count-target),len(chosen))
+            if best_score is None or score<best_score:
+                best=set(chosen)
+                best_score=score
+        count=len(sessions)
+        if count<=16:
+            for mask in range(1,(1<<count)-1):
+                consider({sessions[index] for index in range(count) if mask&(1<<index)})
+        else:
+            generator=random.Random(int(hashlib.sha256("|".join(sessions).encode("utf-8","replace")).hexdigest()[:16],16))
+            for order in (sessions,sorted(sessions,key=lambda value:session_sizes[value]),sorted(sessions,key=lambda value:session_sizes[value],reverse=True)):
+                for length in range(1,min(len(order),16)+1):
+                    consider(set(order[:length]))
+            for _ in range(5000):
+                consider({session for session in sessions if generator.random()<0.25})
+        if not best:
+            return list(valid),[],{"complete":False,"mode":"independent_session","holdout_sessions":[],"reason":"无法建立完整session留出集","strata":len(totals),"session_count":len(sessions)}
+        train=[item for item in valid if self.session_of(item) not in best]
+        holdout=[item for item in valid if self.session_of(item) in best]
+        assert_disjoint_checksums(train,holdout)
+        hold_counts=Counter(self.stratum_of(item) for item in holdout)
+        complete=bool(train and holdout and all(0<hold_counts[key]<totals[key] for key in totals))
+        return train,holdout,{"complete":complete,"mode":"independent_session","holdout_sessions":sorted(best),"reason":"" if complete else "完整session划分后无法同时覆盖全部原始动作签名与采集后端","strata":len(totals),"session_count":len(sessions)}
+    def map_holdout(self,holdout,clusters):
+        by_family=defaultdict(list)
+        for cluster in clusters:
+            by_family[action_family_key(cluster["a"])].append(cluster)
+        uncovered=0
+        for item in holdout:
+            candidates=by_family.get(action_family_key(item["a"]),[])
+            if not candidates:
+                item["_action_cluster"]=None
+                item["_uncovered_action"]=True
+                uncovered+=1
+                continue
+            ranked=sorted((action_geometry_distance(item["a"],cluster["a"]),cluster) for cluster in candidates)
+            distance,cluster=ranked[0]
+            if distance>action_cluster_limit(cluster["a"]):
+                item["_action_cluster"]=None
+                item["_uncovered_action"]=True
+                uncovered+=1
+                continue
+            item["_action_cluster"]=cluster["id"]
+            item["_cluster_action"]=cluster["a"]
+            item["_action_support"]=len(cluster["members"])
+            item["_canonical_action_signature"]=cluster["canonical_action_signature"]
+            item["_uncovered_action"]=False
+        return uncovered
+    def run(self):
+        return self.app._review_worker_impl()
+class TrainingController:
+    def __init__(self,app):
+        self.app=app
+    def run(self):
+        return self.app._training_worker_impl()
+class TeachingController:
+    def __init__(self,app):
+        self.app=app
+    def run(self):
+        app=self.app
+        game=app.require_game()
+        target=app.require_window(False)
+        samples,stats=app.store.load_samples(game["id"])
+        try:
+            model=app.store.load_model(game["id"])
+        except Exception:
+            model=None
+        prototypes=[item for item in (model.get("prototypes",[]) if model else []) if feature_valid(item.get("f")) and normalize_action(item.get("a"))]
+        historical=[]
+        for index,item in enumerate(samples):
+            if index%64==0 and app.should_stop():
+                raise InputStopped("请教初始化已停止")
+            action=normalize_action(item.get("a"))
+            if feature_valid(item.get("f")) and action:
+                historical.append({"id":str(item.get("checksum",uuid.uuid4().hex)),"f":item["f"],"coarse":item.get("coarse") if isinstance(item.get("coarse"),(bytes,bytearray)) and len(item.get("coarse"))==COARSE_LEN else coarse_feature(item["f"]),"a":action,"cluster_id":"history|"+action_signature(action),"canonical_action_signature":action_signature(action),"repeat_policy":str(item.get("repeat_policy","one_shot")),"source":"sample"})
+        calibration=app.ensure_capture_calibration(target,"请教")
+        session_id="teach|"+uuid.uuid4().hex
+        sources=[]
+        for proto in prototypes:
+            sources.append({"a":normalize_action(proto["a"]),"repeat_policy":str(proto.get("repeat_policy","one_shot")),"cluster_id":str(proto.get("cluster_id",""))})
+        for item in historical:
+            sources.append({"a":item["a"],"repeat_policy":item.get("repeat_policy","one_shot"),"cluster_id":item["cluster_id"]})
+        sources.extend({"a":action,"repeat_policy":"one_shot","cluster_id":"basic|"+action_signature(action)} for action in app.basic_actions())
+        unique=[]
+        seen=set()
+        for entry in sources:
+            signature=action_signature(entry["a"])
+            if signature and signature not in seen:
+                seen.add(signature)
+                unique.append(entry)
+        with ModeSession(app,target) as session:
+            buffer=session.start_frames(max(12.0,float(calibration.get("fps",15.0))),2.5,0.1,"teaching")
+            model_version=str((model or {}).get("saved",(model or {}).get("created","none")))
+            producer=AskQuestionProducer(app,buffer,prototypes,historical,unique,game["id"],model_version).start()
+            session.add_resource("TeachingQuestionProducer",producer)
+            app.ask_session_id=session_id
+            app.ask_buffer=buffer
+            app.ask_producer=producer
+            app.ask_counts={"saved":0,"duplicates":0,"skipped":0,"rejected":0}
+            answer_queue=queue.Queue()
+            app.ask_answer_queue=answer_queue
+            producer.request(deque(["<START>","<START>"],maxlen=4),time.time())
+            initial=None
+            deadline=time.monotonic()+5.0
+            while initial is None and time.monotonic()<deadline and not app.should_stop():
+                packet=producer.get_result(0.15)
+                if packet and not packet.get("error") and packet.get("frame") is not None:
+                    initial=packet
+                elif packet and packet.get("error"):
+                    app.set_status("请教初始化等待画面："+str(packet["error"]))
+                    producer.request(deque(["<START>","<START>"],maxlen=4),time.time())
+            if app.should_stop():
+                raise InputStopped("请教初始化已停止")
+            if initial is None:
+                raise CaptureUnavailable("请教初始化未在限定时间内生成第一道题")
+            created=threading.Event()
+            app.ui(lambda:app._create_ask_window({"game":game,"target":target,"buffer":buffer,"producer":producer,"packet":initial,"created":created}))
+            while not created.wait(0.05):
+                if app.should_stop():
+                    raise InputStopped("请教初始化已停止")
+            while not app.should_stop():
+                try:
+                    command=answer_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                callback=command.get("callback")
+                try:
+                    kind=str(command.get("kind",""))
+                    frame=command.get("frame") or {}
+                    entry=command.get("entry") or {}
+                    recent_actions=command.get("recent_actions") or ["<START>","<START>"]
+                    state_since=safe_float(command.get("state_since"),time.time())
+                    if kind=="skip":
+                        app.ask_counts["skipped"]+=1
+                        result={"saved":False,"action":None}
+                    else:
+                        if not frame.get("usable_for_teaching"):
+                            raise CaptureUnavailable("当前画面不可用于请教")
+                        temporal=app.build_temporal_context(buffer,frame,recent_actions,state_since)
+                        temporal["previous_action_changed_frame"]=True
+                        policy=str(entry.get("repeat_policy","one_shot"))
+                        context=app.sample_context(recent_actions[-1] if recent_actions else "",0,True,frame.get("motion_valid",False),session_id,frame.get("method","unknown"),policy,temporal)
+                        if kind in {"choose","custom"}:
+                            action=normalize_action(entry.get("a"))
+                            if not action:
+                                raise RuntimeError("请教动作无效")
+                            source="teach_live_custom" if kind=="custom" else "teach_live"
+                            weight=3.5 if kind=="custom" else 3.0
+                            saved=app.store.append_sample(game["id"],frame["f"],action,source,context,frame.get("gray"),weight)
+                            app.ask_counts["saved" if saved else "duplicates"]+=1
+                            result={"saved":saved,"action":action}
+                        elif kind=="reject":
+                            app.store.append_rejection(game["id"],frame["f"],command.get("candidates") or [],"teach_live_reject",frame.get("gray"),context)
+                            app.ask_counts["rejected"]+=1
+                            result={"saved":False,"action":None}
+                        else:
+                            raise RuntimeError("未知请教命令")
+                    if callback:
+                        app.ui(lambda callback=callback,result=result:callback(result,None))
+                except Exception as error:
+                    message="请教数据库或题目处理失败："+str(error)
+                    if callback:
+                        app.ui(lambda callback=callback,message=message:callback(None,message))
+                    app.lifecycle.request_stop("failed",message)
+                    app.mode_state=MODE_STOPPING
+                    if app.stop_event is not None:
+                        app.stop_event.set()
+                    app.api.block_input()
+                    break
+        try:
+            app.store.flush_samples()
+        except Exception:
+            pass
+        counts=app.ask_counts if isinstance(app.ask_counts,dict) else {"saved":0,"duplicates":0,"skipped":0,"rejected":0}
+        summary="请教已结束：已保存"+str(counts.get("saved",0))+"，重复未保存"+str(counts.get("duplicates",0))+"，跳过"+str(counts.get("skipped",0))+"，拒绝记录"+str(counts.get("rejected",0))+"；模型需要复习"
+        status=app.lifecycle.snapshot()[3]
+        if status=="failed":
+            return ModeResult("failed",app.lifecycle.snapshot()[4] or summary)
+        return ModeResult(status if status in {"completed","stopped"} else "stopped",summary,{"samples":stats.get("valid",0)})
 class DataStore:
     def __init__(self):
         local=os.environ.get("LOCALAPPDATA")
@@ -2503,6 +3265,19 @@ class DataStore:
             for item in cleaned:
                 self.db.execute("INSERT INTO games(id,name,created,needs_review,last_review) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,created=excluded.created,needs_review=excluded.needs_review,last_review=excluded.last_review",(item["id"],item["name"],item["created"],item["needs_review"],item["last_review"]))
             self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('selected_game',?)",(selected,))
+    def delete_game(self,gid):
+        self.flush_samples()
+        game_id=str(gid)
+        with self.lock,self.db:
+            row=self.db.execute("SELECT 1 FROM games WHERE id=?",(game_id,)).fetchone()
+            if not row:
+                return False
+            self.db.execute("DELETE FROM games WHERE id=?",(game_id,))
+            selected=self.db.execute("SELECT value FROM meta WHERE key='selected_game'").fetchone()
+            if selected and str(selected[0])==game_id:
+                self.db.execute("DELETE FROM meta WHERE key='selected_game'")
+        self.model_cache.pop(game_id,None)
+        return True
     def update_game(self,gid,**changes):
         allowed={"name","created","needs_review","last_review"}
         fields=[]
@@ -2589,6 +3364,18 @@ class DataStore:
             self.flush_samples()
             self.compact_samples(gid,MAX_SAMPLES)
         return True
+    def discard_session(self,gid,session_id):
+        with self.lock:
+            before=len(self.pending_samples)
+            self.pending_samples=[item for item in self.pending_samples if not (item["gid"]==gid and item["session_id"]==str(session_id))]
+            pending_removed=before-len(self.pending_samples)
+            with self.db:
+                cursor=self.db.execute("DELETE FROM samples WHERE game_id=? AND session_id=?",(gid,str(session_id)))
+                removed=pending_removed+max(0,int(cursor.rowcount or 0))
+                if removed:
+                    self.db.execute("UPDATE games SET needs_review=1 WHERE id=?",(gid,))
+        self.model_cache.pop(gid,None)
+        return removed
     def discard_session_window(self,gid,session_id,start_time,end_time):
         with self.lock:
             before=len(self.pending_samples)
@@ -2998,6 +3785,11 @@ class DataStore:
                 self.model_cache[gid]=item
                 return True
         raise RuntimeError("没有通过完整版本、游戏ID、特征尺寸、算法版本和原型schema校验的模型备份")
+    def integrity_check(self):
+        self.flush_samples()
+        with self.lock:
+            row=self.db.execute("PRAGMA quick_check").fetchone()
+        return bool(row and str(row[0]).lower()=="ok")
     def close(self,timeout=5.0):
         with self.lock:
             if self.closed:
@@ -3007,8 +3799,8 @@ class DataStore:
             self.closing=True
         self.writer_stop.set()
         self.pending_event.set()
-        if self.writer_thread and self.writer_thread.is_alive() and self.writer_thread is not threading.current_thread():
-            self.writer_thread.join(max(0.1,float(timeout)))
+        if self.writer_thread and self.writer_thread.is_alive() and self.writer_thread is not threading.current_thread() and float(timeout)>0:
+            self.writer_thread.join(float(timeout))
         if self.writer_thread and self.writer_thread.is_alive():
             with self.lock:
                 self.closing=False
@@ -3034,15 +3826,25 @@ class App:
         self.store=DataStore()
         self.selected_game=self.store.selected_game()
         self.selected_window=None
+        self.lifecycle=ModeLifecycle()
         self.mode=None
+        self.mode_state=MODE_IDLE
         self.stop_event=None
         self.mode_thread=None
+        self.active_session=None
+        self.pending_mode_result=None
+        self.pending_mode_error=None
+        self.mode_shutdown_deadline=None
+        self.mode_shutdown_forced=[]
         self.controls=[]
         self.stop_button=None
         self.ask_window=None
         self.ask_buffer=None
+        self.ask_producer=None
+        self.ask_answer_queue=None
         self.ask_after_ids=set()
         self.ask_escape_armed=False
+        self.global_escape_armed=True
         self.ask_session_id=None
         self.ask_counts=None
         self.error_recent={}
@@ -3053,6 +3855,10 @@ class App:
         self.shutdown_started=False
         self.shutdown_deadline=None
         self.review_distance_cache={}
+        self.learning_controller=LearningController(self)
+        self.review_controller=ReviewController(self)
+        self.training_controller=TrainingController(self)
+        self.teaching_controller=TeachingController(self)
         self.status=tk.StringVar(value="就绪")
         self.game_text=tk.StringVar(value="未选择")
         self.window_text=tk.StringVar(value="未选择")
@@ -3068,11 +3874,12 @@ class App:
         self._refresh_all()
         self.root.protocol("WM_DELETE_WINDOW",self.close)
         self.root.after(25,self.process_ui_queue)
+        self.root.after(35,self.poll_global_escape)
         self.root.after(1200,self.periodic_refresh)
     def _build(self):
         self.root.title("通用游戏AI")
-        self.root.geometry("780x660")
-        self.root.minsize(700,590)
+        self.root.geometry("800x680")
+        self.root.minsize(720,610)
         self.root.option_add("*Font",("Microsoft YaHei UI",10))
         outer=ttk.Frame(self.root,padding=18)
         outer.pack(fill="both",expand=True)
@@ -3082,41 +3889,45 @@ class App:
         labels=[("当前游戏：",self.game_text),("目标窗口：",self.window_text),("窗口身份：",self.window_detail),("采集兼容性：",self.capture_text),("输入权限：",self.input_text),("数据统计：",self.sample_text),("模型状态：",self.model_text),("识别状态：",self.confidence_text)]
         for row,(name,value) in enumerate(labels):
             ttk.Label(info,text=name).grid(row=row,column=0,sticky="nw",pady=2)
-            ttk.Label(info,textvariable=value,wraplength=610).grid(row=row,column=1,sticky="nw",pady=2)
+            ttk.Label(info,textvariable=value,wraplength=630).grid(row=row,column=1,sticky="nw",pady=2)
         info.columnconfigure(1,weight=1)
         grid=ttk.Frame(outer)
         grid.pack(fill="both",expand=True)
-        specs=[("游戏",self.open_game_dialog),("选择窗口",self.open_window_dialog),("学习",self.start_learning),("复习",self.start_review),("训练",self.start_training),("请教",self.start_ask),("停止",self.request_stop),("数据清理",self.open_data_dialog)]
+        specs=[("游戏",self.open_game_dialog),("选择窗口",self.open_window_dialog),("重新测试采集后端",self.retest_capture_backends),("学习",self.start_learning),("复习",self.start_review),("训练",self.start_training),("请教",self.start_ask),("停止",self.request_stop),("数据清理",self.open_data_dialog)]
         for index,(text,command) in enumerate(specs):
             button=ttk.Button(grid,text=text,command=command)
-            button.grid(row=index//2,column=index%2,sticky="nsew",padx=7,pady=7,ipady=11)
+            button.grid(row=index//3,column=index%3,sticky="nsew",padx=6,pady=6,ipady=10)
             if text=="停止":
                 self.stop_button=button
                 button.configure(state="disabled")
             else:
                 self.controls.append(button)
-        for column in range(2):
+        for column in range(3):
             grid.columnconfigure(column,weight=1)
-        for row in range(4):
+        for row in range(3):
             grid.rowconfigure(row,weight=1)
         ttk.Progressbar(outer,variable=self.progress_value,maximum=100).pack(fill="x",pady=(12,8))
         bottom=ttk.Frame(outer)
         bottom.pack(fill="x")
         ttk.Label(bottom,text="状态：").pack(side="left")
-        ttk.Label(bottom,textvariable=self.status,wraplength=560).pack(side="left",fill="x",expand=True)
+        ttk.Label(bottom,textvariable=self.status,wraplength=580).pack(side="left",fill="x",expand=True)
         ttk.Label(bottom,text="ESC或“停止”结束").pack(side="right")
     def tk_exception(self,exc_type,exc_value,exc_traceback):
         self.show_error("".join(traceback.format_exception(exc_type,exc_value,exc_traceback)))
     def ui(self,callback):
-        if self.closing and threading.current_thread() is not threading.main_thread():
+        if self.shutdown_started:
             return
         if threading.current_thread() is threading.main_thread():
             try:
                 callback()
             except Exception:
-                self.show_error(traceback.format_exc())
+                if not self.closing:
+                    self.show_error(traceback.format_exc())
             return
-        self.ui_queue.put(("call",callback))
+        try:
+            self.ui_queue.put_nowait(("call",callback))
+        except queue.Full:
+            pass
     def process_ui_queue(self):
         try:
             for _ in range(200):
@@ -3135,6 +3946,132 @@ class App:
                     self.root.after(25,self.process_ui_queue)
                 except Exception:
                     pass
+    def _begin_mode_stopping(self,result,error=None):
+        if self.shutdown_started or self.closing and self.mode_state==MODE_IDLE:
+            return
+        if result is None:
+            result=ModeResult("failed",str(self.mode or "模式")+"失败")
+        self.pending_mode_result=result
+        self.pending_mode_error=error
+        self.lifecycle.mark_stopping(result.status,result.summary if result.status=="failed" else "")
+        self.mode_state=MODE_STOPPING
+        if self.stop_event is not None:
+            self.stop_event.set()
+        self.api.block_input()
+        self._destroy_ask_window()
+        if self.active_session is not None:
+            self.active_session.request_stop()
+        self.mode_shutdown_deadline=time.monotonic()+5.0
+        self.status.set(str(self.mode or "模式")+"正在停止资源，控制按钮保持禁用")
+        self.root.after(25,self._poll_mode_shutdown)
+    def _poll_mode_shutdown(self):
+        if self.mode_state!=MODE_STOPPING:
+            return
+        self.api.block_input()
+        self.api.release_all_buttons()
+        session_done=True
+        pending=[]
+        if self.active_session is not None:
+            session_done=self.active_session.close(0.0)
+            if not session_done:
+                pending.extend(self.active_session.pending_names())
+        capture_pending=self.api.stop_capture_processes(0.0,False)
+        deadline_reached=bool(self.mode_shutdown_deadline is not None and time.monotonic()>=self.mode_shutdown_deadline)
+        if deadline_reached and capture_pending:
+            forced=self.api.stop_capture_processes(0.0,True)
+            self.mode_shutdown_forced.extend(name for name in capture_pending if name not in self.mode_shutdown_forced)
+            capture_pending=forced
+        thread_alive=bool(self.mode_thread and self.mode_thread.is_alive())
+        if thread_alive:
+            pending.append("模式线程")
+        pending.extend("CaptureProcess:"+name for name in capture_pending)
+        if pending or not session_done:
+            suffix="；已到关闭期限并强制终止采集子进程："+"、".join(self.mode_shutdown_forced) if self.mode_shutdown_forced else ""
+            self.status.set("STOPPING：等待资源退出："+"、".join(sorted(set(pending)))+suffix)
+            self.root.after(50,self._poll_mode_shutdown)
+            return
+        result=self.pending_mode_result or ModeResult("failed",str(self.mode or "模式")+"失败")
+        error=self.pending_mode_error
+        name=str(self.mode or "模式")
+        if self.mode_shutdown_forced:
+            result.details["forced_capture_processes"]=list(dict.fromkeys(self.mode_shutdown_forced))
+            result.summary+="；以下采集子进程未正常退出并已强制终止："+"、".join(result.details["forced_capture_processes"])
+        self.mode_thread=None
+        self.active_session=None
+        self.ask_buffer=None
+        self.ask_producer=None
+        self.ask_answer_queue=None
+        self.ask_session_id=None
+        self.ask_counts=None
+        self.stop_event=None
+        self.mode=None
+        self.mode_state=MODE_IDLE
+        self.lifecycle.finish()
+        self.pending_mode_result=None
+        self.pending_mode_error=None
+        self.mode_shutdown_deadline=None
+        self.set_controls(False)
+        self.progress_value.set(0)
+        self.status.set(result.summary)
+        self._refresh_all()
+        if self.closing:
+            self._poll_shutdown()
+            return
+        if error:
+            self.show_error(error)
+        elif result.status=="failed":
+            self.show_error(result.summary)
+        else:
+            title=name+("完成" if result.status=="completed" else "已停止")
+            self.show_info(title,result.summary)
+    def _destroy_ask_window(self):
+        win=self.ask_window
+        self.ask_window=None
+        if win is not None:
+            for after_id in list(self.ask_after_ids):
+                try:
+                    win.after_cancel(after_id)
+                except Exception:
+                    pass
+            self.ask_after_ids.clear()
+            try:
+                win.destroy()
+            except Exception:
+                pass
+    def _fail_active_mode(self,message):
+        self.lifecycle.request_stop("failed",str(message))
+        self.mode_state=MODE_STOPPING
+        if self.stop_event is not None:
+            self.stop_event.set()
+        self.api.block_input()
+        self._destroy_ask_window()
+    def retest_capture_backends(self):
+        self.start_worker("重测采集",self.retest_capture_worker,True)
+    def retest_capture_worker(self):
+        target=self.require_window(False)
+        self.api.reset_capture_backends(target)
+        self.api.calibrations.pop(int(target["hwnd"]),None)
+        result=self.ensure_capture_calibration(target,"重新测试采集后端")
+        self.lifecycle.mark_running()
+        self.mode_state=MODE_RUNNING
+        return ModeResult("completed","采集后端重新测试完成："+str(result.get("validated_backend","未知")),{"validated_backends":list(result.get("validated_backends",[]))})
+    def poll_global_escape(self):
+        if self.shutdown_started:
+            return
+        try:
+            down=self.api.key_down(0x1B)
+            if not down:
+                self.global_escape_armed=True
+            elif self.mode_state!=MODE_IDLE and self.global_escape_armed:
+                self.global_escape_armed=False
+                self._keyboard_escape()
+        except Exception:
+            pass
+        if not self.shutdown_started:
+            try:
+                self.root.after(35,self.poll_global_escape)
+            except Exception:
+                pass
     def set_status(self,text):
         self.ui(lambda:self.status.set(str(text)))
     def set_confidence(self,text):
@@ -3414,10 +4351,18 @@ class App:
             if index is None:
                 self.show_error("请先选择一个游戏")
                 return
-            if not self.confirm_dialog("删除游戏","确认删除“"+games[index]["name"]+"”及其学习数据、模型和备份吗？"):
+            item=dict(games[index])
+            if not self.confirm_dialog("立即删除游戏","确认立即删除“"+item["name"]+"”及其学习数据、模型和备份吗？此操作不依赖对话框总“确认”。"):
+                return
+            if not self.store.delete_game(item["id"]):
+                self.show_error("游戏已不存在")
                 return
             games.pop(index)
+            if self.selected_game and self.selected_game.get("id")==item["id"]:
+                self.selected_game=None
             refresh(games[min(index,len(games)-1)]["id"] if games else None)
+            self._refresh_all()
+            self.status.set("已立即删除游戏："+item["name"])
         def confirm():
             selection=box.curselection()
             if not selection:
@@ -3433,7 +4378,7 @@ class App:
         tools.pack(fill="x",pady=10)
         ttk.Button(tools,text="新建",command=add_game).pack(side="left",padx=(0,6))
         ttk.Button(tools,text="编辑",command=edit_game).pack(side="left",padx=6)
-        ttk.Button(tools,text="删除",command=delete_game).pack(side="left",padx=6)
+        ttk.Button(tools,text="删除（立即）",command=delete_game).pack(side="left",padx=6)
         actions=ttk.Frame(frame)
         actions.pack(fill="x")
         ttk.Button(actions,text="确认",command=confirm).pack(side="right",padx=(6,0))
@@ -3501,8 +4446,9 @@ class App:
                 return
             previous=self.selected_window
             self.selected_window=item
-            if not previous or any(previous.get(key)!=item.get(key) for key in ("hwnd","pid","class")):
+            if not previous or any(previous.get(key)!=item.get(key) for key in ("hwnd","pid","class","process_created")):
                 self.api.calibrations.pop(int(item["hwnd"]),None)
+            self.api.reset_capture_backends(item)
             self.api.reset_frame_history(item["hwnd"])
             self._refresh_all()
             self.status.set("已保存窗口身份："+item["title"]+"；采集动态或稳定性验收将在学习、训练或请教开始前执行")
@@ -3538,11 +4484,13 @@ class App:
     def require_window(self,foreground=False):
         if not self.selected_window:
             raise RuntimeError("请先点击“选择窗口”按钮选择目标窗口")
-        self.api.validate_target(self.selected_window,foreground)
+        self.api.validate_target_identity(self.selected_window,foreground)
         return self.selected_window
     def ensure_capture_calibration(self,target,purpose):
-        target=self.api.target_identity(target)
-        self.selected_window.update(target)
+        target_identity=self.api.target_identity(target)
+        target.update(target_identity)
+        if self.selected_window is target or self.selected_window and int(self.selected_window.get("hwnd",0))==int(target.get("hwnd",0)):
+            self.selected_window.update(target_identity)
         calibration=self.api.calibration_for(target)
         identity_valid=self.api.calibration_identity_matches(target,calibration)
         if not identity_valid:
@@ -3560,13 +4508,16 @@ class App:
                 result=self.api.calibrate(target,duration,self.stop_event,progress)
                 self.store.save_capture_calibration(target,result)
                 return result
+            except InputStopped:
+                raise
             except CaptureUnavailable as error:
                 text=str(error)
                 if "非黑帧" not in text and "黑帧" not in text:
                     raise
                 self.lock_input("检测到黑屏，等待画面恢复")
                 self.set_status(str(purpose)+"验收暂停："+text)
-                time.sleep(0.2)
+                if self.stop_event is not None and self.stop_event.wait(0.2):
+                    raise InputStopped("采集验收已停止")
                 duration=3.0
         raise InputStopped("采集验收已停止")
     def set_controls(self,running):
@@ -3575,61 +4526,71 @@ class App:
         if self.stop_button:
             self.stop_button.configure(state="normal" if running else "disabled")
     def start_worker(self,name,target,needs_window=False):
-        if self.mode or self.closing:
+        if self.mode_state!=MODE_IDLE or self.closing:
             self.show_error("当前已有操作正在运行，请先停止")
             return
         try:
             self.require_game()
             if needs_window:
                 self.require_window(False)
+            stop_event=self.lifecycle.begin(name)
         except Exception as error:
             self.show_error(str(error))
             return
-        self.mode=name
-        self.stop_event=threading.Event()
+        self.mode=str(name)
+        self.mode_state=MODE_STARTING
+        self.stop_event=stop_event
+        self.pending_mode_result=None
+        self.pending_mode_error=None
+        self.mode_shutdown_deadline=None
+        self.mode_shutdown_forced=[]
         self.api.block_input()
         self.set_input_status("已锁定")
         self.set_controls(True)
         self.progress_value.set(0)
-        self.status.set(name+"已开始，按ESC或点击“停止”结束")
+        self.status.set(name+"正在初始化，按ESC或点击“停止”可立即中止")
         self.mode_thread=threading.Thread(target=self.worker_entry,args=(name,target),name="UniversalGameAI-"+name,daemon=True)
         self.mode_thread.start()
     def worker_entry(self,name,target):
+        result=None
         error=None
-        final_text=name+"已结束"
         try:
-            final_text=target()
-        except InputStopped:
-            final_text=name+"已停止"
+            value=target()
+            if isinstance(value,ModeResult):
+                result=value
+            else:
+                stopped=bool(self.stop_event and self.stop_event.is_set())
+                requested=self.lifecycle.snapshot()[3]
+                status=requested if stopped and requested in {"completed","stopped","failed"} else "completed"
+                result=ModeResult(status,str(value if value is not None else name+"已结束"))
+        except InputStopped as stopped_error:
+            requested=self.lifecycle.snapshot()[3]
+            status=requested if requested in {"completed","stopped","failed"} else "stopped"
+            result=ModeResult(status,name+("已完成" if status=="completed" else "已停止"),{"reason":str(stopped_error)})
         except Exception:
             error=traceback.format_exc()
+            result=ModeResult("failed",name+"失败")
         finally:
             self.api.block_input()
             self.set_input_status("已锁定")
-        def finish():
-            if self.shutdown_started:
-                return
-            self.mode=None
-            self.stop_event=None
-            self.mode_thread=None
-            self.set_controls(False)
-            self.progress_value.set(0)
-            self.status.set(final_text)
-            self._refresh_all()
-            if error:
-                self.show_error(error)
-            else:
-                self.show_info(name+"完成",final_text)
-        self.ui(finish)
+        self.ui(lambda:self._begin_mode_stopping(result,error))
     def request_stop(self):
+        if self.mode_state==MODE_IDLE:
+            return
+        self.lifecycle.request_stop("stopped","用户请求停止")
+        self.mode_state=MODE_STOPPING
         if self.stop_event:
             self.stop_event.set()
         self.lock_input("因停止请求锁定")
-        if self.ask_window is not None:
-            self.close_ask()
-            return
+        self._destroy_ask_window()
+        if self.active_session is not None:
+            self.active_session.request_stop()
         self.status.set("正在停止，已阻止新的鼠标按下并释放全部鼠标键")
     def _keyboard_escape(self,event=None):
+        if self.mode_state==MODE_IDLE:
+            return
+        self.lifecycle.request_stop("stopped","ESC停止")
+        self.mode_state=MODE_STOPPING
         if self.stop_event:
             self.stop_event.set()
         self.api.block_input()
@@ -3638,10 +4599,12 @@ class App:
         while self.api.key_down(0x1B) and self.stop_event and not self.stop_event.is_set():
             time.sleep(0.04)
     def should_stop(self):
-        if not self.stop_event or self.stop_event.is_set():
+        if self.stop_event is None or self.stop_event.is_set():
             self.api.block_input()
             return True
         if self.api.key_down(0x1B):
+            self.lifecycle.request_stop("stopped","ESC停止")
+            self.mode_state=MODE_STOPPING
             self.stop_event.set()
             self.api.block_input()
             return True
@@ -3678,8 +4641,10 @@ class App:
             actions.insert(0,"<START>")
         return {"recent_frame_count":len(frames),"recent_frame_deltas":deltas,"recent_actions":actions,"state_duration":round(max(0.0,min(60.0,time.time()-float(state_since))),3),"cursor":cursor_point,"window_size":[int(rect[2]),int(rect[3])] if len(rect)==4 else None,"dpi":int(frame.get("dpi",0)),"capture_method":str(frame.get("method","unknown"))}
     def start_learning(self):
-        self.start_worker("学习",self.learning_worker,True)
+        self.start_worker("学习",self.learning_controller.run,True)
     def learning_worker(self):
+        return self.learning_controller.run()
+    def _learning_worker_impl(self):
         game=self.require_game()
         target=self.require_window(False)
         hwnd=target["hwnd"]
@@ -3688,13 +4653,9 @@ class App:
         if not self.api.request_foreground(hwnd):
             self.set_status("无法自动切换到目标窗口，学习将等待目标窗口成为前台")
         self.wait_escape_release()
-        keyboard_queue=queue.Queue()
-        keyboard_state={"until":0.0,"generation":0,"last_time":0.0}
-        def other_key(event):
-            try:
-                keyboard_queue.put_nowait(dict(event))
-            except Exception:
-                pass
+        keyboard_state={"generation":0,"last_time":0.0}
+        strict_violation=False
+        isolation=StrictInputIsolation(self.stop_event)
         learned=0
         discarded=0
         duplicates=0
@@ -3709,8 +4670,10 @@ class App:
         state_since=time.time()
         with ModeSession(self,target) as session:
             frame_buffer=session.start_frames(20.0,2.0,0.1,"learning")
-            keyboard=session.start_keyboard(other_key)
+            keyboard=session.start_keyboard()
             monitor=session.start_mouse()
+            self.lifecycle.mark_running()
+            self.mode_state=MODE_RUNNING
             active={}
             pending_click={}
             last_negative=0.0
@@ -3721,25 +4684,22 @@ class App:
             hover_point=None
             last_update=0.0
             def drain_keyboard_events():
-                nonlocal keyboard_count,keyboard_discarded
-                events=[]
-                while True:
-                    try:
-                        event=keyboard_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    event_time=safe_float(event.get("time"),time.time()) if isinstance(event,dict) else time.time()
-                    keyboard_state["until"]=max(float(keyboard_state["until"]),event_time+0.75)
+                nonlocal keyboard_count,strict_violation
+                events=[event for event in keyboard.drain() if event.get("kind")=="other" and event.get("down")]
+                if events:
+                    strict_violation=True
+                    keyboard_count+=len(events)
                     keyboard_state["generation"]=safe_int(keyboard_state["generation"],0)+1
-                    keyboard_state["last_time"]=event_time
-                    keyboard_count+=1
-                    keyboard_discarded+=self.store.discard_session_window(game["id"],session_id,event_time-0.75,event_time+0.75)
-                    events.append(event)
+                    keyboard_state["last_time"]=safe_float(events[0].get("time"),time.time())
+                    isolation.signal("keyboard",keyboard_state["last_time"])
+                    self.lifecycle.request_stop("stopped","学习检测到非ESC键盘输入，整段session无效")
+                    self.mode_state=MODE_STOPPING
+                    self.api.block_input()
+                    self.api.release_all_buttons()
                 return events
             def paused(now=None):
                 drain_keyboard_events()
-                current=time.time() if now is None else float(now)
-                return current<float(keyboard_state["until"]) or not keyboard.all_released()
+                return strict_violation or keyboard.other_event.is_set()
             def capture_safe(stamp=None):
                 nonlocal invalid_frames
                 frame=frame_buffer.latest(stamp,0.75,"learning")
@@ -3767,8 +4727,7 @@ class App:
                 context=self.sample_context(last_action_signature,last_action_time,last_action_changed,frame.get("motion_valid",False),session_id,frame.get("method","unknown"),"one_shot",temporal)
                 saved=self.store.append_sample(game["id"],frame["f"],action,source,context,frame.get("gray"),weight)
                 if saved and (generation!=int(keyboard_state["generation"]) or paused()):
-                    event_time=float(keyboard_state.get("last_time") or time.time())
-                    keyboard_discarded+=self.store.discard_session_window(game["id"],session_id,event_time-0.75,event_time+0.75)
+                    keyboard_discarded+=1
                     return False
                 if saved:
                     learned+=1
@@ -3803,14 +4762,15 @@ class App:
                     hover_point=None
                     hover_start=0.0
                     monitor.drain()
+                    self.set_status("检测到非ESC键盘输入，学习立即停止且整段session将被标记无效")
+                    break
                 if paused(now):
                     active.clear()
                     pending_click.clear()
                     motion=None
                     self.api.release_all_buttons()
-                    self.set_status("检测到非ESC键盘输入，学习已暂停并废弃按键前后样本；等待全部按键释放")
-                    time.sleep(0.03)
-                    continue
+                    self.set_status("检测到非ESC键盘输入，学习立即停止且整段session将被标记无效")
+                    break
                 try:
                     rect=self.api.validate_target(target,True)
                     focused=True
@@ -3968,7 +4928,12 @@ class App:
                     last_update=now
                 time.sleep(0.012)
         self.store.flush_samples()
-        return "学习已结束：有效"+str(learned)+"，重复或配额抑制"+str(duplicates)+"，越界废弃"+str(discarded)+"，无效画面"+str(invalid_frames)+"，检测到非ESC键盘输入"+str(keyboard_count)+"次，因此废弃样本"+str(keyboard_discarded)+"个"
+        if strict_violation:
+            removed=self.store.discard_session(game["id"],session_id)
+            keyboard_discarded=max(keyboard_discarded,removed)
+            return ModeResult("stopped","学习因检测到非ESC键盘输入而严格停止；整段session已作废并删除"+str(removed)+"个样本",{"invalid_session":session_id,"keyboard_events":keyboard_count})
+        summary="学习已停止：有效"+str(learned)+"，重复或配额抑制"+str(duplicates)+"，越界废弃"+str(discarded)+"，无效画面"+str(invalid_frames)
+        return ModeResult("stopped" if self.stop_event and self.stop_event.is_set() else "completed",summary)
     def _prototype_medoid(self,members):
         if len(members)==1:
             return members[0]
@@ -4243,7 +5208,7 @@ class App:
             reason="未达到动作阈值、差距或支持数要求"
         return {"accepted":accepted,"best":best,"second":second,"threshold":threshold,"margin":margin,"required_gap":required_gap,"support":support,"min_support":min_support,"confidence":confidence,"margin_ok":margin_ok,"rejection_ok":rejection_ok,"temporal_ok":temporal_ok,"ambiguous":ambiguous,"reason":reason,"nearest_rejected_distance":rejected_distance,"query_backend":query_backend}
     def start_review(self):
-        self.start_worker("复习",self.review_worker,False)
+        self.start_worker("复习",self.review_controller.run,False)
     def _limit_prototypes(self,prototypes,limit):
         limit=int(limit)
         if len(prototypes)<=limit:
@@ -4268,84 +5233,14 @@ class App:
             raise RuntimeError("原型限制执行失败")
         return chosen
     def _split_review_samples(self,valid):
-        def session_of(item):
-            return str(item.get("session_id") or item.get("context",{}).get("session_id") or "legacy")
-        def method_of(item):
-            return str(item.get("capture_method") or item.get("context",{}).get("capture_method") or "unknown")
-        def stratum_of(item):
-            return (str(item.get("_action_cluster") or action_family_key(item["a"])),method_of(item))
-        session_groups=defaultdict(list)
-        for item in valid:
-            session_groups[session_of(item)].append(item)
-        sessions=sorted(session_groups,key=lambda key:hashlib.sha256(key.encode("utf-8","replace")).hexdigest())
-        target=max(20,round(len(valid)*0.25))
-        if len(sessions)==1:
-            groups=defaultdict(list)
-            for item in sorted(valid,key=lambda value:(float(value.get("created",0.0)),str(value.get("checksum","")))):
-                groups[stratum_of(item)].append(item)
-            if any(len(items)<2 for items in groups.values()):
-                return list(valid),[],{"complete":False,"mode":"time_block_stratified","holdout_sessions":[],"reason":"至少一个动作类型与采集后端分层只有一个样本","strata":len(groups)}
-            counts={key:max(1,min(len(items)-1,round(len(items)*0.25))) for key,items in groups.items()}
-            maximum=sum(len(items)-1 for items in groups.values())
-            desired=min(maximum,target)
-            while sum(counts.values())<desired:
-                candidates=[key for key,items in groups.items() if counts[key]<len(items)-1]
-                if not candidates:
-                    break
-                key=max(candidates,key=lambda value:(len(groups[value])-counts[value],len(groups[value])))
-                counts[key]+=1
-            holdout_ids=set()
-            for key,items in groups.items():
-                for item in items[-counts[key]:]:
-                    holdout_ids.add(id(item))
-            train=[item for item in valid if id(item) not in holdout_ids]
-            holdout=[item for item in valid if id(item) in holdout_ids]
-            complete=bool(train and holdout and all(any(stratum_of(item)==key for item in train) and any(stratum_of(item)==key for item in holdout) for key in groups))
-            return train,holdout,{"complete":complete,"mode":"time_block_stratified","holdout_sessions":[],"reason":"" if complete else "时间块分层无法同时覆盖训练集和验证集","strata":len(groups)}
-        totals=Counter(stratum_of(item) for item in valid)
-        session_counts={session:Counter(stratum_of(item) for item in items) for session,items in session_groups.items()}
-        session_sizes={session:len(items) for session,items in session_groups.items()}
-        best=None
-        best_score=None
-        def consider(chosen):
-            nonlocal best,best_score
-            if not chosen or len(chosen)>=len(sessions):
-                return
-            hold_counts=Counter()
-            hold_count=0
-            for session in chosen:
-                hold_counts.update(session_counts[session])
-                hold_count+=session_sizes[session]
-            if not all(0<hold_counts[key]<totals[key] for key in totals):
-                return
-            score=(0 if hold_count>=20 else 1,abs(hold_count-target),len(chosen))
-            if best_score is None or score<best_score:
-                best=set(chosen)
-                best_score=score
-        count=len(sessions)
-        if count<=16:
-            for mask in range(1,(1<<count)-1):
-                consider({sessions[index] for index in range(count) if mask&(1<<index)})
-        else:
-            orders=[sessions,sorted(sessions,key=lambda value:session_sizes[value]),sorted(sessions,key=lambda value:session_sizes[value],reverse=True),sorted(sessions,key=lambda value:hashlib.sha256((value+"|holdout").encode("utf-8","replace")).hexdigest())]
-            for order in orders:
-                for length in range(1,min(len(order),12)+1):
-                    consider(set(order[:length]))
-            generator=random.Random(int(hashlib.sha256("|".join(sessions).encode("utf-8","replace")).hexdigest()[:16],16))
-            for _ in range(2500):
-                consider({session for session in sessions if generator.random()<0.25})
-        if not best:
-            return list(valid),[],{"complete":False,"mode":"session_group_stratified","holdout_sessions":[],"reason":"无法找到按完整会话分组且覆盖所有动作类型与采集后端的留出集","strata":len(totals)}
-        train=[item for item in valid if session_of(item) not in best]
-        holdout=[item for item in valid if session_of(item) in best]
-        return train,holdout,{"complete":True,"mode":"session_group_stratified","holdout_sessions":sorted(best),"reason":"","strata":len(totals)}
-    def review_worker(self):
+        return self.review_controller.split(valid)
+    def _review_worker_impl(self):
         game=self.require_game()
         samples,stats=self.store.load_samples(game["id"])
         valid=[]
         for index,sample in enumerate(samples):
             if index%64==0 and self.should_stop():
-                return "复习已中断：旧完整模型未被覆盖"
+                raise InputStopped("复习已停止")
             action=normalize_action(sample.get("a"))
             context=sample.get("context",{})
             temporal=temporal_from_context(context)
@@ -4358,10 +5253,21 @@ class App:
             raise RuntimeError("没有同时具备已验收采集后端和完整短时序上下文的学习数据；数据不足时只允许请教")
         self.wait_escape_release()
         self.review_distance_cache={}
-        action_clusters=self._cluster_action_samples(valid)
+        decorrelated,decorrelated_removed=self.review_controller.decorrelate(valid)
+        if not decorrelated:
+            raise RuntimeError("连续帧去相关后没有独立样本")
+        train,holdout,split_info=self.review_controller.split(decorrelated)
+        assert_disjoint_checksums(train,holdout)
+        train_checksums=sorted(checksum_set(train))
+        holdout_checksums=sorted(checksum_set(holdout))
+        if set(train_checksums)&set(holdout_checksums):
+            raise RuntimeError("训练集与留出集checksum交集非空")
+        self.lifecycle.mark_running()
+        self.mode_state=MODE_RUNNING
+        action_clusters=self._cluster_action_samples(train)
+        uncovered_actions=self.review_controller.map_holdout(holdout,action_clusters)
         if self.should_stop():
-            return "复习已中断：旧完整模型未被覆盖"
-        train,holdout,split_info=self._split_review_samples(valid)
+            raise InputStopped("复习已停止")
         holdout_sessions=set(split_info.get("holdout_sessions",[]))
         cluster_map={cluster["id"]:cluster for cluster in action_clusters}
         groups=defaultdict(list)
@@ -4377,22 +5283,22 @@ class App:
                 cluster=cluster_map[cluster_id]
                 def progress(local,total_local,count):
                     self.set_progress(78*(processed+local)/max(1,len(train)))
-                    self.set_status("复习中：生成短时序原型；"+str(processed+local)+"/"+str(len(train)))
+                    self.set_status("复习中：仅使用训练集生成动作簇和短时序原型；"+str(processed+local)+"/"+str(len(train)))
                 prototypes.extend(self._cluster_action_group(cluster_id,cluster["a"],len(items),items,progress,cluster.get("repeat_policy","one_shot"),cluster.get("max_rate",3.0)))
                 processed+=len(items)
                 prototypes=self._limit_prototypes(prototypes,MAX_PROTOTYPES)
         except InputStopped:
             if prototypes:
-                partial={"created":time.time(),"samples":len(valid),"training_samples":len(train),"invalid_samples":stats["invalid"],"prototypes":prototypes,"capture_backends":sorted({str(item.get("capture_method")) for item in train}),"validation":{"status":"stopped"},"stopped":True}
+                partial={"created":time.time(),"samples":len(decorrelated),"training_samples":len(train),"invalid_samples":stats["invalid"],"prototypes":prototypes,"capture_backends":sorted({str(item.get("capture_method")) for item in train}),"validation":{"status":"stopped","training_checksums":train_checksums,"holdout_checksums":holdout_checksums},"stopped":True}
                 self.store.save_model(game["id"],partial,False)
-            return "复习已中断：旧完整模型未被覆盖，部分结果仅保存为临时模型"
+            raise
         operations=0
         for index,proto in enumerate(prototypes):
             conflicting=[]
             for other in prototypes:
                 operations+=1
                 if operations%64==0 and self.should_stop():
-                    return "复习已中断：旧完整模型未被覆盖"
+                    raise InputStopped("复习已停止")
                 if other["id"]!=proto["id"] and other.get("cluster_id")!=proto.get("cluster_id"):
                     conflicting.append(other)
             nearest=float("inf")
@@ -4403,7 +5309,7 @@ class App:
                 for _,other in rough:
                     operations+=1
                     if operations%32==0 and self.should_stop():
-                        return "复习已中断：旧完整模型未被覆盖"
+                        raise InputStopped("复习已停止")
                     distances.append((feature_distance(proto["f"],other["f"]),temporal_distance(proto.get("temporal",{}),other.get("temporal",{}))))
                 nearest,temporal_nearest=min(distances,key=lambda item:item[0])
             proto["nearest_conflicting_distance"]=None if math.isinf(nearest) else round(nearest,6)
@@ -4413,6 +5319,7 @@ class App:
             proto["ambiguous"]=bool(visual_close and temporal_close)
             proto["threshold"]=round(max(0.001,intra if math.isinf(nearest) else min(intra,max(0.001,nearest*0.62))),6)
             proto["minimum_second_candidate_gap"]=round(max(10.0,float(proto["threshold"])*0.15,0.0 if math.isinf(nearest) else nearest*0.10),6)
+            proto["channel_stats"]={"mean":sum(proto["f"])/len(proto["f"]),"minimum":min(proto["f"]),"maximum":max(proto["f"])}
             if index%12==0:
                 self.set_progress(78+7*(index+1)/max(1,len(prototypes)))
         rejections=self.store.load_rejections(game["id"],500)
@@ -4421,7 +5328,7 @@ class App:
             matching=[]
             for rejection_index,rejection in enumerate(rejections):
                 if (proto_index*max(1,len(rejections))+rejection_index)%64==0 and self.should_stop():
-                    return "复习已中断：旧完整模型未被覆盖"
+                    raise InputStopped("复习已停止")
                 candidate_actions=[normalize_action(item.get("a")) for item in rejection.get("candidates",[]) if isinstance(item,dict)]
                 if any(action and action_family_key(action)==action_family_key(proto["a"]) and action_geometry_distance(action,proto["a"])<=action_cluster_limit(proto["a"])*1.25 for action in candidate_actions):
                     matching.append((coarse_distance(proto["coarse"],rejection["coarse"]),rejection))
@@ -4432,28 +5339,33 @@ class App:
                 rejection_constraints+=1
             else:
                 proto["nearest_rejected_distance"]=None
-        errors=accepted=correct=0
-        by_action=defaultdict(lambda:{"total":0,"accepted":0,"correct":0,"errors":0,"unrecognized":0})
+        errors=0
+        accepted=0
+        correct=0
+        by_action=defaultdict(lambda:{"total":0,"accepted":0,"correct":0,"errors":0,"unrecognized":0,"negative_total":0,"false_positive":0})
         by_method=defaultdict(lambda:{"total":0,"accepted":0,"correct":0,"errors":0})
         dangerous_false=0
+        dangerous_signatures={cluster["canonical_action_signature"] for cluster in action_clusters if cluster["a"]["kind"] in {"double_click","long_press","drag"} or cluster["a"].get("button") in {"right","middle"}}
         for index,sample in enumerate(holdout):
             if index%8==0 and self.should_stop():
-                return "复习已中断：旧完整模型未被覆盖"
+                raise InputStopped("复习已停止")
             ranked=self.rank_action_candidates(sample["f"],prototypes,str(sample.get("context",{}).get("previous_action","")),16,sample.get("context",{}),sample.get("coarse"))
             decision=self.evaluate_action_candidates(ranked)
-            expected=sample["_action_cluster"]
-            canonical=sample.get("_canonical_action_signature",action_signature(sample["a"]))
+            expected=sample.get("_action_cluster")
+            canonical=sample.get("_canonical_action_signature") or action_signature(sample["a"])
             method=str(sample.get("capture_method") or sample.get("context",{}).get("capture_method") or "unknown")
             arow=by_action[canonical]
             mrow=by_method[method]
             arow["total"]+=1
             mrow["total"]+=1
+            predicted_signature=""
             if decision.get("accepted"):
                 accepted+=1
                 arow["accepted"]+=1
                 mrow["accepted"]+=1
                 predicted=decision["best"]
-                if predicted["cluster_id"]==expected:
+                predicted_signature=str(predicted.get("canonical_action_signature") or action_signature(predicted["a"]))
+                if expected is not None and predicted["cluster_id"]==expected:
                     correct+=1
                     arow["correct"]+=1
                     mrow["correct"]+=1
@@ -4466,11 +5378,17 @@ class App:
                         dangerous_false+=1
             else:
                 arow["unrecognized"]+=1
+            for signature in dangerous_signatures:
+                if canonical!=signature:
+                    by_action[signature]["negative_total"]+=1
+                    if predicted_signature==signature:
+                        by_action[signature]["false_positive"]+=1
             if index%5==0:
                 self.set_progress(85+13*(index+1)/max(1,len(holdout)))
         holdout_count=len(holdout)
         coverage=accepted/holdout_count if holdout_count else 0.0
         accepted_error_rate=errors/accepted if accepted else None
+        error_upper_95=binomial_error_upper(errors,accepted,0.95)
         overall_accuracy=correct/holdout_count if holdout_count else 0.0
         dangerous_false_rate=dangerous_false/max(1,holdout_count)
         per_action={}
@@ -4479,12 +5397,16 @@ class App:
         for signature in sorted(train_signatures|set(by_action)):
             row=dict(by_action[signature])
             row["recall"]=row["correct"]/row["total"] if row["total"] else 0.0
+            row["coverage"]=row["accepted"]/row["total"] if row["total"] else 0.0
             row["accepted_error_rate"]=row["errors"]/row["accepted"] if row["accepted"] else None
-            row["unrecognized_rate"]=row["unrecognized"]/row["total"] if row["total"] else 0.0
-            action=next((item["a"] for item in valid if str(item.get("_canonical_action_signature",action_signature(item["a"])))==signature),{"kind":"no_op"})
+            row["error_upper_95"]=binomial_error_upper(row["errors"],row["accepted"],0.95)
+            action=next((cluster["a"] for cluster in action_clusters if cluster["canonical_action_signature"]==signature),{"kind":"no_op"})
             dangerous=action["kind"] in {"double_click","long_press","drag"} or action.get("button") in {"right","middle"}
             row["dangerous"]=dangerous
-            row_pass=row["total"]>=1 and row["accepted"]>=1 and row["errors"]==0 if dangerous else row["total"]>=1 and row["accepted"]>=1 and row["accepted_error_rate"] is not None and row["accepted_error_rate"]<=0.02
+            if dangerous:
+                row_pass=row["total"]>=50 and row["negative_total"]>=50 and row["errors"]==0 and row["false_positive"]==0 and row["coverage"]>=0.80
+            else:
+                row_pass=row["total"]>=20 and row["errors"]==0 and row["coverage"]>=0.80
             row["passed"]=bool(row_pass)
             action_rules_pass=action_rules_pass and bool(row_pass)
             per_action[signature]=row
@@ -4496,29 +5418,32 @@ class App:
             row["accuracy"]=row["correct"]/row["total"] if row["total"] else 0.0
             row["coverage"]=row["accepted"]/row["total"] if row["total"] else 0.0
             row["accepted_error_rate"]=row["errors"]/row["accepted"] if row["accepted"] else None
-            row["passed"]=bool(row["total"]>=3 and row["accepted"]>=1 and row["accepted_error_rate"] is not None and row["accepted_error_rate"]<=0.02 and row["coverage"]>=0.80)
+            row["error_upper_95"]=binomial_error_upper(row["errors"],row["accepted"],0.95)
+            row["passed"]=bool(row["total"]>=20 and row["errors"]==0 and row["coverage"]>=0.80)
             method_rules_pass=method_rules_pass and row["passed"]
             per_method[method]=row
-        enough=holdout_count>=20 and bool(split_info.get("complete")) and accepted>0 and bool(train_methods)
-        global_pass=coverage>=0.80 and overall_accuracy>=0.80 and accepted_error_rate is not None and accepted_error_rate<=0.02 and dangerous_false==0
-        validation_status="passed" if enough and global_pass and action_rules_pass and method_rules_pass and prototypes and not any(proto.get("ambiguous") for proto in prototypes) else ("insufficient" if not enough or not action_rules_pass or not method_rules_pass else "failed")
-        validation={"status":validation_status,"split":str(split_info.get("mode","unknown")),"split_complete":bool(split_info.get("complete")),"split_reason":str(split_info.get("reason","")),"strata":int(split_info.get("strata",0)),"holdout_sessions":len(holdout_sessions),"minimum_holdout":20,"minimum_coverage":0.80,"maximum_accepted_error_rate":0.02,"minimum_overall_accuracy":0.80,"maximum_dangerous_false":0,"holdout":holdout_count,"accepted":accepted,"errors":errors,"correct":correct,"coverage":coverage,"accepted_error_rate":accepted_error_rate,"overall_accuracy":overall_accuracy,"dangerous_false":dangerous_false,"dangerous_false_rate":dangerous_false_rate,"per_action":per_action,"per_capture_method":per_method,"ambiguous_prototypes":sum(1 for proto in prototypes if proto.get("ambiguous"))}
-        model={"created":time.time(),"samples":len(valid),"training_samples":len(train),"invalid_samples":stats["invalid"],"action_clusters":len(action_clusters),"rejection_constraints":rejection_constraints,"prototypes":prototypes,"capture_backends":train_methods,"validation":validation,"stopped":False}
+        enough=bool(split_info.get("complete")) and int(split_info.get("session_count",0))>=2 and holdout_count>=150 and accepted>=150 and bool(train_methods)
+        global_pass=coverage>=0.80 and overall_accuracy>=0.80 and error_upper_95<0.02 and dangerous_false==0 and uncovered_actions==0
+        passed=bool(enough and global_pass and action_rules_pass and method_rules_pass and prototypes and not any(proto.get("ambiguous") for proto in prototypes))
+        validation_status="passed" if passed else "insufficient" if not enough or not action_rules_pass or not method_rules_pass else "failed"
+        validation={"status":validation_status,"split":str(split_info.get("mode","unknown")),"split_complete":bool(split_info.get("complete")),"split_reason":str(split_info.get("reason","")),"strata":int(split_info.get("strata",0)),"session_count":int(split_info.get("session_count",0)),"holdout_sessions":sorted(holdout_sessions),"minimum_holdout":150,"minimum_accepted":150,"minimum_ordinary_action_holdout":20,"minimum_dangerous_positive":50,"minimum_dangerous_negative":50,"minimum_coverage":0.80,"maximum_error_upper_95":0.02,"minimum_overall_accuracy":0.80,"maximum_dangerous_false":0,"holdout":holdout_count,"accepted":accepted,"errors":errors,"correct":correct,"coverage":coverage,"accepted_error_rate":accepted_error_rate,"error_upper_95":error_upper_95,"overall_accuracy":overall_accuracy,"dangerous_false":dangerous_false,"dangerous_false_rate":dangerous_false_rate,"uncovered_actions":uncovered_actions,"decorrelated_removed":decorrelated_removed,"per_action":per_action,"per_capture_method":per_method,"ambiguous_prototypes":sum(1 for proto in prototypes if proto.get("ambiguous")),"training_checksums":train_checksums,"holdout_checksums":holdout_checksums,"checksum_intersection":[]}
+        model={"created":time.time(),"samples":len(decorrelated),"training_samples":len(train),"holdout_samples":len(holdout),"invalid_samples":stats["invalid"],"action_clusters":len(action_clusters),"rejection_constraints":rejection_constraints,"prototypes":prototypes,"capture_backends":train_methods,"validation":validation,"training_checksums":train_checksums,"holdout_checksums":holdout_checksums,"stopped":False}
         if not prototypes:
             raise RuntimeError("复习未生成可用原型")
         self.store.save_model(game["id"],model,validation_status=="passed")
         self.review_distance_cache={}
         self.set_progress(100)
-        label="通过验收" if validation_status=="passed" else ("验证不足，仅保存临时模型并禁止训练" if validation_status=="insufficient" else "验证失败，仅保存临时模型并禁止训练")
+        label="通过验收" if validation_status=="passed" else "验证不足，仅保存临时模型并禁止训练" if validation_status=="insufficient" else "验证失败，仅保存临时模型并禁止训练"
         error_text="无可计算值" if accepted_error_rate is None else str(round(accepted_error_rate*100,2))+"%"
-        split_label="按完整会话分组留出" if split_info.get("mode")=="session_group_stratified" else "单会话按时间块分层留出"
-        lines=["复习完成，"+label+"：原型"+str(len(prototypes))+"，"+split_label+str(holdout_count)+"，覆盖率"+str(round(coverage*100,2))+"%，接受错误率"+error_text+"，总体正确率"+str(round(overall_accuracy*100,2))+"%，危险动作误触"+str(dangerous_false)+"次"+("；留出失败原因："+str(split_info.get("reason")) if split_info.get("reason") else ""),"各动作独立留出验证："]
+        lines=["复习完成，"+label+"：原型"+str(len(prototypes))+"，独立session留出"+str(holdout_count)+"，接受"+str(accepted)+"，覆盖率"+str(round(coverage*100,2))+"%，接受错误率"+error_text+"，95%错误率上界"+str(round(error_upper_95*100,2))+"%，未覆盖动作"+str(uncovered_actions)+"，连续帧去相关移除"+str(decorrelated_removed)+("；留出失败原因："+str(split_info.get("reason")) if split_info.get("reason") else ""),"各动作独立留出验证："]
         for signature,row in sorted(per_action.items()):
-            lines.append(signature+"：留出"+str(row["total"])+"，接受"+str(row["accepted"])+"，错误"+str(row["errors"])+"，"+("通过" if row["passed"] else "未通过"))
+            lines.append(signature+"：正例"+str(row["total"])+"，负例"+str(row["negative_total"])+"，接受"+str(row["accepted"])+"，错误"+str(row["errors"])+"，危险误触"+str(row["false_positive"])+"，"+("通过" if row["passed"] else "未通过"))
         lines.append("各采集后端独立验证：")
         for method,row in sorted(per_method.items()):
-            lines.append(method+"：留出"+str(row["total"])+"，覆盖率"+str(round(row["coverage"]*100,2))+"%，"+("通过" if row["passed"] else "未通过"))
-        return "\n".join(lines)
+            lines.append(method+"：留出"+str(row["total"])+"，覆盖率"+str(round(row["coverage"]*100,2))+"%，错误"+str(row["errors"])+"，"+("通过" if row["passed"] else "未通过"))
+        return ModeResult("completed","\n".join(lines),{"validation":validation_status})
+    def review_worker(self):
+        return self.review_controller.run()
     def action_text(self,action):
         item=normalize_action(action) or {"kind":"no_op","duration":0.3}
         kind=item["kind"]
@@ -4686,8 +5611,10 @@ class App:
         except Exception as error:
             self.show_error(str(error))
             return
-        self.start_worker("训练",self.training_worker,True)
+        self.start_worker("训练",self.training_controller.run,True)
     def training_worker(self):
+        return self.training_controller.run()
+    def _training_worker_impl(self):
         game=self.require_game()
         target=self.require_window(False)
         model=self.store.load_model(game["id"])
@@ -4699,26 +5626,9 @@ class App:
             raise RuntimeError("当前采集后端未在完整模型中独立验证；请用该后端重新学习并复习")
         self.api.request_foreground(target["hwnd"])
         self.wait_escape_release()
-        key_queue=queue.Queue()
-        mouse_queue=queue.Queue()
-        mouse_interrupt=threading.Event()
-        keyboard_interrupt=threading.Event()
-        def other_key(event):
-            keyboard_interrupt.set()
-            try:
-                key_queue.put_nowait(event)
-            except Exception:
-                pass
-            self.api.block_input()
-            self.set_input_status("因键盘输入锁定")
-        def human_mouse(event):
-            mouse_interrupt.set()
-            try:
-                mouse_queue.put_nowait(event)
-            except Exception:
-                pass
-            self.api.block_input()
-            self.set_input_status("因人工干扰锁定")
+        isolation=StrictInputIsolation(self.stop_event)
+        mouse_interrupt=None
+        keyboard_interrupt=None
         actions=0
         keyboard_count=0
         mouse_count=0
@@ -4736,47 +5646,34 @@ class App:
         previous_frame_stamp=0.0
         state_since=time.time()
         action_hits=defaultdict(deque)
-        pause_until=0.0
-        mouse_pause_until=0.0
         with ModeSession(self,target) as session:
             frame_buffer=session.start_frames(max(8.0,float(calibration.get("fps",15.0))),2.5,0.1,"training")
-            keyboard=session.start_keyboard(other_key)
-            mouse=session.start_mouse(human_mouse)
+            keyboard=session.start_keyboard()
+            mouse=session.start_mouse()
+            self.lifecycle.mark_running()
+            self.mode_state=MODE_RUNNING
+            keyboard_interrupt=keyboard.other_event
+            mouse_interrupt=mouse.input_event
             while not self.should_stop():
-                mouse_interrupt.clear()
-                keyboard_interrupt.clear()
-                while True:
-                    try:
-                        event=key_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    keyboard_count+=1
-                    pause_until=max(pause_until,float(event["time"])+0.25)
+                key_events=[event for event in keyboard.drain() if event.get("kind")=="other" and event.get("down")]
+                mouse_events=mouse.drain()
+                if key_events or mouse_events:
+                    keyboard_count+=len(key_events)
+                    mouse_count+=len(mouse_events)
+                    if key_events:
+                        isolation.signal("keyboard",key_events[0].get("time"))
+                        reason="检测到非ESC键盘输入，训练立即停止"
+                        self.set_input_status("因键盘输入锁定")
+                    else:
+                        isolation.signal("mouse",mouse_events[0].get("time") if mouse_events else time.time())
+                        reason="检测到物理鼠标输入，训练立即停止"
+                        self.set_input_status("因人工鼠标输入锁定")
+                    self.lifecycle.request_stop("stopped",reason)
+                    self.mode_state=MODE_STOPPING
                     self.api.block_input()
-                    candidate_id=None
-                    candidate_count=0
-                while True:
-                    try:
-                        event=mouse_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    mouse_count+=1
-                    mouse_pause_until=max(mouse_pause_until,float(event["time"])+0.55)
-                    self.api.block_input()
-                    candidate_id=None
-                    candidate_count=0
-                    candidate_frame_stamp=0.0
-                    state_unlocked=True
-                if time.time()<pause_until or not keyboard.all_released():
-                    self.api.block_input()
-                    self.set_status("检测到非ESC键盘输入，训练已暂停；等待全部按键释放")
-                    time.sleep(0.03)
-                    continue
-                if time.time()<mouse_pause_until or not mouse.stable_for(0.45):
-                    self.api.block_input()
-                    self.set_status("检测到人工鼠标移动、点击或滚轮，已立即释放按键并清空连续确认；等待鼠标稳定")
-                    time.sleep(0.03)
-                    continue
+                    self.api.release_all_buttons()
+                    self.set_status(reason+"；不会自动恢复")
+                    break
                 self.api.block_input()
                 self.set_input_status("等待连续确认")
                 try:
@@ -4929,21 +5826,16 @@ class App:
                     self.set_status("训练中："+self.action_text(action)+"；全部安全条件已通过；采集="+fresh["method"])
                     self.execute_action(target,action,fresh,mouse_interrupt,keyboard,keyboard_interrupt)
                 except InputStopped:
-                    if self.stop_event is not None and self.stop_event.is_set():
-                        raise
-                    candidate_id=None
-                    candidate_count=0
-                    candidate_frame_stamp=0.0
-                    if mouse_interrupt.is_set():
-                        self.set_status("检测到人工鼠标干扰，动作已立即中止并释放全部鼠标键")
-                        self.set_input_status("因人工干扰锁定")
-                    elif keyboard_interrupt.is_set() or not keyboard.all_released():
-                        self.set_status("检测到非ESC键盘输入，动作已中止并等待全部按键释放")
-                        self.set_input_status("因键盘输入锁定")
-                    else:
-                        self.set_status("动作前最后安全验证未通过，已取消本次动作")
-                        self.set_input_status("等待连续确认")
-                    continue
+                    if mouse_interrupt.is_set() or keyboard_interrupt.is_set() or not keyboard.all_released():
+                        kind="mouse" if mouse_interrupt.is_set() else "keyboard"
+                        isolation.signal(kind,time.time())
+                        reason="检测到物理鼠标输入，训练立即停止" if kind=="mouse" else "检测到非ESC键盘输入，训练立即停止"
+                        self.lifecycle.request_stop("stopped",reason)
+                        self.mode_state=MODE_STOPPING
+                        self.api.block_input()
+                        self.api.release_all_buttons()
+                        self.set_status(reason+"；不会自动恢复")
+                    raise
                 except TargetUnavailable as error:
                     candidate_id=None
                     candidate_count=0
@@ -4988,7 +5880,8 @@ class App:
                     state_unlocked=True
                     state_since=time.time()
                 time.sleep(0.05)
-        return "训练已结束，AI执行"+str(actions)+"个鼠标动作；检测到非ESC键盘输入"+str(keyboard_count)+"次，人工鼠标干扰"+str(mouse_count)+"次；每次干扰均立即释放鼠标键、清空连续确认并等待稳定"
+        summary="训练已停止，AI执行"+str(actions)+"个鼠标动作；检测到非ESC键盘输入"+str(keyboard_count)+"次，物理鼠标输入"+str(mouse_count)+"次"
+        return ModeResult("stopped" if self.stop_event and self.stop_event.is_set() else "completed",summary,{"strict_input_violation":isolation.kind})
     def basic_actions(self):
         result=[]
         for y in (0.18,0.35,0.5,0.68,0.84):
@@ -4997,455 +5890,314 @@ class App:
         result.extend([normalize_action({"kind":"double_click","button":"left","path":[[0.5,0.5]],"duration":0.16}),normalize_action({"kind":"drag","button":"left","path":[[0.25,0.5],[0.75,0.5]],"duration":0.45}),normalize_action({"kind":"drag","button":"left","path":[[0.5,0.75],[0.5,0.25]],"duration":0.45}),normalize_action({"kind":"no_op","duration":0.4}),normalize_action({"kind":"scroll_v","delta":120,"path":[[0.5,0.5]],"duration":0.08}),normalize_action({"kind":"scroll_v","delta":-120,"path":[[0.5,0.5]],"duration":0.08})])
         return result
     def start_ask(self):
+        self.start_worker("请教",self.teaching_controller.run,True)
+    def _create_ask_window(self,prepared):
+        created=prepared.get("created")
         try:
-            return self._start_ask_impl()
-        except Exception:
-            error=traceback.format_exc()
-            try:
-                self.close_ask(show_summary=False,wait_buffer=False)
-            except Exception:
-                pass
-            self.mode=None
-            self.set_controls(False)
-            self.show_error(error)
-    def _start_ask_impl(self):
-        if self.mode or self.closing:
-            self.show_error("当前已有操作正在运行，请先停止")
-            return
-        try:
-            game=self.require_game()
-            target=self.require_window(False)
-            samples,stats=self.store.load_samples(game["id"])
-            try:
-                model=self.store.load_model(game["id"])
-            except Exception:
-                model=None
-            prototypes=[item for item in (model.get("prototypes",[]) if model else []) if feature_valid(item.get("f")) and normalize_action(item.get("a"))]
-            historical=[]
-            for item in samples:
-                action=normalize_action(item.get("a"))
-                if feature_valid(item.get("f")) and action:
-                    historical.append({"id":str(item.get("checksum",uuid.uuid4().hex)),"f":item["f"],"coarse":item.get("coarse") if isinstance(item.get("coarse"),(bytes,bytearray)) and len(item.get("coarse"))==COARSE_LEN else coarse_feature(item["f"]),"a":action,"cluster_id":"history|"+action_signature(action),"canonical_action_signature":action_signature(action),"repeat_policy":str(item.get("repeat_policy","one_shot")),"source":"sample"})
-            calibration=self.ensure_capture_calibration(target,"请教")
-            self.ask_session_id="teach|"+uuid.uuid4().hex
-            self.ask_buffer=FrameBuffer(self.api,target,20.0,2.5,0.1,"teaching").start()
-        except Exception as error:
-            if self.ask_buffer is not None:
-                self.ask_buffer.stop()
-                self.ask_buffer=None
-            self.show_error(str(error))
-            return
-        self.mode="请教"
-        self.api.block_input()
-        self.set_input_status("已锁定")
-        self.set_controls(True)
-        self.status.set("请教已开始：请教窗口可保持前台，目标窗口将通过后台采集出题；ESC或“停止”结束")
-        win=tk.Toplevel(self.root)
-        self.ask_window=win
-        win.title("请教")
-        win.geometry("780x780")
-        win.minsize(700,700)
-        win.transient(self.root)
-        win.bind("<Unmap>",lambda event:self.ask_buffer.set_preview_active(False) if self.ask_buffer is not None else None)
-        win.bind("<Map>",lambda event:self.ask_buffer.set_preview_active(True) if self.ask_buffer is not None else None)
-        win.bind("<FocusOut>",lambda event:self.ask_buffer.set_preview_active(False) if self.ask_buffer is not None else None)
-        win.bind("<FocusIn>",lambda event:self.ask_buffer.set_preview_active(True) if self.ask_buffer is not None else None)
-        frame=ttk.Frame(win,padding=16)
-        frame.pack(fill="both",expand=True)
-        ttk.Label(frame,text="请选择当前画面中AI应该执行的鼠标动作",font=("Microsoft YaHei UI",14,"bold")).pack(anchor="w")
-        ttk.Label(frame,text="优先展示歧义、拒识或候选动作接近的实时状态。请教窗口在前台时不会要求游戏窗口也在前台。",wraplength=730).pack(anchor="w",pady=(4,10))
-        canvas=tk.Canvas(frame,width=672,height=378,bg="black",highlightthickness=1,highlightbackground="#777777")
-        canvas.pack()
-        preview_info=tk.StringVar(value="等待彩色教学预览")
-        ttk.Label(frame,textvariable=preview_info,wraplength=730).pack(anchor="w",fill="x",pady=(6,0))
-        choice_frame=ttk.Frame(frame)
-        choice_frame.pack(fill="both",expand=True,pady=(10,0))
-        answer_buttons=[]
-        count={"saved":0,"duplicates":0,"skipped":0,"rejected":0}
-        self.ask_counts=count
-        state={"frame":None,"choices":[],"image":None,"locked":False,"candidates":[],"recent_actions":deque(["<START>","<START>"],maxlen=4),"state_since":time.time(),"init_deadline":time.monotonic()+3.0,"initialized":False}
-        sources=[]
-        for proto in prototypes:
-            sources.append({"a":normalize_action(proto["a"]),"repeat_policy":str(proto.get("repeat_policy","one_shot")),"cluster_id":str(proto.get("cluster_id",""))})
-        for item in historical:
-            sources.append({"a":item["a"],"repeat_policy":item.get("repeat_policy","one_shot"),"cluster_id":item["cluster_id"]})
-        sources.extend({"a":action,"repeat_policy":"one_shot","cluster_id":"basic|"+action_signature(action)} for action in self.basic_actions())
-        unique=[]
-        seen=set()
-        for entry in sources:
-            signature=action_signature(entry["a"])
-            if signature and signature not in seen:
-                seen.add(signature)
-                unique.append(entry)
-        def schedule(delay,callback):
-            if self.ask_window is None:
+            if self.mode!="请教" or self.stop_event is None or self.stop_event.is_set() or self.closing:
                 return
-            holder={"id":None}
-            def wrapped():
-                self.ask_after_ids.discard(holder["id"])
-                if self.ask_window is not None:
-                    callback()
-            holder["id"]=win.after(delay,wrapped)
-            self.ask_after_ids.add(holder["id"])
-        def set_locked(value):
-            state["locked"]=bool(value)
-            for index,button in enumerate(answer_buttons):
-                button.configure(state="normal" if not value and index<len(state["choices"]) else "disabled")
-            skip_button.configure(state="disabled" if value else "normal")
-            reject_button.configure(state="disabled" if value else "normal")
-            custom_button.configure(state="disabled" if value else "normal")
-        def render(question_frame,choices):
-            preview=preview_rgb_bytes(question_frame.get("preview_rgb")) or bytes(PREVIEW_W*PREVIEW_H*3)
-            ppm=b"P6\n"+str(PREVIEW_W).encode("ascii")+b" "+str(PREVIEW_H).encode("ascii")+b"\n255\n"+preview
-            image=tk.PhotoImage(data=base64.b64encode(ppm).decode("ascii"),format="PPM")
-            scaled=image.zoom(2,2)
-            state["image"]=(image,scaled)
-            canvas.delete("all")
-            x0=16
-            y0=9
-            canvas.create_image(x0,y0,image=scaled,anchor="nw")
-            colors=("#00ffff","#ffff00","#ff66ff","#66ff66")
-            for index,entry in enumerate(choices[:4]):
-                action=normalize_action(entry.get("a"))
-                if not action or action["kind"]=="no_op":
-                    continue
-                path=action.get("path") or []
-                points=[]
-                for point in path:
-                    points.extend([x0+float(point[0])*639,y0+float(point[1])*359])
-                color=colors[index%len(colors)]
-                if len(points)>=4:
-                    canvas.create_line(*points,fill=color,width=3,arrow="last")
-                if len(points)>=2:
-                    canvas.create_oval(points[-2]-6,points[-1]-6,points[-2]+6,points[-1]+6,outline=color,width=3)
-                    canvas.create_text(points[-2]+10,points[-1]-10,text=chr(65+index),fill=color,font=("Microsoft YaHei UI",12,"bold"),anchor="sw")
-            latest=self.ask_buffer.latest(None,2.0) if self.ask_buffer is not None else None
-            is_latest=bool(latest and abs(float(latest["time"])-float(question_frame.get("time",0)))<0.05)
-            warnings=[]
-            if question_frame.get("protected_or_black"):
-                warnings.append("黑屏/受保护画面")
-            if question_frame.get("stale"):
-                warnings.append("长时间重复")
-            if question_frame.get("backend_changed"):
-                warnings.append("采集后端变化")
-            if not question_frame.get("backend_validated"):
-                warnings.append("后端未验收")
-            if not question_frame.get("capture_valid"):
-                warnings.append("画面无效")
-            stamp=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(float(question_frame.get("time",time.time()))))
-            preview_info.set("采集时间："+stamp+"  后端："+str(question_frame.get("method","未知"))+"  最新帧："+("是" if is_latest else "否")+"  质量告警："+("、".join(warnings) if warnings else "无"))
-        def select_question_frame():
-            frames=self.ask_buffer.snapshot(1.8) if self.ask_buffer is not None else []
-            if not frames:
-                return None,[]
-            usable=[frame for frame in frames if frame.get("usable_for_teaching")]
-            if not usable:
-                return frames[-1],[]
-            if not prototypes:
-                return usable[-1],[]
-            selected=usable[-1]
-            temporal=self.build_temporal_context(self.ask_buffer,selected,state["recent_actions"],state["state_since"])
-            temporal["previous_action_changed_frame"]=True
-            selected_ranked=self.rank_action_candidates(selected["f"],prototypes,"",18,temporal,selected.get("coarse"))
-            selected_priority=float("inf")
-            for candidate_frame in usable[-28:]:
-                temporal=self.build_temporal_context(self.ask_buffer,candidate_frame,state["recent_actions"],state["state_since"])
-                temporal["previous_action_changed_frame"]=True
-                ranked=self.rank_action_candidates(candidate_frame["f"],prototypes,"",18,temporal,candidate_frame.get("coarse"))
-                if not ranked:
-                    priority=-2.0
-                else:
-                    decision=self.evaluate_action_candidates(ranked)
-                    gap=(ranked[1]["score"]-ranked[0]["score"])/max(1.0,ranked[0]["score"]) if len(ranked)>1 else 10.0
-                    priority=gap
-                    if decision.get("ambiguous"):
-                        priority-=3.0
-                    elif not decision.get("accepted"):
-                        priority-=1.0
-                if priority<selected_priority:
-                    selected_priority=priority
-                    selected=candidate_frame
-                    selected_ranked=ranked
-            return selected,selected_ranked
-        def make_choices(question_frame,ranked):
-            choices=[]
-            signatures=set()
-            for item in ranked[:4]:
-                action=normalize_action(item["a"])
-                signature=action_signature(action)
-                if signature and signature not in signatures:
-                    signatures.add(signature)
-                    choices.append({"a":action,"repeat_policy":str(item["proto"].get("repeat_policy","one_shot")),"cluster_id":item["cluster_id"]})
-                if len(choices)>=3:
-                    break
-            if not choices and historical:
-                query=coarse_feature(question_frame["f"])
-                rough=sorted((coarse_distance(query,item["coarse"]),item) for item in historical)[:20]
-                for _,item in sorted((feature_distance(question_frame["f"],item["f"]),item) for _,item in rough):
-                    signature=action_signature(item["a"])
-                    if signature not in signatures:
-                        signatures.add(signature)
-                        choices.append({"a":item["a"],"repeat_policy":item.get("repeat_policy","one_shot"),"cluster_id":item["cluster_id"]})
-                    if len(choices)>=2:
-                        break
-            distractors=list(unique)
-            random.shuffle(distractors)
-            for entry in distractors:
-                signature=action_signature(entry["a"])
-                if signature and signature not in signatures:
-                    signatures.add(signature)
-                    choices.append(dict(entry))
-                if len(choices)>=4:
-                    break
-            random.shuffle(choices)
-            choices=choices[:4]
-            candidates=[{"cluster_id":entry.get("cluster_id",""),"canonical_action_signature":action_signature(entry["a"]),"a":entry["a"]} for entry in choices]
-            return choices,candidates
-        def new_question():
-            if self.ask_window is None:
-                return
-            set_locked(True)
-            try:
-                self.api.validate_target(target,False)
-            except Exception as error:
-                if not state["initialized"] and time.monotonic()>=state["init_deadline"]:
-                    self.close_ask(show_summary=False,wait_buffer=False)
-                    self.show_error("请教启动失败："+str(error))
+            game=prepared["game"]
+            target=prepared["target"]
+            buffer=prepared["buffer"]
+            producer=prepared["producer"]
+            initial=prepared["packet"]
+            self.lifecycle.mark_running()
+            self.mode_state=MODE_RUNNING
+            self.api.block_input()
+            self.set_input_status("已锁定")
+            self.status.set("请教已开始：题目由后台线程生成；ESC或“停止”结束")
+            win=tk.Toplevel(self.root)
+            self.ask_window=win
+            win.title("请教")
+            win.geometry("780x780")
+            win.minsize(700,700)
+            win.transient(self.root)
+            win.bind("<Unmap>",lambda event:buffer.set_preview_active(False))
+            win.bind("<Map>",lambda event:buffer.set_preview_active(True))
+            win.bind("<FocusOut>",lambda event:buffer.set_preview_active(False))
+            win.bind("<FocusIn>",lambda event:buffer.set_preview_active(True))
+            frame=ttk.Frame(win,padding=16)
+            frame.pack(fill="both",expand=True)
+            ttk.Label(frame,text="请选择当前画面中AI应该执行的鼠标动作",font=("Microsoft YaHei UI",14,"bold")).pack(anchor="w")
+            ttk.Label(frame,text="候选排序在后台线程完成；请教窗口在前台时不要求游戏窗口也在前台。",wraplength=730).pack(anchor="w",pady=(4,10))
+            canvas=tk.Canvas(frame,width=ASK_CANVAS_W,height=ASK_CANVAS_H,bg="black",highlightthickness=1,highlightbackground="#777777")
+            canvas.pack()
+            preview_info=tk.StringVar(value="等待彩色教学预览")
+            ttk.Label(frame,textvariable=preview_info,wraplength=730).pack(anchor="w",fill="x",pady=(6,0))
+            choice_frame=ttk.Frame(frame)
+            choice_frame.pack(fill="both",expand=True,pady=(10,0))
+            answer_buttons=[]
+            state={"frame":None,"choices":[],"candidates":[],"image":None,"locked":False,"recent_actions":deque(["<START>","<START>"],maxlen=4),"state_since":time.time(),"waiting":False}
+            def schedule(delay,callback):
+                if self.ask_window is None:
                     return
-                self.status.set("请教等待目标窗口恢复或等待后台采集画面："+str(error))
-                schedule(180,new_question)
-                return
-            question_frame,ranked=select_question_frame()
-            if question_frame is None:
-                if not state["initialized"] and time.monotonic()>=state["init_deadline"]:
-                    message=self.ask_buffer.last_error if self.ask_buffer is not None else "尚无画面"
-                    self.close_ask(show_summary=False,wait_buffer=False)
-                    self.show_error("请教启动失败：未在3秒内获得合格画面；"+str(message))
+                holder={"id":None}
+                def wrapped():
+                    self.ask_after_ids.discard(holder["id"])
+                    if self.ask_window is not None:
+                        callback()
+                holder["id"]=win.after(delay,wrapped)
+                self.ask_after_ids.add(holder["id"])
+            def set_locked(value):
+                state["locked"]=bool(value)
+                for index,button in enumerate(answer_buttons):
+                    button.configure(state="normal" if not value and index<len(state["choices"]) else "disabled")
+                skip_button.configure(state="disabled" if value else "normal")
+                reject_button.configure(state="disabled" if value else "normal")
+                custom_button.configure(state="disabled" if value else "normal")
+            def render(packet):
+                question_frame=packet["frame"]
+                choices=packet["choices"]
+                preview=preview_rgb_bytes(question_frame.get("preview_rgb")) or bytes(PREVIEW_W*PREVIEW_H*3)
+                ppm=b"P6\n"+str(PREVIEW_W).encode("ascii")+b" "+str(PREVIEW_H).encode("ascii")+b"\n255\n"+preview
+                image=tk.PhotoImage(data=base64.b64encode(ppm).decode("ascii"),format="PPM")
+                scaled=image.zoom(2,2)
+                state["image"]=(image,scaled)
+                canvas.delete("all")
+                canvas.create_image(ASK_PREVIEW_X,ASK_PREVIEW_Y,image=scaled,anchor="nw")
+                colors=("#00ffff","#ffff00","#ff66ff","#66ff66")
+                for index,entry in enumerate(choices[:4]):
+                    action=normalize_action(entry.get("a"))
+                    if not action or action["kind"]=="no_op":
+                        continue
+                    points=[]
+                    for point in action.get("path") or []:
+                        cx,cy=PreviewCoordinateMapper.to_canvas(point)
+                        points.extend([cx,cy])
+                    color=colors[index%len(colors)]
+                    if len(points)>=4:
+                        canvas.create_line(*points,fill=color,width=3,arrow="last")
+                    if len(points)>=2:
+                        canvas.create_oval(points[-2]-6,points[-1]-6,points[-2]+6,points[-1]+6,outline=color,width=3)
+                        canvas.create_text(points[-2]+10,points[-1]-10,text=chr(65+index),fill=color,font=("Microsoft YaHei UI",12,"bold"),anchor="sw")
+                latest=buffer.latest(None,2.0)
+                is_latest=bool(latest and abs(float(latest["time"])-float(question_frame.get("time",0)))<0.05)
+                warnings=[]
+                if question_frame.get("protected_or_black"):
+                    warnings.append("黑屏/受保护画面")
+                if question_frame.get("stale"):
+                    warnings.append("长时间重复")
+                if question_frame.get("backend_changed"):
+                    warnings.append("采集后端变化")
+                if not question_frame.get("backend_validated"):
+                    warnings.append("后端未验收")
+                if not question_frame.get("capture_valid"):
+                    warnings.append("画面无效")
+                stamp=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(float(question_frame.get("time",time.time()))))
+                preview_info.set("采集时间："+stamp+"  后端："+str(question_frame.get("method","未知"))+"  最新帧："+("是" if is_latest else "否")+"  质量告警："+("、".join(warnings) if warnings else "无"))
+            def apply_packet(packet):
+                if self.ask_window is None:
                     return
-                self.status.set("请教等待目标窗口恢复或等待后台采集画面："+(self.ask_buffer.last_error if self.ask_buffer is not None else "尚无画面"))
-                schedule(160,new_question)
-                return
-            if not question_frame.get("usable_for_teaching"):
-                if not state["initialized"] and time.monotonic()>=state["init_deadline"]:
-                    self.close_ask(show_summary=False,wait_buffer=False)
-                    self.show_error("请教启动失败：采集画面未通过黑屏、重复、动态后端或质量验收")
-                    return
-                state["frame"]=question_frame
-                state["choices"]=[]
-                state["candidates"]=[]
-                render(question_frame,[])
-                self.status.set("当前画面仅可预览，因黑屏、重复、未验收或后端变化而拒绝请教答案")
-                schedule(180,new_question)
-                return
-            state["initialized"]=True
-            choices,candidates=make_choices(question_frame,ranked)
-            state["frame"]=question_frame
-            state["choices"]=choices
-            state["candidates"]=candidates
-            render(question_frame,choices)
-            for index,button in enumerate(answer_buttons):
-                if index<len(choices):
-                    button.configure(text=chr(65+index)+". "+self.action_text(choices[index]["a"]))
-                else:
-                    button.configure(text=chr(65+index)+". 无可用答案")
-            set_locked(False)
-        def context_for(entry=None):
-            question_frame=state["frame"] or {}
-            policy=str((entry or {}).get("repeat_policy","one_shot"))
-            temporal=self.build_temporal_context(self.ask_buffer,question_frame,state["recent_actions"],state["state_since"])
-            temporal["previous_action_changed_frame"]=True
-            return self.sample_context(state["recent_actions"][-1] if state["recent_actions"] else "",0,True,question_frame.get("motion_valid",False),self.ask_session_id,question_frame.get("method","unknown"),policy,temporal)
-        def finish_answer():
-            self.status.set("请教中：已保存"+str(count["saved"])+"，重复未保存"+str(count["duplicates"])+"，跳过"+str(count["skipped"])+"，拒绝记录"+str(count["rejected"])+"；模型需要复习")
-            schedule(140,new_question)
-        def choose(index):
-            if self.ask_window is None or state["locked"] or index>=len(state["choices"]):
-                return
-            set_locked(True)
-            try:
-                entry=state["choices"][index]
-                question_frame=state["frame"]
-                if not question_frame.get("usable_for_teaching"):
-                    raise CaptureUnavailable("当前画面不可用于请教")
-                saved=self.store.append_sample(game["id"],question_frame["f"],entry["a"],"teach_live",context_for(entry),question_frame.get("gray"),3.0)
-                count["saved" if saved else "duplicates"]+=1
-                if saved:
-                    state["recent_actions"].append(action_signature(entry["a"]))
-                    state["state_since"]=time.time()
-                finish_answer()
-            except Exception as error:
-                self.close_ask(show_summary=False,wait_buffer=False)
-                self.show_error("请教数据库写入失败，已逆序释放资源："+str(error))
-        def skip():
-            if state["locked"]:
-                return
-            set_locked(True); count["skipped"]+=1; finish_answer()
-        def reject():
-            if state["locked"]:
-                return
-            set_locked(True)
-            try:
-                question_frame=state["frame"]
-                if not question_frame.get("usable_for_teaching"):
-                    raise CaptureUnavailable("当前画面不可用于请教")
-                self.store.append_rejection(game["id"],question_frame["f"],state["candidates"],"teach_live_reject",question_frame.get("gray"),context_for())
-                count["rejected"]+=1
-                finish_answer()
-            except Exception as error:
-                self.close_ask(show_summary=False,wait_buffer=False)
-                self.show_error("请教数据库写入失败，已逆序释放资源："+str(error))
-        def custom():
-            if state["locked"]:
-                return
-            set_locked(True)
-            dialog=tk.Toplevel(win)
-            dialog.title("自定义鼠标动作")
-            dialog.geometry("760x650")
-            dialog.transient(win)
-            dialog.grab_set()
-            controls=ttk.Frame(dialog,padding=10)
-            controls.pack(fill="x")
-            kind_var=tk.StringVar(value="click")
-            button_var=tk.StringVar(value="left")
-            duration_var=tk.StringVar(value="0.12")
-            delta_var=tk.StringVar(value="120")
-            policy_var=tk.StringVar(value="one_shot")
-            fields=[("动作",kind_var,["click","double_click","long_press","drag","scroll_v","scroll_h","move","hover","no_op"]),("按钮",button_var,["left","right","middle"]),("重复策略",policy_var,["one_shot","repeatable","hold_until_change","rate_limited"])]
-            for column,(label,var,values) in enumerate(fields):
-                ttk.Label(controls,text=label).grid(row=0,column=column,sticky="w",padx=4)
-                ttk.Combobox(controls,textvariable=var,values=values,state="readonly",width=18).grid(row=1,column=column,padx=4)
-            ttk.Label(controls,text="持续秒").grid(row=2,column=0,sticky="w",padx=4,pady=(8,0))
-            ttk.Entry(controls,textvariable=duration_var,width=20).grid(row=3,column=0,padx=4,sticky="w")
-            ttk.Label(controls,text="滚轮增量").grid(row=2,column=1,sticky="w",padx=4,pady=(8,0))
-            ttk.Entry(controls,textvariable=delta_var,width=20).grid(row=3,column=1,padx=4,sticky="w")
-            ttk.Label(dialog,text="在画面上单击可选择位置；拖动可定义移动或拖动路径。其他动作也会使用最后位置。",wraplength=720).pack(pady=(0,8))
-            custom_canvas=tk.Canvas(dialog,width=672,height=378,bg="black",highlightthickness=1,highlightbackground="#777777")
-            custom_canvas.pack()
-            custom_canvas.create_image(336,189,image=state["image"][1])
-            path_state={"start":[0.5,0.5],"end":[0.5,0.5],"line":None}
-            def press(event):
-                path_state["start"]=[max(0,min(671,event.x))/671,max(0,min(377,event.y))/377]
-                path_state["end"]=list(path_state["start"])
-            def motion_event(event):
-                path_state["end"]=[max(0,min(671,event.x))/671,max(0,min(377,event.y))/377]
-                if path_state["line"]:
-                    custom_canvas.delete(path_state["line"])
-                path_state["line"]=custom_canvas.create_line(path_state["start"][0]*671,path_state["start"][1]*377,path_state["end"][0]*671,path_state["end"][1]*377,width=3,arrow="last")
-            def release(event):
-                motion_event(event)
-            error_var=tk.StringVar()
-            ttk.Label(dialog,textvariable=error_var).pack()
-            def submit():
-                try:
-                    kind=kind_var.get()
-                    duration=float(duration_var.get())
-                    if kind=="no_op":
-                        raw={"kind":kind,"duration":duration}
-                    elif kind in {"scroll_v","scroll_h"}:
-                        raw={"kind":kind,"delta":int(delta_var.get()),"path":[path_state["end"]],"duration":duration}
-                    elif kind in {"click","double_click","long_press"}:
-                        raw={"kind":kind,"button":button_var.get(),"path":[path_state["end"]],"duration":duration}
-                    elif kind=="drag":
-                        raw={"kind":kind,"button":button_var.get(),"path":[path_state["start"],path_state["end"]],"duration":duration}
+                state["waiting"]=False
+                state["frame"]=packet["frame"]
+                state["choices"]=packet["choices"]
+                state["candidates"]=packet["candidates"]
+                render(packet)
+                for index,button in enumerate(answer_buttons):
+                    if index<len(state["choices"]):
+                        button.configure(text=chr(65+index)+". "+self.action_text(state["choices"][index]["a"]))
                     else:
-                        raw={"kind":kind,"path":[path_state["start"],path_state["end"]],"duration":duration}
-                    action=normalize_action(raw)
-                    if not action:
-                        raise ValueError("动作参数无效")
-                    question_frame=state["frame"]
-                    entry={"a":action,"repeat_policy":policy_var.get()}
-                    if not question_frame.get("usable_for_teaching"):
-                        raise CaptureUnavailable("当前画面不可用于请教")
-                    saved=self.store.append_sample(game["id"],question_frame["f"],action,"teach_live_custom",context_for(entry),question_frame.get("gray"),3.5)
-                    count["saved" if saved else "duplicates"]+=1
-                    if saved:
-                        state["recent_actions"].append(action_signature(action))
-                        state["state_since"]=time.time()
-                    dialog.destroy(); finish_answer()
-                except Exception as error:
+                        button.configure(text=chr(65+index)+". 无可用答案")
+                set_locked(False)
+            def poll_question():
+                if self.ask_window is None or self.stop_event is None or self.stop_event.is_set():
+                    return
+                packet=producer.get_result(0.0)
+                if packet is None:
+                    schedule(45,poll_question)
+                    return
+                if packet.get("error"):
+                    self.status.set("请教等待可用画面："+str(packet["error"]))
+                    producer.request(state["recent_actions"],state["state_since"])
+                    schedule(160,poll_question)
+                    return
+                apply_packet(packet)
+            def request_question():
+                if self.ask_window is None or state["waiting"]:
+                    return
+                state["waiting"]=True
+                set_locked(True)
+                producer.request(state["recent_actions"],state["state_since"])
+                schedule(20,poll_question)
+            def finish_answer(result,error):
+                if self.ask_window is None:
+                    return
+                if error:
+                    self._fail_active_mode(error)
+                    return
+                if result and result.get("saved") and result.get("action"):
+                    state["recent_actions"].append(action_signature(result["action"]))
+                    state["state_since"]=time.time()
+                counts=self.ask_counts or {}
+                self.status.set("请教中：已保存"+str(counts.get("saved",0))+"，重复未保存"+str(counts.get("duplicates",0))+"，跳过"+str(counts.get("skipped",0))+"，拒绝记录"+str(counts.get("rejected",0))+"；模型需要复习")
+                schedule(100,request_question)
+            def queue_answer(kind,entry=None,candidates=None):
+                if state["locked"] or self.ask_answer_queue is None:
+                    return
+                set_locked(True)
+                command={"kind":kind,"frame":state["frame"],"entry":entry or {},"candidates":candidates or [],"recent_actions":list(state["recent_actions"]),"state_since":state["state_since"],"callback":finish_answer}
+                self.ask_answer_queue.put(command)
+            def choose(index):
+                if index<len(state["choices"]):
+                    queue_answer("choose",state["choices"][index])
+            def skip():
+                queue_answer("skip")
+            def reject():
+                queue_answer("reject",{},state["candidates"])
+            def custom():
+                if state["locked"] or state["image"] is None:
+                    return
+                set_locked(True)
+                dialog=tk.Toplevel(win)
+                dialog.title("自定义鼠标动作")
+                dialog.geometry("760x650")
+                dialog.transient(win)
+                dialog.grab_set()
+                controls=ttk.Frame(dialog,padding=10)
+                controls.pack(fill="x")
+                kind_var=tk.StringVar(value="click")
+                button_var=tk.StringVar(value="left")
+                duration_var=tk.StringVar(value="0.12")
+                delta_var=tk.StringVar(value="120")
+                policy_var=tk.StringVar(value="one_shot")
+                fields=[("动作",kind_var,["click","double_click","long_press","drag","scroll_v","scroll_h","move","hover","no_op"]),("按钮",button_var,["left","right","middle"]),("重复策略",policy_var,["one_shot","repeatable","hold_until_change","rate_limited"])]
+                for column,(label,var,values) in enumerate(fields):
+                    ttk.Label(controls,text=label).grid(row=0,column=column,sticky="w",padx=4)
+                    ttk.Combobox(controls,textvariable=var,values=values,state="readonly",width=18).grid(row=1,column=column,padx=4)
+                ttk.Label(controls,text="持续秒").grid(row=2,column=0,sticky="w",padx=4,pady=(8,0))
+                ttk.Entry(controls,textvariable=duration_var,width=20).grid(row=3,column=0,padx=4,sticky="w")
+                ttk.Label(controls,text="滚轮增量").grid(row=2,column=1,sticky="w",padx=4,pady=(8,0))
+                ttk.Entry(controls,textvariable=delta_var,width=20).grid(row=3,column=1,padx=4,sticky="w")
+                ttk.Label(dialog,text="只能在640×360游戏预览区域内单击或拖动；边框区域会被拒绝。",wraplength=720).pack(pady=(0,8))
+                custom_canvas=tk.Canvas(dialog,width=ASK_CANVAS_W,height=ASK_CANVAS_H,bg="black",highlightthickness=1,highlightbackground="#777777")
+                custom_canvas.pack()
+                custom_canvas.create_image(ASK_PREVIEW_X,ASK_PREVIEW_Y,image=state["image"][1],anchor="nw")
+                path_state={"start":None,"end":None,"line":None}
+                error_var=tk.StringVar()
+                ttk.Label(dialog,textvariable=error_var).pack()
+                def draw_path():
+                    if path_state["line"]:
+                        custom_canvas.delete(path_state["line"])
+                        path_state["line"]=None
+                    if path_state["start"] is not None and path_state["end"] is not None:
+                        sx,sy=PreviewCoordinateMapper.to_canvas(path_state["start"])
+                        ex,ey=PreviewCoordinateMapper.to_canvas(path_state["end"])
+                        path_state["line"]=custom_canvas.create_line(sx,sy,ex,ey,width=3,arrow="last")
+                def press(event):
+                    point=PreviewCoordinateMapper.to_normalized(event.x,event.y)
+                    if point is None:
+                        error_var.set("点击位于预览边框，已拒绝；请在游戏画面内操作")
+                        return
+                    error_var.set("")
+                    path_state["start"]=point
+                    path_state["end"]=list(point)
+                    draw_path()
+                def motion_event(event):
+                    if path_state["start"] is None:
+                        return
+                    point=PreviewCoordinateMapper.to_normalized(event.x,event.y)
+                    if point is None:
+                        error_var.set("拖动越出游戏画面，当前坐标未记录")
+                        return
+                    error_var.set("")
+                    path_state["end"]=point
+                    draw_path()
+                def release(event):
+                    motion_event(event)
+                def cancel():
                     try:
-                        dialog.destroy()
+                        dialog.grab_release()
                     except Exception:
                         pass
-                    self.close_ask(show_summary=False,wait_buffer=False)
-                    self.show_error("请教数据库写入失败，已逆序释放资源："+str(error))
-            def cancel():
-                dialog.destroy(); set_locked(False)
-            custom_canvas.bind("<ButtonPress-1>",press)
-            custom_canvas.bind("<B1-Motion>",motion_event)
-            custom_canvas.bind("<ButtonRelease-1>",release)
-            actions_frame=ttk.Frame(dialog,padding=10)
-            actions_frame.pack()
-            ttk.Button(actions_frame,text="确认",command=submit).pack(side="left",padx=6)
-            ttk.Button(actions_frame,text="取消",command=cancel).pack(side="left",padx=6)
-            dialog.protocol("WM_DELETE_WINDOW",cancel)
-        for index in range(4):
-            button=ttk.Button(choice_frame,text=chr(65+index),command=lambda position=index:choose(position))
-            button.pack(fill="x",pady=3,ipady=6)
-            answer_buttons.append(button)
-        tools=ttk.Frame(frame)
-        tools.pack(fill="x",pady=(8,0))
-        skip_button=ttk.Button(tools,text="跳过此题",command=skip)
-        skip_button.pack(side="left",padx=(0,6))
-        reject_button=ttk.Button(tools,text="都不正确",command=reject)
-        reject_button.pack(side="left",padx=6)
-        custom_button=ttk.Button(tools,text="自定义动作",command=custom)
-        custom_button.pack(side="left",padx=6)
-        ttk.Button(tools,text="结束请教",command=self.close_ask).pack(side="right")
-        win.protocol("WM_DELETE_WINDOW",self.close_ask)
-        self.ask_escape_armed=not self.api.key_down(0x1B)
-        def poll_escape():
-            if self.ask_window is None:
-                return
-            down=self.api.key_down(0x1B)
-            if not down:
-                self.ask_escape_armed=True
-            elif self.ask_escape_armed:
-                self.close_ask(); return
-            schedule(45,poll_escape)
-        schedule(120,new_question)
-        poll_escape()
-        win.wait_visibility()
-        win.focus_force()
-    def close_ask(self,show_summary=True,wait_buffer=True):
-        if self.ask_window is None and self.ask_buffer is None:
+                    dialog.destroy()
+                    set_locked(False)
+                def submit():
+                    try:
+                        kind=kind_var.get()
+                        duration=float(duration_var.get())
+                        if kind=="no_op":
+                            raw={"kind":kind,"duration":duration}
+                        else:
+                            if path_state["end"] is None:
+                                raise ValueError("请先在游戏预览区域内选择位置")
+                            if kind in {"scroll_v","scroll_h"}:
+                                raw={"kind":kind,"delta":int(delta_var.get()),"path":[path_state["end"]],"duration":duration}
+                            elif kind in {"click","double_click","long_press"}:
+                                raw={"kind":kind,"button":button_var.get(),"path":[path_state["end"]],"duration":duration}
+                            elif kind=="drag":
+                                raw={"kind":kind,"button":button_var.get(),"path":[path_state["start"],path_state["end"]],"duration":duration}
+                            else:
+                                raw={"kind":kind,"path":[path_state["start"],path_state["end"]],"duration":duration}
+                        action=normalize_action(raw)
+                        if not action:
+                            raise ValueError("动作参数无效")
+                        try:
+                            dialog.grab_release()
+                        except Exception:
+                            pass
+                        dialog.destroy()
+                        state["locked"]=False
+                        queue_answer("custom",{"a":action,"repeat_policy":policy_var.get()})
+                    except Exception as error:
+                        error_var.set(str(error))
+                custom_canvas.bind("<ButtonPress-1>",press)
+                custom_canvas.bind("<B1-Motion>",motion_event)
+                custom_canvas.bind("<ButtonRelease-1>",release)
+                actions_frame=ttk.Frame(dialog,padding=10)
+                actions_frame.pack()
+                ttk.Button(actions_frame,text="确认",command=submit).pack(side="left",padx=6)
+                ttk.Button(actions_frame,text="取消",command=cancel).pack(side="left",padx=6)
+                dialog.protocol("WM_DELETE_WINDOW",cancel)
+            for index in range(4):
+                button=ttk.Button(choice_frame,text=chr(65+index),command=lambda position=index:choose(position))
+                button.pack(fill="x",pady=3,ipady=6)
+                answer_buttons.append(button)
+            tools=ttk.Frame(frame)
+            tools.pack(fill="x",pady=(8,0))
+            skip_button=ttk.Button(tools,text="跳过此题",command=skip)
+            skip_button.pack(side="left",padx=(0,6))
+            reject_button=ttk.Button(tools,text="都不正确",command=reject)
+            reject_button.pack(side="left",padx=6)
+            custom_button=ttk.Button(tools,text="自定义动作",command=custom)
+            custom_button.pack(side="left",padx=6)
+            ttk.Button(tools,text="结束请教",command=lambda:self.close_ask(reason="completed")).pack(side="right")
+            win.protocol("WM_DELETE_WINDOW",lambda:self.close_ask(reason="stopped"))
+            self.ask_escape_armed=not self.api.key_down(0x1B)
+            def poll_escape():
+                if self.ask_window is None:
+                    return
+                down=self.api.key_down(0x1B)
+                if not down:
+                    self.ask_escape_armed=True
+                elif self.ask_escape_armed:
+                    self.close_ask(reason="stopped")
+                    return
+                schedule(45,poll_escape)
+            apply_packet(initial)
+            poll_escape()
+            win.wait_visibility()
+            win.focus_force()
+        except Exception as error:
+            self._fail_active_mode("请教界面创建失败："+str(error))
+        finally:
+            if created is not None:
+                created.set()
+    def close_ask(self,show_summary=True,wait_buffer=True,reason="completed"):
+        if self.mode!="请教" and self.ask_window is None:
             return
-        win=self.ask_window
-        self.ask_window=None
-        if win is not None:
-            for after_id in list(self.ask_after_ids):
-                try:
-                    win.after_cancel(after_id)
-                except Exception:
-                    pass
-            self.ask_after_ids.clear()
-        if self.ask_buffer is not None:
-            self.ask_buffer.stop(wait_buffer,1.0)
-            if wait_buffer or not self.ask_buffer.alive():
-                self.ask_buffer=None
-        if win is not None:
-            try:
-                win.destroy()
-            except Exception:
-                pass
-        try:
-            self.store.flush_samples()
-        except Exception:
-            pass
-        summary="请教已结束"
-        if isinstance(self.ask_counts,dict):
-            summary+="：已保存"+str(self.ask_counts.get("saved",0))+"，重复未保存"+str(self.ask_counts.get("duplicates",0))+"，跳过"+str(self.ask_counts.get("skipped",0))+"，拒绝记录"+str(self.ask_counts.get("rejected",0))+"；模型需要复习"
-        self.ask_session_id=None
-        self.ask_counts=None
-        self.mode=None
+        status="completed" if str(reason)=="completed" else "stopped"
+        text="用户结束请教" if status=="completed" else "请教已停止"
+        self.lifecycle.request_stop(status,text)
+        self.mode_state=MODE_STOPPING
+        if self.stop_event is not None:
+            self.stop_event.set()
         self.api.block_input()
         self.set_input_status("已锁定")
+        self._destroy_ask_window()
+        if self.active_session is not None:
+            self.active_session.request_stop()
         if not self.closing:
-            self.set_controls(False)
-            self.status.set(summary)
-            self._refresh_all()
-            if show_summary:
-                self.show_info("请教完成",summary)
+            self.status.set("请教正在停止，等待FrameBuffer、题目线程和采集进程退出")
     def open_data_dialog(self):
         if self.mode:
             self.show_error("请先停止当前模式")
@@ -5503,17 +6255,19 @@ class App:
         if self.closing:
             return
         self.closing=True
-        self.shutdown_deadline=None
+        self.shutdown_deadline=time.monotonic()+8.0
         self.status.set("正在安全关闭：锁定输入并停止模式与采集")
         self.set_input_status("关闭过程中已锁定")
-        if self.stop_event:
-            self.stop_event.set()
+        if self.mode_state!=MODE_IDLE:
+            self.lifecycle.request_stop("stopped","程序关闭")
+            self.mode_state=MODE_STOPPING
+            if self.stop_event is not None:
+                self.stop_event.set()
+            if self.active_session is not None:
+                self.active_session.request_stop()
+        self._destroy_ask_window()
         self.api.block_input()
         self.api.release_all_buttons()
-        try:
-            self.api.abort_capture_processes()
-        except Exception:
-            pass
         if self.result_modal is not None:
             try:
                 self.result_modal.grab_release()
@@ -5535,64 +6289,72 @@ class App:
                 self.stop_button.configure(state="disabled")
             except Exception:
                 pass
-        if self.ask_window is not None:
-            self.close_ask(show_summary=False,wait_buffer=False)
-        self._poll_shutdown()
+        self.root.after(0,self._poll_shutdown)
     def _poll_shutdown(self):
         self.api.block_input()
         self.api.release_all_buttons()
-        try:
-            self.api.abort_capture_processes()
-        except Exception:
-            pass
-        if self.ask_buffer is not None:
-            try:
-                self.ask_buffer.stop(True,0.25)
-                if not self.ask_buffer.alive():
-                    self.ask_buffer=None
-            except Exception:
-                pass
-        mode_alive=bool(self.mode_thread and self.mode_thread.is_alive())
-        ask_alive=bool(self.ask_buffer and self.ask_buffer.alive())
-        if mode_alive or ask_alive:
-            self.status.set("正在安全关闭：等待模式循环和钩子退出")
-            try:
+        deadline_reached=bool(self.shutdown_deadline is not None and time.monotonic()>=self.shutdown_deadline)
+        pending=[]
+        if self.mode_state!=MODE_IDLE:
+            self.lifecycle.request_stop("stopped","程序关闭")
+            if self.stop_event is not None:
+                self.stop_event.set()
+            self._destroy_ask_window()
+            session_done=True
+            if self.active_session is not None:
+                self.active_session.request_stop()
+                session_done=self.active_session.close(0.0)
+                if not session_done:
+                    pending.extend(self.active_session.pending_names())
+            thread_alive=bool(self.mode_thread and self.mode_thread.is_alive())
+            if thread_alive:
+                pending.append("模式线程")
+            capture_pending=self.api.stop_capture_processes(0.0,deadline_reached)
+            pending.extend("CaptureProcess:"+name for name in capture_pending)
+            if pending or not session_done:
+                suffix="；关闭期限已到，采集子进程已请求强制终止" if deadline_reached else ""
+                self.status.set("正在安全关闭：等待"+"、".join(sorted(set(pending)))+suffix)
                 self.root.after(50,self._poll_shutdown)
-            except Exception:
-                pass
+                return
+            self.mode_thread=None
+            self.active_session=None
+            self.ask_buffer=None
+            self.ask_producer=None
+            self.ask_answer_queue=None
+            self.ask_session_id=None
+            self.ask_counts=None
+            self.stop_event=None
+            self.mode=None
+            self.mode_state=MODE_IDLE
+            self.lifecycle.finish()
+            self.pending_mode_result=None
+            self.pending_mode_error=None
+            self.mode_shutdown_deadline=None
+        capture_pending=self.api.stop_capture_processes(0.0,deadline_reached)
+        if capture_pending:
+            self.status.set("正在安全关闭：等待采集子进程退出："+"、".join(capture_pending)+( "；已强制终止" if deadline_reached else ""))
+            self.root.after(50,self._poll_shutdown)
             return
         self.status.set("正在安全关闭：刷新待写样本并关闭SQLite")
         try:
-            store_closed=self.store.close(5.0)
+            store_closed=self.store.close(0.0)
         except Exception as error:
             self.status.set("SQLite关闭失败，输入仍保持锁定："+str(error))
-            try:
-                self.root.after(200,self._poll_shutdown)
-            except Exception:
-                pass
+            self.root.after(200,self._poll_shutdown)
             return
         if not store_closed:
             self.status.set("正在安全关闭：等待样本写入线程退出")
-            try:
-                self.root.after(100,self._poll_shutdown)
-            except Exception:
-                pass
+            self.root.after(100,self._poll_shutdown)
             return
-        self.status.set("正在安全关闭：释放WGC、GDI和系统钩子")
+        self.status.set("正在安全关闭：释放WGC、GDI和系统资源")
         try:
             if not self.api.close():
                 self.status.set("正在安全关闭：等待采集资源退出")
-                try:
-                    self.root.after(100,self._poll_shutdown)
-                except Exception:
-                    pass
+                self.root.after(100,self._poll_shutdown)
                 return
         except Exception as error:
             self.status.set("采集资源关闭失败："+str(error))
-            try:
-                self.root.after(200,self._poll_shutdown)
-            except Exception:
-                pass
+            self.root.after(200,self._poll_shutdown)
             return
         self.shutdown_started=True
         try:
@@ -5639,7 +6401,140 @@ def startup_error(root,text):
     widget.configure(state="disabled")
     ttk.Button(frame,text="确认",command=root.destroy).pack(pady=(10,0))
     win.protocol("WM_DELETE_WINDOW",root.destroy)
+def run_self_test(path=None):
+    source_path=Path(path or __file__).resolve()
+    raw=source_path.read_bytes()
+    text=raw.decode("utf-8")
+    failures=[]
+    checks={}
+    def check(name,condition,detail=""):
+        value=bool(condition)
+        checks[str(name)]=value
+        if not value:
+            failures.append(str(name)+("："+str(detail) if detail else ""))
+    check("源文件无空行",not any(not line.strip() for line in text.splitlines()))
+    try:
+        tokens=list(tokenize.tokenize(io.BytesIO(raw).readline))
+        check("源文件无COMMENT",not any(token.type==tokenize.COMMENT for token in tokens))
+    except Exception as error:
+        check("源文件可分词",False,error)
+    try:
+        compile(text,str(source_path),"exec")
+        tree=ast.parse(text,str(source_path))
+        check("源文件可编译",True)
+    except Exception as error:
+        tree=None
+        check("源文件可编译",False,error)
+    required_classes={"ModeLifecycle","LearningController","ReviewController","TrainingController","TeachingController","PreviewCoordinateMapper","ResourceShutdownBarrier"}
+    class_map={node.name:node for node in tree.body if isinstance(node,ast.ClassDef)} if tree is not None else {}
+    check("单文件职责类完整",required_classes.issubset(class_map),sorted(required_classes-set(class_map)))
+    app_methods={node.name for node in class_map["App"].body if isinstance(node,ast.FunctionDef)} if "App" in class_map else set()
+    check("模式生命周期方法归属App",{"_begin_mode_stopping","_poll_mode_shutdown","_poll_shutdown","_create_ask_window"}.issubset(app_methods))
+    points=([0.0,0.0],[1.0,1.0],[0.5,0.5],[0.137,0.829])
+    roundtrip=True
+    for point in points:
+        canvas=PreviewCoordinateMapper.to_canvas(point)
+        restored=PreviewCoordinateMapper.to_normalized(canvas[0],canvas[1])
+        roundtrip=roundtrip and restored is not None and max(abs(restored[index]-point[index]) for index in range(2))<1e-9
+    check("请教坐标往返",roundtrip)
+    check("请教边框点击拒绝",PreviewCoordinateMapper.to_normalized(ASK_PREVIEW_X-1,ASK_PREVIEW_Y) is None and PreviewCoordinateMapper.to_normalized(ASK_PREVIEW_X,ASK_PREVIEW_Y-1) is None and PreviewCoordinateMapper.to_normalized(ASK_PREVIEW_X+ASK_PREVIEW_W,ASK_PREVIEW_Y) is None)
+    actions=[{"kind":"click","button":"left","path":[[0.25,0.75]],"duration":0.08},{"kind":"double_click","button":"left","path":[[0.5,0.5]],"duration":0.16},{"kind":"long_press","button":"right","path":[[0.4,0.6]],"duration":0.8},{"kind":"drag","button":"left","path":[[0.1,0.2],[0.9,0.8]],"duration":0.5},{"kind":"scroll_v","delta":120,"path":[[0.5,0.5]],"duration":0.08},{"kind":"no_op","duration":0.3}]
+    check("动作规范化",all(normalize_action(action) is not None and action_signature(action) for action in actions))
+    check("INPUT仅鼠标联合体",[name for name,_ in INPUTUNION._fields_]==["mi"] and ("KEYBD"+"INPUT") not in text)
+    input_type_assignments=[]
+    if tree is not None:
+        for node in ast.walk(tree):
+            if isinstance(node,ast.Assign):
+                for target in node.targets:
+                    if isinstance(target,ast.Attribute) and target.attr=="type":
+                        input_type_assignments.append(node.value.value if isinstance(node.value,ast.Constant) else None)
+    check("自动INPUT类型恒为鼠标",bool(input_type_assignments) and all(value==0 for value in input_type_assignments),input_type_assignments)
+    payload=add_checksum({"version":FORMAT_VERSION,"items":[1,2,3]})
+    check("模型checksum",verify_checksum(payload) and not verify_checksum({**payload,"version":FORMAT_VERSION+1}))
+    compressed=zlib.compress(canonical_bytes(payload),9)
+    check("压缩上限正常",bounded_decompress(compressed,len(canonical_bytes(payload)))==canonical_bytes(payload))
+    try:
+        bounded_decompress(zlib.compress(b"x"*1024,9),128)
+        compression_rejected=False
+    except ValueError:
+        compression_rejected=True
+    check("压缩上限拒绝超限",compression_rejected)
+    connection=sqlite3.connect(":memory:")
+    try:
+        connection.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY,value TEXT NOT NULL)")
+        connection.execute("INSERT INTO sample(value) VALUES('ok')")
+        integrity=connection.execute("PRAGMA integrity_check").fetchone()[0]
+    finally:
+        connection.close()
+    check("数据库完整性",str(integrity).lower()=="ok")
+    train=[{"checksum":"train-a"},{"checksum":"train-b"}]
+    holdout=[{"checksum":"holdout-a"},{"checksum":"holdout-b"}]
+    try:
+        assert_disjoint_checksums(train,holdout)
+        disjoint=True
+    except Exception:
+        disjoint=False
+    check("训练留出checksum不相交",disjoint and not checksum_set(train).intersection(checksum_set(holdout)))
+    for stage in (MODE_STARTING,MODE_RUNNING,MODE_STOPPING):
+        lifecycle=ModeLifecycle()
+        event=lifecycle.begin("自检")
+        if stage==MODE_RUNNING:
+            lifecycle.mark_running()
+        if stage==MODE_STOPPING:
+            lifecycle.request_stop("stopped","预置")
+        lifecycle.request_stop("stopped","ESC")
+        check("ESC可中止"+stage,event.is_set() and lifecycle.snapshot()[0]==MODE_STOPPING)
+    stop=threading.Event()
+    isolation=StrictInputIsolation(stop)
+    before=isolation.can_automate()
+    isolation.signal("keyboard",time.time())
+    check("人工输入后禁止自动输入",before and stop.is_set() and not isolation.can_automate())
+    fake_bridge=object.__new__(WinBridge)
+    fake_bridge.input_lock=threading.RLock()
+    fake_bridge.input_blocked=False
+    fake_bridge.input_stop_event=stop
+    fake_bridge.held=set()
+    class FakeUser32:
+        def __init__(self):
+            self.sent=0
+        def SendInput(self,*args):
+            self.sent+=1
+            return 1
+    fake_bridge.user32=FakeUser32()
+    try:
+        fake_bridge._send(1,require_allowed=True)
+        blocked=False
+    except InputStopped:
+        blocked=True
+    check("人工输入后无新SendInput",blocked and fake_bridge.user32.sent==0)
+    class FakeResource:
+        def __init__(self):
+            self.running=True
+        def stop(self,timeout=0.0):
+            self.running=False
+            return True
+        def alive(self):
+            return self.running
+    resources={name:FakeResource() for name in ("FrameBuffer","KeyboardHook","MouseHook","CaptureProcess")}
+    barrier=ResourceShutdownBarrier("自检",0.5)
+    for name,resource in resources.items():
+        barrier.add(name,resource.stop,resource.alive)
+    barrier.request_stop()
+    check("模式结束资源无存活",barrier.poll() and not barrier.pending_names() and not any(resource.alive() for resource in resources.values()))
+    if tree is not None:
+        for class_name in ("KeyboardMonitor","MouseMonitor"):
+            node=class_map.get(class_name)
+            segment=ast.get_source_segment(text,node) if node is not None else ""
+            check(class_name+"回调轻量",all(fragment not in segment for fragment in ("block_input(","release_all_buttons(","self.app.ui(","on_other(","on_input(")))
+    check("关闭期限已使用","shutdown_deadline=time.monotonic()+8.0" in text and "deadline_reached" in text)
+    check("ESC主线程轮询","poll_global_escape" in app_methods and "self.root.after(35,self.poll_global_escape)" in text)
+    check("危险验收样本阈值","positive_total>=50" in text and "negative_total>=50" in text and "holdout_count>=150" in text)
+    result={"status":"passed" if not failures else "failed","checks":checks,"failures":failures}
+    sys.stdout.write(json.dumps(result,ensure_ascii=False,sort_keys=True,separators=(",",":"))+"\n")
+    return 0 if not failures else 1
 def main():
+    if "--self-test" in sys.argv:
+        raise SystemExit(run_self_test())
     enable_dpi_awareness()
     holder={"app":None}
     install_global_hooks(holder)
