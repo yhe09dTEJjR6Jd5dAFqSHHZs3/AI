@@ -18,14 +18,16 @@ import base64
 import io
 import tokenize
 import tempfile
+import shutil
+from contextlib import contextmanager
 from pathlib import Path
-from collections import deque,Counter,defaultdict
+from collections import deque,Counter,defaultdict,OrderedDict
 import tkinter as tk
 from tkinter import ttk
 import ctypes
 from ctypes import wintypes
 APP_NAME="UniversalGameAI"
-FORMAT_VERSION=5
+FORMAT_VERSION=6
 FEATURE_W=64
 FEATURE_H=36
 PREVIEW_W=320
@@ -39,7 +41,7 @@ COARSE_LEN=COARSE_W*COARSE_H*FEATURE_CHANNELS
 SQUARED_DIFF=tuple(value*value for value in range(-255,256))
 FEATURE_ALGORITHM_VERSION=4
 ACTION_ALGORITHM_VERSION=6
-DATABASE_SCHEMA_VERSION=5
+DATABASE_SCHEMA_VERSION=6
 MAX_SAMPLES=1500
 MAX_PROTOTYPES=320
 SUPPORTED_BUTTONS={"left","right","middle"}
@@ -57,6 +59,202 @@ ASK_PREVIEW_H=360
 ASK_PREVIEW_X=16
 ASK_PREVIEW_Y=9
 CAPTURE_RETRY_DELAYS=(2.0,10.0,60.0)
+INPUT_EXTRA_INFO=0x5547414932303236
+TITLE_RULE_MODES={"none","contains","prefix","exact"}
+WINDOW_RULE_VERSION=2
+CAPTURE_BACKEND_VERSION=2
+RECOVERY_BACKUP_LIMIT=1024*1024*1024
+MIN_FREE_DISK=256*1024*1024
+class VersionedThresholdConfig:
+    version=1
+    review_min_holdout=150
+    review_min_accepted=150
+    ordinary_min_positive=20
+    ordinary_min_sessions=2
+    dangerous_min_positive=50
+    dangerous_min_negative=50
+    dangerous_min_sessions=4
+    minimum_coverage=0.80
+    maximum_error_upper_95=0.02
+    minimum_overall_accuracy=0.80
+    candidate_full_limit=18
+    content_aspect_tolerance=0.015
+    @classmethod
+    def snapshot(cls):
+        return {key:value for key,value in vars(cls).items() if not key.startswith("_") and isinstance(value,(int,float,str,bool))}
+def current_build_hash():
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except Exception:
+        return ""
+def algorithm_snapshot():
+    return {"format_version":FORMAT_VERSION,"feature_algorithm_version":FEATURE_ALGORITHM_VERSION,"action_algorithm_version":ACTION_ALGORITHM_VERSION,"feature_size":[FEATURE_W,FEATURE_H,FEATURE_CHANNELS],"coarse_size":[COARSE_W,COARSE_H,FEATURE_CHANNELS],"window_rule_version":WINDOW_RULE_VERSION,"capture_backend_version":CAPTURE_BACKEND_VERSION,"thresholds":VersionedThresholdConfig.snapshot(),"build_hash":current_build_hash()}
+def own_injected_event(flags,extra_info,mask):
+    return bool(int(flags)&int(mask) and int(extra_info)==INPUT_EXTRA_INFO)
+def normalized_rect(rect,container):
+    x,y,w,h=[float(value) for value in rect]
+    cx,cy,cw,ch=[float(value) for value in container]
+    if min(cw,ch,w,h)<=0:
+        raise ValueError("矩形尺寸无效")
+    left=max(0.0,min(1.0,(x-cx)/cw)); top=max(0.0,min(1.0,(y-cy)/ch)); right=max(left,min(1.0,(x+w-cx)/cw)); bottom=max(top,min(1.0,(y+h-cy)/ch))
+    if right-left<0.02 or bottom-top<0.02:
+        raise ValueError("内容区域过小")
+    return [round(left,8),round(top,8),round(right-left,8),round(bottom-top,8)]
+def apply_normalized_rect(container,norm):
+    cx,cy,cw,ch=[int(value) for value in container]
+    if not isinstance(norm,(list,tuple)) or len(norm)!=4:
+        norm=[0.0,0.0,1.0,1.0]
+    left=max(0.0,min(1.0,safe_float(norm[0],0.0))); top=max(0.0,min(1.0,safe_float(norm[1],0.0))); width=max(0.02,min(1.0-left,safe_float(norm[2],1.0))); height=max(0.02,min(1.0-top,safe_float(norm[3],1.0)))
+    x=cx+round(left*cw); y=cy+round(top*ch); right=cx+round((left+width)*cw); bottom=cy+round((top+height)*ch)
+    return x,y,max(2,right-x),max(2,bottom-y)
+def visual_perceptual_hash(feature):
+    source=feature_bytes(feature)
+    plane=source[:PIXELS]
+    values=[]
+    for oy in range(8):
+        sy=min(FEATURE_H-1,(2*oy+1)*FEATURE_H//16)
+        row=[]
+        for ox in range(9):
+            sx=min(FEATURE_W-1,(2*ox+1)*FEATURE_W//18)
+            row.append(plane[sy*FEATURE_W+sx])
+        values.extend(1 if row[index+1]>=row[index] else 0 for index in range(8))
+    value=0
+    for bit in values:
+        value=(value<<1)|bit
+    return format(value,"016x")
+def visual_scene_key(item):
+    feature=feature_bytes(item.get("f"))
+    plane=feature[:PIXELS]
+    mean=sum(plane)/max(1,len(plane))
+    edges=feature[3*PIXELS:4*PIXELS]
+    edge_mean=sum(edges)/max(1,len(edges))
+    context=temporal_from_context(item.get("context",{}))
+    motion=sum(context.get("recent_frame_deltas",[]))/max(1,len(context.get("recent_frame_deltas",[])))
+    return "L"+str(min(5,int(mean//43)))+"|E"+str(min(5,int(edge_mean//43)))+"|M"+str(min(5,int(motion//120)))
+class TaskAgentPolicy:
+    def __init__(self,profile):
+        self.profile=dict(profile) if isinstance(profile,dict) else {}
+        self.allowed=set(str(value) for value in self.profile.get("allowed_families",[]))
+        self.max_failures=max(1,safe_int(self.profile.get("max_consecutive_failures",3),3,1,20))
+        self.failures=0
+        self.history=deque(maxlen=128)
+    def allowed_action(self,action):
+        family=action_family_key(action)
+        return bool(family and family in self.allowed)
+    def state_hash(self,feature):
+        return visual_perceptual_hash(feature)
+    def classify(self,feature):
+        value=self.state_hash(feature)
+        if value in set(self.profile.get("success_states",[])):
+            return "success",safe_float(self.profile.get("success_reward",1.0),1.0)
+        if value in set(self.profile.get("failure_states",[])):
+            return "failure",safe_float(self.profile.get("failure_reward",-1.0),-1.0)
+        return "neutral",0.0
+    def register(self,before,action,after,changed):
+        before_hash=self.state_hash(before); after_hash=self.state_hash(after) if after is not None else ""
+        state,reward=self.classify(after if after is not None else before)
+        if state=="failure" or not changed:
+            self.failures+=1
+        else:
+            self.failures=0
+        self.history.append({"before":before_hash,"action":action_signature(action),"after":after_hash,"state":state,"reward":reward,"changed":bool(changed)})
+        return {"state":state,"reward":reward,"failures":self.failures,"stop":self.failures>=self.max_failures}
+    def sequence_penalty(self,history,cluster_id,sequence_model):
+        if not isinstance(sequence_model,dict):
+            return 0.0
+        values=[str(value) for value in history] if isinstance(history,(list,tuple,deque)) else [str(history)]
+        choices={}
+        depth=0
+        for size in range(min(4,len(values)),0,-1):
+            key=str(size)+"|"+"|".join(values[-size:])
+            candidate=sequence_model.get(key,{})
+            if isinstance(candidate,dict) and candidate:
+                choices=candidate
+                depth=size
+                break
+        if not choices:
+            choices=sequence_model.get(str(values[-1] if values else "<START>"),{})
+        if not isinstance(choices,dict) or not choices:
+            return 0.0
+        total=sum(max(0.0,safe_float(value,0.0)) for value in choices.values())
+        probability=max(0.0,safe_float(choices.get(str(cluster_id),0.0),0.0))/max(1e-9,total)
+        return (1.0-probability)*(18.0+depth*3.0)
+def profile_checksum(profile):
+    value=dict(profile) if isinstance(profile,dict) else {}
+    value.pop("updated",None)
+    return hashlib.sha256(canonical_bytes(value)).hexdigest()
+def model_binding_from_samples(samples):
+    paths=set(); classes=set(); norms=set(); aspects=[]; dpis=[]; methods=set()
+    for item in samples:
+        context=item.get("context",{}) if isinstance(item,dict) else {}
+        path=os.path.normcase(str(context.get("process_path","")))
+        window_class=str(context.get("window_class",""))
+        norm=context.get("content_rect_norm")
+        aspect=context.get("content_aspect")
+        dpi=context.get("dpi")
+        method=str(item.get("capture_method") or context.get("capture_method") or "")
+        if path:
+            paths.add(path)
+        if window_class:
+            classes.add(window_class)
+        if isinstance(norm,(list,tuple)) and len(norm)==4:
+            norms.add(tuple(round(safe_float(value,0.0),6) for value in norm))
+        if finite_number(aspect) and float(aspect)>0:
+            aspects.append(float(aspect))
+        if finite_number(dpi) and int(dpi)>0:
+            dpis.append(int(dpi))
+        if method:
+            methods.add(method)
+    return {"process_paths":sorted(paths),"window_classes":sorted(classes),"content_rect_norms":[list(value) for value in sorted(norms)],"content_aspect_min":min(aspects) if aspects else 0.0,"content_aspect_max":max(aspects) if aspects else 0.0,"dpi_min":min(dpis) if dpis else 0,"dpi_max":max(dpis) if dpis else 0,"capture_methods":sorted(methods),"window_rule_version":WINDOW_RULE_VERSION,"capture_backend_version":CAPTURE_BACKEND_VERSION}
+class ThreadLocalSQLite:
+    def __init__(self,path,read_only=False):
+        self.path=Path(path)
+        self.read_only=bool(read_only)
+        self.lock=threading.RLock()
+        self.connections={}
+    def _new(self):
+        if self.read_only:
+            connection=sqlite3.connect("file:"+self.path.as_posix()+"?mode=ro",uri=True,timeout=1.0,check_same_thread=False)
+        else:
+            connection=sqlite3.connect(str(self.path),timeout=3.0,check_same_thread=False)
+        connection.row_factory=sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=3000")
+        if not self.read_only:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("PRAGMA temp_store=MEMORY")
+        return connection
+    def current(self):
+        key=threading.get_ident()
+        with self.lock:
+            connection=self.connections.get(key)
+            if connection is None:
+                connection=self._new()
+                self.connections[key]=connection
+            return connection
+    def execute(self,*args,**kwargs):
+        return self.current().execute(*args,**kwargs)
+    def executemany(self,*args,**kwargs):
+        return self.current().executemany(*args,**kwargs)
+    def commit(self):
+        return self.current().commit()
+    def rollback(self):
+        return self.current().rollback()
+    def __enter__(self):
+        self.current().__enter__()
+        return self
+    def __exit__(self,exc_type,exc_value,exc_traceback):
+        return self.current().__exit__(exc_type,exc_value,exc_traceback)
+    def close(self):
+        with self.lock:
+            values=list(self.connections.values())
+            self.connections.clear()
+        for connection in values:
+            try:
+                connection.close()
+            except Exception:
+                pass
 class POINT(ctypes.Structure):
     _fields_=[("x",wintypes.LONG),("y",wintypes.LONG)]
 class RECT(ctypes.Structure):
@@ -137,13 +335,16 @@ class ModeLifecycle:
                 self.state=MODE_RUNNING
             return self.state
     def request_stop(self,status="stopped",reason=""):
+        priority={"completed":0,"stopped":1,"failed":2}
         with self.lock:
             if self.state==MODE_IDLE:
                 return False
-            if status in {"completed","stopped","failed"}:
-                if status=="failed" or self.requested_status!="failed":
-                    self.requested_status=status
-            if reason:
+            value=str(status) if str(status) in priority else "stopped"
+            if priority[value]>=priority.get(self.requested_status,0):
+                self.requested_status=value
+                if reason:
+                    self.reason=str(reason)
+            elif reason and not self.reason:
                 self.reason=str(reason)
             self.state=MODE_STOPPING
             if self.stop_event is not None:
@@ -582,6 +783,24 @@ def visual_distance(a,b):
         offset=channel*PIXELS
         value=0
         for index in range(offset,offset+PIXELS):
+            value+=SQUARED_DIFF[int(first[index])-int(second[index])+255]
+        total+=weight*value/PIXELS
+    return total
+def runtime_feature_distance(feature,prototype):
+    if not feature_valid(feature) or not isinstance(prototype,dict):
+        return float("inf")
+    first=memoryview(feature_bytes(feature))
+    second=prototype.get("feature_view")
+    if not isinstance(second,memoryview) or len(second)!=FEATURE_LEN:
+        if not feature_valid(prototype.get("f")):
+            return float("inf")
+        second=memoryview(feature_bytes(prototype["f"]))
+    offsets=prototype.get("channel_offsets",(0,PIXELS,PIXELS*2,PIXELS*3,PIXELS*4))
+    weights=(0.30,0.19,0.19,0.22,0.10)
+    total=0.0
+    for offset,weight in zip(offsets,weights):
+        value=0
+        for index in range(int(offset),int(offset)+PIXELS):
             value+=SQUARED_DIFF[int(first[index])-int(second[index])+255]
         total+=weight*value/PIXELS
     return total
@@ -1062,12 +1281,33 @@ class WinBridge:
         self.capture_processes={}
         self.capture_disabled={}
         self.gdi_resources={}
-        self.wgc=WindowsGraphicsCapture(self)
+        self.wgc_lock=threading.RLock()
+        self.wgc=None
+        self.wgc_error="尚未初始化"
+    def get_wgc(self):
+        with self.wgc_lock:
+            if self.wgc is not None:
+                return self.wgc
+            try:
+                self.wgc=WindowsGraphicsCapture(self)
+                self.wgc_error=""
+                return self.wgc
+            except Exception as error:
+                self.wgc_error=str(error)
+                raise CaptureUnavailable("Windows Graphics Capture不可用，已降级："+self.wgc_error)
+    def wgc_status(self):
+        with self.wgc_lock:
+            if self.wgc is not None:
+                return "可用"
+            return "未初始化" if self.wgc_error=="尚未初始化" else "不可用，已降级："+self.wgc_error
     def _bind(self):
         self.WNDENUMPROC=ctypes.WINFUNCTYPE(wintypes.BOOL,wintypes.HWND,wintypes.LPARAM)
+        self.CHILDENUMPROC=ctypes.WINFUNCTYPE(wintypes.BOOL,wintypes.HWND,wintypes.LPARAM)
         self.HOOKPROC=ctypes.WINFUNCTYPE(wintypes.LPARAM,ctypes.c_int,wintypes.WPARAM,wintypes.LPARAM)
         self.user32.EnumWindows.argtypes=[self.WNDENUMPROC,wintypes.LPARAM]
         self.user32.EnumWindows.restype=wintypes.BOOL
+        self.user32.EnumChildWindows.argtypes=[wintypes.HWND,self.CHILDENUMPROC,wintypes.LPARAM]
+        self.user32.EnumChildWindows.restype=wintypes.BOOL
         self.user32.IsWindow.argtypes=[wintypes.HWND]
         self.user32.IsWindow.restype=wintypes.BOOL
         self.user32.IsWindowVisible.argtypes=[wintypes.HWND]
@@ -1298,10 +1538,13 @@ class WinBridge:
             items=[self.gdi_resources.pop(key) for key in keys]
         for item in items:
             self._dispose_gdi_resource(item)
-        try:
-            self.wgc.release_thread(wanted)
-        except Exception:
-            pass
+        with self.wgc_lock:
+            wgc=self.wgc
+        if wgc is not None:
+            try:
+                wgc.release_thread(wanted)
+            except Exception:
+                pass
     def _gdi_resource(self,kind,source_hwnd,width,height):
         key=(threading.get_ident(),str(kind),int(source_hwnd),int(width),int(height))
         stale=[]
@@ -1338,7 +1581,7 @@ class WinBridge:
             if memory:
                 self.gdi32.DeleteDC(memory)
     def _capture_identity_key(self,target):
-        item={"hwnd":safe_int(target.get("hwnd",0),0),"pid":safe_int(target.get("pid",0),0),"class":str(target.get("class","")),"thread":safe_int(target.get("window_thread_id",0),0),"path":os.path.normcase(str(target.get("process_path",""))),"created":safe_int(target.get("process_created",0),0)}
+        item={"hwnd":safe_int(target.get("hwnd",0),0),"pid":safe_int(target.get("pid",0),0),"class":str(target.get("class","")),"thread":safe_int(target.get("window_thread_id",0),0),"path":os.path.normcase(str(target.get("process_path",""))),"created":safe_int(target.get("process_created",0),0),"content_rect_norm":[round(safe_float(value,0.0),6) for value in target.get("content_rect_norm",[0,0,1,1])[:4]],"window_rule_version":WINDOW_RULE_VERSION}
         return hashlib.sha256(canonical_bytes(item)).hexdigest()
     def _circuit_allows(self,key):
         with self.capture_task_lock:
@@ -1486,8 +1729,14 @@ class WinBridge:
         dpi=self.dpi_for_window(hwnd)
         item.update({"hwnd":hwnd,"pid":pid,"class":self.class_name(hwnd),"title":self.window_title(hwnd),"window_thread_id":thread_id,"process_path":process["path"],"process_created":process["created"],"integrity":process["integrity"],"selected_rect":list(rect),"client_size":[int(rect[2]),int(rect[3])],"selected_dpi":dpi,"dpi":dpi})
         rule=item.get("title_rule")
-        if rule is not None and not isinstance(rule,dict):
-            item.pop("title_rule",None)
+        if not isinstance(rule,dict) or str(rule.get("mode","none")) not in TITLE_RULE_MODES:
+            item["title_rule"]={"mode":"none","value":""}
+        norm=item.get("content_rect_norm")
+        if not isinstance(norm,(list,tuple)) or len(norm)!=4:
+            item["content_rect_norm"]=[0.0,0.0,1.0,1.0]
+        content=apply_normalized_rect(rect,item["content_rect_norm"])
+        item["content_aspect"]=round(content[2]/max(1,content[3]),8)
+        item["window_rule_version"]=WINDOW_RULE_VERSION
         return item
     def enum_windows(self):
         result=[]
@@ -1532,6 +1781,43 @@ class WinBridge:
         if width<2 or height<2:
             raise TargetUnavailable("目标窗口客户区尺寸无效")
         return int(first.x),int(first.y),width,height
+    def visible_child_regions(self,hwnd):
+        client=self.client_rect(hwnd)
+        cx,cy,cw,ch=client
+        result=[]
+        def callback(child,lparam):
+            try:
+                if not self.user32.IsWindowVisible(child) or self.user32.IsIconic(child):
+                    return True
+                rect=RECT()
+                if not self.user32.GetWindowRect(child,ctypes.byref(rect)):
+                    return True
+                left=max(cx,int(rect.left)); top=max(cy,int(rect.top)); right=min(cx+cw,int(rect.right)); bottom=min(cy+ch,int(rect.bottom))
+                width=right-left; height=bottom-top
+                if width>=FEATURE_W and height>=FEATURE_H:
+                    result.append({"hwnd":int(child),"rect":(left,top,width,height),"area":width*height,"class":self.class_name(child)})
+            except Exception:
+                pass
+            return True
+        proc=self.CHILDENUMPROC(callback)
+        self.user32.EnumChildWindows(wintypes.HWND(int(hwnd)),proc,0)
+        result.sort(key=lambda item:item["area"],reverse=True)
+        return result
+    def auto_content_region(self,target):
+        client=self.client_rect(int(target["hwnd"]))
+        children=self.visible_child_regions(int(target["hwnd"]))
+        minimum=client[2]*client[3]*0.30
+        chosen=next((item for item in children if item["area"]>=minimum),None)
+        rect=chosen["rect"] if chosen else client
+        return {"rect":rect,"norm":normalized_rect(rect,client),"source":"largest_visible_child" if chosen else "full_client","child_class":str(chosen.get("class","")) if chosen else ""}
+    def content_rect(self,target):
+        client=self.client_rect(int(target["hwnd"]))
+        rect=apply_normalized_rect(client,target.get("content_rect_norm",[0.0,0.0,1.0,1.0]))
+        expected=safe_float(target.get("content_aspect",rect[2]/max(1,rect[3])),rect[2]/max(1,rect[3]))
+        actual=rect[2]/max(1,rect[3])
+        if expected>0 and abs(actual/expected-1.0)>VersionedThresholdConfig.content_aspect_tolerance:
+            raise TargetUnavailable("内容区域宽高比已变化，已暂停并要求重新校准")
+        return rect
     def window_rect(self,hwnd):
         if not self.valid(hwnd):
             raise TargetUnavailable("目标窗口已关闭或句柄无效")
@@ -1588,25 +1874,23 @@ class WinBridge:
             raise TargetUnavailable("目标窗口失去焦点，等待恢复")
         rule=target.get("title_rule")
         if isinstance(rule,dict):
-            mode=str(rule.get("mode",""))
-            value=str(rule.get("value",""))
-            title=self.window_title(hwnd)
+            mode=str(rule.get("mode","none")); value=str(rule.get("value","")); title=self.window_title(hwnd)
             if mode=="exact" and title!=value:
                 raise TargetUnavailable("目标窗口标题不再符合精确规则")
-            if mode=="contains" and value not in title:
+            if mode=="contains" and value and value not in title:
                 raise TargetUnavailable("目标窗口标题不再符合包含规则")
-            if mode=="prefix" and not title.startswith(value):
+            if mode=="prefix" and value and not title.startswith(value):
                 raise TargetUnavailable("目标窗口标题不再符合前缀规则")
         return self.client_rect(hwnd),self.dpi_for_window(hwnd)
     def validate_target(self,target,require_foreground=True):
-        rect,dpi=self.validate_target_identity(target,require_foreground)
+        client,dpi=self.validate_target_identity(target,require_foreground)
         expected_size=target.get("client_size")
-        if isinstance(expected_size,(list,tuple)) and len(expected_size)>=2 and [int(rect[2]),int(rect[3])]!=[safe_int(expected_size[0],-1),safe_int(expected_size[1],-1)]:
-            raise TargetUnavailable("目标窗口客户区尺寸或DPI已变化，正在暂停并自动重新校准")
+        if isinstance(expected_size,(list,tuple)) and len(expected_size)>=2 and [int(client[2]),int(client[3])]!=[safe_int(expected_size[0],-1),safe_int(expected_size[1],-1)]:
+            raise TargetUnavailable("目标窗口客户区尺寸已变化，已暂停并要求重新校准内容区域")
         expected_dpi=target.get("selected_dpi",target.get("dpi"))
         if expected_dpi is not None and int(dpi)!=safe_int(expected_dpi,-1):
-            raise TargetUnavailable("目标窗口客户区尺寸或DPI已变化，正在暂停并自动重新校准")
-        return rect
+            raise TargetUnavailable("目标窗口DPI已变化，已暂停并要求重新校准")
+        return self.content_rect(target)
     def cursor(self):
         point=POINT()
         if not self.user32.GetCursorPos(ctypes.byref(point)):
@@ -1632,26 +1916,28 @@ class WinBridge:
             raise ctypes.WinError(ctypes.get_last_error())
         old=self.gdi32.SelectObject(memory,bitmap)
         return memory,bitmap,old,bits
-    def _rgb_from_raw(self,raw,width,height,out_w=PREVIEW_W,out_h=PREVIEW_H):
-        result=bytearray(out_w*out_h*3)
-        for oy in range(out_h):
-            sy=min(height-1,(2*oy+1)*height//(2*out_h))
-            for ox in range(out_w):
-                sx=min(width-1,(2*ox+1)*width//(2*out_w))
-                index=(sy*width+sx)*4
-                position=(oy*out_w+ox)*3
+    def _rgb_from_raw(self,raw,width,height,out_w=PREVIEW_W,out_h=PREVIEW_H,crop=None):
+        left,top,crop_w,crop_h=(0,0,int(width),int(height)) if not isinstance(crop,(list,tuple)) or len(crop)!=4 else [int(value) for value in crop]
+        left=max(0,min(int(width)-1,left)); top=max(0,min(int(height)-1,top)); crop_w=max(1,min(int(width)-left,crop_w)); crop_h=max(1,min(int(height)-top,crop_h))
+        result=bytearray(int(out_w)*int(out_h)*3)
+        for oy in range(int(out_h)):
+            sy=min(int(height)-1,top+(2*oy+1)*crop_h//(2*int(out_h)))
+            for ox in range(int(out_w)):
+                sx=min(int(width)-1,left+(2*ox+1)*crop_w//(2*int(out_w)))
+                index=(sy*int(width)+sx)*4
+                position=(oy*int(out_w)+ox)*3
                 result[position]=raw[index+2]
                 result[position+1]=raw[index+1]
                 result[position+2]=raw[index]
         return bytes(result)
-    def _capture_print(self,hwnd,width,height,out_w=FEATURE_W,out_h=FEATURE_H):
+    def _capture_print(self,hwnd,width,height,out_w=FEATURE_W,out_h=FEATURE_H,crop=None):
         key_kind="print|"+str(int(hwnd))
         item=self._gdi_resource(key_kind,0,int(width),int(height))
         ctypes.memset(item["bits"],0,int(width)*int(height)*4)
         if not self.user32.PrintWindow(wintypes.HWND(hwnd),item["memory"],3):
             raise CaptureUnavailable("PrintWindow采集失败")
         raw=(ctypes.c_ubyte*(int(width)*int(height)*4)).from_address(int(item["bits"].value))
-        return self._rgb_from_raw(raw,int(width),int(height),int(out_w),int(out_h))
+        return self._rgb_from_raw(raw,int(width),int(height),int(out_w),int(out_h),crop)
     def _capture_dc(self,source_hwnd,sx,sy,width,height,out_w=FEATURE_W,out_h=FEATURE_H):
         key_kind="dc|"+str(int(source_hwnd))
         item=self._gdi_resource(key_kind,int(source_hwnd),int(out_w),int(out_h))
@@ -1768,15 +2054,18 @@ class WinBridge:
             hwnd=safe_int(target.get("hwnd",0),0)
             current_thread,current_pid=self.window_thread_pid(hwnd)
             process=self.process_identity_for_pid(current_pid)
-            return bool(calibration.get("validated_backend") and safe_int(calibration.get("validated_pid",-1),-1)==current_pid and str(calibration.get("validated_class",""))==self.class_name(hwnd) and str(calibration.get("validated_process_path",""))==process["path"] and safe_int(calibration.get("validated_process_created",-1),-1)==process["created"] and safe_int(calibration.get("validated_window_thread_id",-1),-1)==current_thread and safe_int(calibration.get("validated_integrity",-1),-1)==process["integrity"] and safe_int(calibration.get("validated_dpi",0),0)==self.dpi_for_window(hwnd) and list(calibration.get("validated_rect",[0,0,0,0]))[2:4]==[int(current_rect[2]),int(current_rect[3])])
+            norm=[round(safe_float(value,0.0),6) for value in target.get("content_rect_norm",[0,0,1,1])[:4]]
+            saved_norm=[round(safe_float(value,0.0),6) for value in calibration.get("validated_content_rect_norm",[0,0,1,1])[:4]]
+            return bool(calibration.get("validated_backend") and safe_int(calibration.get("validated_pid",-1),-1)==current_pid and str(calibration.get("validated_class",""))==self.class_name(hwnd) and str(calibration.get("validated_process_path",""))==process["path"] and safe_int(calibration.get("validated_process_created",-1),-1)==process["created"] and safe_int(calibration.get("validated_window_thread_id",-1),-1)==current_thread and safe_int(calibration.get("validated_integrity",-1),-1)==process["integrity"] and safe_int(calibration.get("validated_dpi",0),0)==self.dpi_for_window(hwnd) and list(calibration.get("validated_rect",[0,0,0,0]))[2:4]==[int(current_rect[2]),int(current_rect[3])] and norm==saved_norm and safe_int(calibration.get("capture_backend_version",0),0)==CAPTURE_BACKEND_VERSION)
         except Exception:
             return False
     def capture_gray(self,target,require_foreground_for_desktop=True,validation_mode=False,need_preview=False):
         rect=self.validate_target(target,False)
+        client=self.client_rect(int(target["hwnd"]))
         hwnd=safe_int(target["hwnd"],0)
         x,y,width,height=rect
         if width<FEATURE_W or height<FEATURE_H:
-            raise CaptureUnavailable("客户区尺寸异常，拒绝采集")
+            raise CaptureUnavailable("内容区域尺寸异常，拒绝采集")
         out_w=PREVIEW_W if need_preview else FEATURE_W
         out_h=PREVIEW_H if need_preview else FEATURE_H
         attempts=[]
@@ -1810,13 +2099,14 @@ class WinBridge:
             backend_names.sort(key=lambda name:0 if name==validated_method else 1)
         identity_valid=self.calibration_identity_matches(target,calibration,rect)
         need_comparison=bool(validation_mode)
+        offset_x=x-client[0]; offset_y=y-client[1]
         for priority,name in enumerate(backend_names):
             allowed,reason=self._circuit_allows((identity_key,name))
             if not allowed:
                 attempts.append(name+"已跳过："+reason)
                 continue
             try:
-                command={"backend":name,"hwnd":hwnd,"rect":list(rect),"out_w":out_w,"out_h":out_h}
+                command={"backend":name,"hwnd":hwnd,"rect":list(rect),"client_rect":list(client),"content_offset":[offset_x,offset_y],"out_w":out_w,"out_h":out_h}
                 raw=self._isolated_capture((identity_key,name),command,0.55)
                 rgb=bytes(raw)
                 expected=int(out_w)*int(out_h)*3
@@ -1840,7 +2130,7 @@ class WinBridge:
                 attempts.append(name+"失败："+str(error))
         if not candidates:
             self.capture_reports[hwnd]="采集失败："+"；".join(attempts)
-            raise CaptureUnavailable("无法采集目标窗口："+"；".join(attempts))
+            raise CaptureUnavailable("无法采集目标内容区域："+"；".join(attempts))
         chosen=next((item for item in candidates if item["method"]==validated_method and identity_valid),None)
         if chosen is None:
             chosen=min(candidates,key=lambda item:(not item["capture_valid"],bool(item["quality"].get("black_frame")),item["priority"]))
@@ -1863,9 +2153,10 @@ class WinBridge:
         result.update({"usable_for_learning":usable,"usable_for_training":usable,"usable_for_teaching":usable,"protected_or_black":bool(protected or is_black),"black_frame":is_black,"stable_frame":bool(chosen.get("stable_frame") and not frozen),"capture_frozen":frozen,"frozen_backend":frozen})
         if validation_mode:
             result["validation_candidates"]=[{"method":item["method"],"rgb":item["rgb"],"quality":dict(item["quality"]),"stale":bool(item.get("stale"))} for item in candidates]
+        wgc_note="；WGC不可用，已降级" if any(str(value).startswith("Windows Graphics Capture失败") for value in attempts) else ""
         if usable:
             mode="合法静态画面" if result.get("stable_frame") else ("低纹理画面" if result["quality"].get("flat_frame") else "画面有效")
-            self.capture_reports[hwnd]="当前采集："+result["method"]+"；"+mode+"；后端已验收"
+            self.capture_reports[hwnd]="当前采集："+result["method"]+"；"+mode+"；内容区域已隔离；后端已验收"+wgc_note
         else:
             reasons=[]
             if is_black:
@@ -1991,7 +2282,7 @@ class WinBridge:
         thread_id,pid=self.window_thread_pid(hwnd)
         process=self.process_identity_for_pid(pid)
         result=dict(thresholds)
-        result.update({"method":method,"validated_backend":method,"validated_backends":sorted(eligible),"dynamic_passed":True,"static_passed":not dynamic,"calibration_mode":"dynamic" if dynamic else "stable","validated_at":time.time(),"validated_rect":list(rect),"validated_dpi":dpi,"validated_pid":pid,"validated_class":str(target["class"]),"validated_process_path":process["path"],"validated_process_created":process["created"],"validated_window_thread_id":thread_id,"validated_integrity":process["integrity"],"integrity":process["integrity"],"nonblack_frames":len(selected),"black_frames":black_frames,"trusted_change":dynamic,"backend_thresholds":backend_thresholds})
+        result.update({"method":method,"validated_backend":method,"validated_backends":sorted(eligible),"dynamic_passed":True,"static_passed":not dynamic,"calibration_mode":"dynamic" if dynamic else "stable","validated_at":time.time(),"validated_rect":list(rect),"validated_content_rect_norm":[round(safe_float(value,0.0),6) for value in target.get("content_rect_norm",[0,0,1,1])[:4]],"capture_backend_version":CAPTURE_BACKEND_VERSION,"validated_dpi":dpi,"validated_pid":pid,"validated_class":str(target["class"]),"validated_process_path":process["path"],"validated_process_created":process["created"],"validated_window_thread_id":thread_id,"validated_integrity":process["integrity"],"integrity":process["integrity"],"nonblack_frames":len(selected),"black_frames":black_frames,"trusted_change":dynamic,"backend_thresholds":backend_thresholds})
         self.calibrations[hwnd]=result
         mode="动态校准" if dynamic else "稳定性校准"
         self.capture_reports[hwnd]="当前采集："+method+"；"+mode+"通过；非黑帧"+str(len(selected))+"；帧率"+str(round(fps,1))+"fps；后端已验收"
@@ -2001,7 +2292,7 @@ class WinBridge:
             raise InputStopped("停止标志已设置，拒绝新的鼠标输入")
         item=INPUT()
         item.type=0
-        item.mi=MOUSEINPUT(int(dx),int(dy),ctypes.c_ulong(int(data)&0xffffffff).value,int(flags),0,0)
+        item.mi=MOUSEINPUT(int(dx),int(dy),ctypes.c_ulong(int(data)&0xffffffff).value,int(flags),0,ULONG_PTR(INPUT_EXTRA_INFO))
         if require_allowed and not self.input_allowed():
             raise InputStopped("停止标志已设置，拒绝新的鼠标输入")
         if self.user32.SendInput(1,ctypes.byref(item),ctypes.sizeof(INPUT))!=1:
@@ -2036,10 +2327,14 @@ class WinBridge:
     def close(self):
         self.block_input()
         processes_stopped=self.abort_capture_processes()
-        try:
-            self.wgc.close()
-        except Exception:
-            pass
+        with self.wgc_lock:
+            wgc=self.wgc
+            self.wgc=None
+        if wgc is not None:
+            try:
+                wgc.close()
+            except Exception:
+                pass
         with self.capture_task_lock:
             items=list(self.gdi_resources.values())
             self.gdi_resources.clear()
@@ -2081,11 +2376,13 @@ def _capture_process_main(connection):
                 out_w=safe_int(command.get("out_w",FEATURE_W),FEATURE_W,1,PREVIEW_W)
                 out_h=safe_int(command.get("out_h",FEATURE_H),FEATURE_H,1,PREVIEW_H)
                 if backend=="Windows Graphics Capture":
-                    result=bridge.wgc.capture(hwnd,(x,y,width,height),out_w,out_h)
+                    result=bridge.get_wgc().capture(hwnd,(x,y,width,height),out_w,out_h)
                 elif backend=="PrintWindow客户区":
-                    result=bridge._capture_print(hwnd,width,height,out_w,out_h)
+                    client_rect=command.get("client_rect",rect); cx,cy,cw,ch=[safe_int(value,0) for value in client_rect]; offset=command.get("content_offset",[x-cx,y-cy]); ox,oy=[safe_int(value,0) for value in offset[:2]]
+                    result=bridge._capture_print(hwnd,cw,ch,out_w,out_h,(ox,oy,width,height))
                 elif backend=="窗口DC":
-                    result=bridge._capture_dc(hwnd,0,0,width,height,out_w,out_h)
+                    client_rect=command.get("client_rect",rect); cx,cy,cw,ch=[safe_int(value,0) for value in client_rect]; offset=command.get("content_offset",[x-cx,y-cy]); ox,oy=[safe_int(value,0) for value in offset[:2]]
+                    result=bridge._capture_dc(hwnd,ox,oy,width,height,out_w,out_h)
                 elif backend=="前台桌面裁剪":
                     result=bridge._capture_dc(0,x,y,width,height,out_w,out_h)
                 else:
@@ -2119,7 +2416,8 @@ class KeyboardMonitor:
         self.ready=threading.Event()
         self.error=None
         self.escape_down=False
-        self.non_escape_active=False
+        self.pressed_non_escape=set()
+        self.key_lock=threading.RLock()
         self.non_escape_count=0
     def start(self):
         self.thread=threading.Thread(target=self._run,name="UniversalGameAI-KeyboardHook",daemon=True)
@@ -2142,7 +2440,11 @@ class KeyboardMonitor:
             def callback(code,wparam,lparam):
                 if code>=0 and int(wparam) in {0x0100,0x0101,0x0104,0x0105}:
                     data=ctypes.cast(lparam,ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                    is_escape=int(data.vkCode)==0x1B
+                    injected=bool(int(data.flags)&0x12)
+                    if own_injected_event(data.flags,data.dwExtraInfo,0x12):
+                        return self.bridge.user32.CallNextHookEx(self.hook,code,wparam,lparam)
+                    vk=int(data.vkCode)
+                    is_escape=vk==0x1B
                     down=int(wparam) in {0x0100,0x0104}
                     stamp=time.time()
                     if is_escape:
@@ -2150,16 +2452,24 @@ class KeyboardMonitor:
                         self.escape_down=down
                         if first:
                             self.escape_event.set()
-                            self._put({"kind":"escape","down":True,"time":stamp})
+                            self._put({"kind":"escape","down":True,"time":stamp,"injected":injected})
                     else:
+                        with self.key_lock:
+                            first=down and vk not in self.pressed_non_escape
+                            if down:
+                                self.pressed_non_escape.add(vk)
+                            else:
+                                self.pressed_non_escape.discard(vk)
+                            active=bool(self.pressed_non_escape)
                         if down:
-                            self.non_escape_active=True
-                            self.non_escape_count+=1
+                            if first:
+                                self.non_escape_count+=1
                             self.other_event.set()
-                            self._put({"kind":"other","down":True,"time":stamp})
+                            self._put({"kind":"other","down":True,"time":stamp,"vk":vk,"injected":injected})
                         else:
-                            self.non_escape_active=False
-                            self._put({"kind":"other","down":False,"time":stamp})
+                            self._put({"kind":"other","down":False,"time":stamp,"vk":vk,"injected":injected})
+                            if not active:
+                                self.other_event.clear()
                 return self.bridge.user32.CallNextHookEx(self.hook,code,wparam,lparam)
             self.callback=self.bridge.HOOKPROC(callback)
             module=self.bridge.kernel32.GetModuleHandleW(None)
@@ -2194,7 +2504,8 @@ class KeyboardMonitor:
             self.escape_event.clear()
         return result
     def all_released(self):
-        return not self.non_escape_active
+        with self.key_lock:
+            return not self.pressed_non_escape
     def stop(self,timeout=1.0):
         if self.thread_id:
             try:
@@ -2242,14 +2553,15 @@ class MouseMonitor:
             def callback(code,wparam,lparam):
                 if code>=0 and int(wparam) in messages:
                     data=ctypes.cast(lparam,ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-                    if int(data.flags)&0x00000003:
+                    injected=bool(int(data.flags)&0x00000003)
+                    if own_injected_event(data.flags,data.dwExtraInfo,0x00000003):
                         return self.bridge.user32.CallNextHookEx(self.hook,code,wparam,lparam)
                     stamp=time.time()
                     kind=messages[int(wparam)]
                     if kind!="move" or stamp-self.last_move>=0.018:
                         if kind=="move":
                             self.last_move=stamp
-                        event={"type":kind,"x":int(data.pt.x),"y":int(data.pt.y),"time":stamp}
+                        event={"type":kind,"x":int(data.pt.x),"y":int(data.pt.y),"time":stamp,"injected":injected,"extra_info":int(data.dwExtraInfo)}
                         if kind in {"wheel","hwheel"}:
                             raw=(int(data.mouseData)>>16)&0xffff
                             event["delta"]=raw-0x10000 if raw&0x8000 else raw
@@ -2700,9 +3012,280 @@ class AskQuestionProducer:
         return not bool(self.thread and self.thread.is_alive())
     def alive(self):
         return bool(self.thread and self.thread.is_alive())
+class BoundedLRU:
+    def __init__(self,capacity=50000):
+        self.capacity=max(1,int(capacity))
+        self.data=OrderedDict()
+        self.hits=0
+        self.misses=0
+    def get(self,key,default=None):
+        if key not in self.data:
+            self.misses+=1
+            return default
+        value=self.data.pop(key)
+        self.data[key]=value
+        self.hits+=1
+        return value
+    def __setitem__(self,key,value):
+        if key in self.data:
+            self.data.pop(key)
+        self.data[key]=value
+        while len(self.data)>self.capacity:
+            self.data.popitem(last=False)
+    def clear(self):
+        self.data.clear()
+    def __len__(self):
+        return len(self.data)
+def compact_checksum_key(item):
+    value=str(item.get("checksum") or item.get("created") or id(item)).encode("utf-8","replace")
+    return int.from_bytes(hashlib.blake2b(value,digest_size=8).digest(),"big")
+def action_runtime_metadata(action):
+    item=normalize_action(action)
+    if not item:
+        return {"action":None,"family":"","dangerous":True,"strictness":(9.0,999,0.0),"cooldown":9.0}
+    kind=item["kind"]
+    button=item.get("button")
+    dangerous=kind in {"double_click","long_press","drag"} or button in {"right","middle"}
+    if dangerous:
+        strictness=(1.35,4,0.78)
+    elif kind in {"scroll_v","scroll_h"}:
+        strictness=(1.2,3,0.80)
+    elif kind in {"move","hover"}:
+        strictness=(1.0,2,0.84)
+    elif kind=="no_op":
+        strictness=(1.0,1,0.88)
+    else:
+        strictness=(1.0,2,0.84)
+    cooldown={"click":0.8,"double_click":1.5,"long_press":2.0,"drag":1.2,"scroll_v":0.8,"scroll_h":1.0,"move":0.45,"hover":1.0,"no_op":0.25}.get(kind,1.0)
+    return {"action":item,"family":action_family_key(item),"dangerous":dangerous,"strictness":strictness,"cooldown":cooldown}
+def coarse_bucket_key(value):
+    raw=bytes(value) if isinstance(value,(bytes,bytearray)) and len(value)==COARSE_LEN else b""
+    if not raw:
+        return ()
+    plane=COARSE_W*COARSE_H
+    return tuple(min(7,max(0,round(sum(raw[index*plane:(index+1)*plane])/plane/36.0))) for index in range(FEATURE_CHANNELS))
+def window_descriptor_score(descriptor,candidate):
+    if not isinstance(descriptor,dict) or not isinstance(candidate,dict):
+        return -1
+    score=0
+    if os.path.normcase(str(descriptor.get("process_path",""))) and os.path.normcase(str(descriptor.get("process_path","")))==os.path.normcase(str(candidate.get("process_path",""))):
+        score+=8
+    if str(descriptor.get("class","")) and str(descriptor.get("class",""))==str(candidate.get("class","")):
+        score+=5
+    rule=descriptor.get("title_rule",{})
+    title=str(candidate.get("title",""))
+    if isinstance(rule,dict):
+        mode=str(rule.get("mode","")); value=str(rule.get("value",""))
+        if mode=="exact" and title==value:
+            score+=4
+        elif mode=="prefix" and title.startswith(value):
+            score+=3
+        elif mode=="contains" and value and value in title:
+            score+=2
+    size=descriptor.get("client_size")
+    if isinstance(size,(list,tuple)) and len(size)>=2 and list(size[:2])==list(candidate.get("client_size",[])[:2]):
+        score+=2
+    if safe_int(descriptor.get("dpi",0),0)>0 and safe_int(descriptor.get("dpi",0),0)==safe_int(candidate.get("dpi",0),0):
+        score+=1
+    if safe_int(descriptor.get("integrity",-1),-1)>=0 and safe_int(descriptor.get("integrity",-1),-1)==safe_int(candidate.get("integrity",-2),-2):
+        score+=1
+    return score
+class ReviewProcessStore:
+    def __init__(self,payload):
+        self.samples=list(payload.get("samples",[]))
+        self.stats=dict(payload.get("stats",{}))
+        self.rejections=list(payload.get("rejections",[]))
+        self.saved=[]
+        self.profile=dict(payload.get("profile",{}))
+    def load_game_profile(self,gid):
+        return dict(self.profile)
+    def load_samples(self,gid):
+        return list(self.samples),dict(self.stats)
+    def load_rejections(self,gid,limit=500):
+        return list(self.rejections[:int(limit)])
+    def save_model(self,gid,model,complete=True):
+        self.saved.append((str(gid),dict(model),bool(complete)))
+        return True
+class ReviewProcessLifecycle:
+    def mark_running(self):
+        return MODE_RUNNING
+    def snapshot(self):
+        return MODE_RUNNING,"复习",None,"completed",""
+class ReviewProcessApi:
+    def key_down(self,key):
+        return False
+    def block_input(self):
+        return None
+    def release_all_buttons(self):
+        return None
+def review_process_send(connection,kind,payload):
+    try:
+        connection.send((str(kind),payload))
+        return True
+    except Exception:
+        return False
+def review_process_main(connection,stop_event,payload):
+    try:
+        app=object.__new__(App)
+        app.selected_game=dict(payload["game"])
+        app.store=ReviewProcessStore(payload)
+        app.stop_event=stop_event
+        app.review_distance_cache=BoundedLRU(payload.get("cache_capacity",50000))
+        app.candidate_cache=BoundedLRU(64)
+        app.active_model_runtime=None
+        app.review_controller=ReviewController(app)
+        app.lifecycle=ReviewProcessLifecycle()
+        app.mode_state=MODE_STARTING
+        app.api=ReviewProcessApi()
+        app.set_progress=lambda value:review_process_send(connection,"progress",float(value))
+        app.set_status=lambda value:review_process_send(connection,"status",str(value))
+        result=App._review_worker_impl(app)
+        review_process_send(connection,"result",{"status":result.status,"summary":result.summary,"details":result.details,"models":app.store.saved})
+    except InputStopped as error:
+        saved=app.store.saved if "app" in locals() else []
+        review_process_send(connection,"result",{"status":"stopped","summary":"复习已停止","details":{"reason":str(error)},"models":saved})
+    except BaseException:
+        saved=app.store.saved if "app" in locals() else []
+        review_process_send(connection,"error",{"traceback":traceback.format_exc(),"models":saved})
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+class ReviewProcessWorker:
+    def __init__(self,payload):
+        context=multiprocessing.get_context("spawn")
+        self.connection,child=context.Pipe(duplex=False)
+        self.stop_event=context.Event()
+        self.process=context.Process(target=review_process_main,args=(child,self.stop_event,dict(payload)),name="UniversalGameAI-OfflineReview",daemon=True)
+        self.process.start()
+        child.close()
+    def request_stop(self):
+        self.stop_event.set()
+    def receive(self,timeout=0.0):
+        if self.connection.poll(max(0.0,float(timeout))):
+            return self.connection.recv()
+        return None
+    def alive(self):
+        return bool(self.process.is_alive())
+    def terminate(self,timeout=0.3):
+        self.stop_event.set()
+        try:
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join(max(0.0,float(timeout)))
+            if self.process.is_alive() and hasattr(self.process,"kill"):
+                self.process.kill()
+                self.process.join(max(0.0,float(timeout)))
+        except Exception:
+            pass
+        return not self.process.is_alive()
+    def close(self,timeout=0.2):
+        self.stop_event.set()
+        try:
+            self.process.join(max(0.0,float(timeout)))
+        except Exception:
+            pass
+        stopped=not self.process.is_alive()
+        if stopped:
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+        return stopped
+class LearningInputEventConverter:
+    def convert(self,event,rect):
+        if not isinstance(event,dict) or len(rect)!=4:
+            return None
+        item=dict(event)
+        if not all(key in item for key in ("x","y","time","type")):
+            return None
+        rx,ry,rw,rh=rect
+        item["inside"]=bool(rx<=int(item["x"])<rx+rw and ry<=int(item["y"])<ry+rh)
+        if item["inside"]:
+            item["point"]=[max(0.0,min(1.0,(int(item["x"])-rx)/max(1,rw-1))),max(0.0,min(1.0,(int(item["y"])-ry)/max(1,rh-1)))]
+        return item
+class ClickMerger:
+    def merge(self,first,second,maximum_gap=0.32):
+        if not first or not second or float(second.get("time",0))-float(first.get("time",0))>float(maximum_gap):
+            return None
+        return {"kind":"double_click","button":str(first.get("button","left")),"path":[list(first.get("point",[0.5,0.5]))],"duration":max(0.06,float(second.get("time",0))-float(first.get("time",0)))}
+class NegativeSampleSampler:
+    def due(self,last_time,now,motion_time):
+        return float(now)-float(last_time)>0.9 and float(now)-float(motion_time)>0.35
+class SessionSubmitter:
+    def __init__(self,store,gid,session_id):
+        self.store=store; self.gid=str(gid); self.session_id=str(session_id)
+    def flush(self):
+        return self.store.flush_samples()
+class ReviewDataFilter:
+    def valid(self,sample):
+        action=normalize_action(sample.get("a")); context=sample.get("context",{}); temporal=temporal_from_context(context); calibration=context.get("calibration",{}) if isinstance(context,dict) else {}
+        return bool(feature_valid(sample.get("f")) and action and temporal.get("complete") and str(sample.get("capture_method","unknown")) not in {"","unknown","legacy"} and calibration.get("dynamic_passed"))
+class ReviewSessionSplitter:
+    def split(self,controller,valid):
+        return controller._split_by_family_backend(valid)
+class ReviewActionClusterer:
+    def cluster(self,app,samples):
+        return app._cluster_action_samples(samples)
+class ReviewVisualClusterer:
+    def cluster(self,app,*args):
+        return app._cluster_action_group(*args)
+class ReviewThresholdBuilder:
+    def dangerous(self,action):
+        return action_runtime_metadata(action)["dangerous"]
+class ReviewValidator:
+    def authorize(self,row,dangerous):
+        minimum=VersionedThresholdConfig.dangerous_min_positive if dangerous else VersionedThresholdConfig.ordinary_min_positive
+        sessions=VersionedThresholdConfig.dangerous_min_sessions if dangerous else VersionedThresholdConfig.ordinary_min_sessions
+        return bool(row.get("total",0)>=minimum and row.get("independent_sessions",0)>=sessions and row.get("errors",0)==0 and row.get("false_positive",0)==0 and row.get("coverage",0.0)>=VersionedThresholdConfig.minimum_coverage and (not dangerous or row.get("negative_total",0)>=VersionedThresholdConfig.dangerous_min_negative))
+class TrainingInterferenceDetector:
+    def tripped(self,mouse_event,keyboard_event):
+        return bool(mouse_event.is_set() or keyboard_event.is_set())
+class TrainingFrameGate:
+    def usable(self,frame,backend):
+        return bool(frame and frame.get("usable_for_training") and not frame.get("black_frame") and not frame.get("capture_frozen") and frame.get("method")==backend)
+class TrainingCandidateConfirmer:
+    def confirmed(self,count,required):
+        return int(count)>=int(required)
+class TrainingActionAuthorizer:
+    def authorized(self,proto):
+        return bool(proto.get("authorized",False) and not proto.get("ambiguous",False))
+class TrainingPostActionVerifier:
+    def changed(self,before,after,threshold):
+        return bool(after is not None and visual_distance(before,after["f"])>=float(threshold))
+class AskRenderer:
+    def action_text(self,app,action):
+        return app.action_text(action)
+class AskQuestionStateMachine:
+    def __init__(self):
+        self.state="loading"
+    def set(self,value):
+        self.state=str(value)
+class AskActionEditor:
+    def normalize(self,action):
+        return normalize_action(action)
+class AskSubmitController:
+    def submit(self,queue_object,value):
+        queue_object.put(value)
 class LearningController:
     def __init__(self,app):
         self.app=app
+        self.converter=LearningInputEventConverter()
+        self.click_merger=ClickMerger()
+        self.negative_sampler=NegativeSampleSampler()
+    def convert_event(self,event,rect):
+        return self.converter.convert(event,rect)
+    def merge_clicks(self,first,button,point,start_time,end_time):
+        second={"time":float(start_time),"button":str(button),"point":list(point)}
+        merged=self.click_merger.merge(first,second,0.42)
+        if merged is not None:
+            merged["duration"]=max(0.06,float(end_time)-float(first.get("time",start_time)))
+        return merged
+    def negative_due(self,last_time,now,motion_time):
+        return self.negative_sampler.due(last_time,now,motion_time)
+    def submit(self,store,gid,session_id):
+        return SessionSubmitter(store,gid,session_id).flush()
     def run(self):
         return self.app._learning_worker_impl()
 class ReviewController:
@@ -2713,7 +3296,7 @@ class ReviewController:
     def method_of(self,item):
         return str(item.get("capture_method") or item.get("context",{}).get("capture_method") or "unknown")
     def stratum_of(self,item):
-        return (action_family_key(item["a"]),action_signature(item["a"]),self.method_of(item))
+        return (action_family_key(item["a"]),self.method_of(item))
     def decorrelate(self,valid):
         result=[]
         previous={}
@@ -2722,7 +3305,7 @@ class ReviewController:
         for index,item in enumerate(ordered):
             if index%32==0 and self.app.should_stop():
                 raise InputStopped("复习已停止")
-            key=(self.session_of(item),self.stratum_of(item))
+            key=(self.session_of(item),action_signature(item["a"]),self.method_of(item))
             old=previous.get(key)
             keep=True
             if old is not None:
@@ -2738,51 +3321,92 @@ class ReviewController:
                 removed+=1
         return result,removed
     def split(self,valid):
+        return ReviewSessionSplitter().split(self,valid)
+    def _split_by_family_backend(self,valid):
         session_groups=defaultdict(list)
         for item in valid:
             session_groups[self.session_of(item)].append(item)
         sessions=sorted(session_groups,key=lambda key:hashlib.sha256(key.encode("utf-8","replace")).hexdigest())
         totals=Counter(self.stratum_of(item) for item in valid)
         if len(sessions)<2:
-            return list(valid),[],{"complete":False,"mode":"independent_session","holdout_sessions":[],"reason":"只有一个完整学习session，只能生成临时模型","strata":len(totals),"session_count":len(sessions)}
-        session_counts={session:Counter(self.stratum_of(item) for item in items) for session,items in session_groups.items()}
-        session_sizes={session:len(items) for session,items in session_groups.items()}
-        target=max(150,round(len(valid)*0.25))
+            return list(valid),[],{"complete":False,"mode":"session_family_backend_visual_group","holdout_sessions":[],"reason":"只有一个完整学习session，只能生成临时模型","strata":len(totals),"session_count":len(sessions),"visual_group_intersection":[]}
+        parent={session:session for session in sessions}
+        def find(value):
+            while parent[value]!=value:
+                parent[value]=parent[parent[value]]
+                value=parent[value]
+            return value
+        def union(first,second):
+            a=find(first); b=find(second)
+            if a!=b:
+                parent[max(a,b)]=min(a,b)
+        hash_sessions=defaultdict(set)
+        for item in valid:
+            hash_sessions[visual_perceptual_hash(item["f"])].add(self.session_of(item))
+        for sessions_for_hash in hash_sessions.values():
+            ordered_sessions=sorted(sessions_for_hash)
+            for session in ordered_sessions[1:]:
+                union(ordered_sessions[0],session)
+        hash_values=sorted(hash_sessions)
+        comparisons=0
+        for first_index,first_hash in enumerate(hash_values):
+            first_sessions=sorted(hash_sessions[first_hash])
+            for second_hash in hash_values[first_index+1:]:
+                comparisons+=1
+                if comparisons%2048==0 and self.app.should_stop():
+                    raise InputStopped("复习已停止")
+                if bin(int(first_hash,16)^int(second_hash,16)).count("1")<=4:
+                    second_sessions=sorted(hash_sessions[second_hash])
+                    if first_sessions and second_sessions:
+                        union(first_sessions[0],second_sessions[0])
+        group_sessions=defaultdict(set)
+        for session in sessions:
+            group_sessions[find(session)].add(session)
+        groups=sorted(group_sessions,key=lambda key:hashlib.sha256("|".join(sorted(group_sessions[key])).encode("utf-8","replace")).hexdigest())
+        group_items={group:[item for session in group_sessions[group] for item in session_groups[session]] for group in groups}
+        group_counts={group:Counter(self.stratum_of(item) for item in items) for group,items in group_items.items()}
+        group_sizes={group:len(items) for group,items in group_items.items()}
+        target=max(VersionedThresholdConfig.review_min_holdout,round(len(valid)*0.25))
         best=None
         best_score=None
         def consider(chosen):
             nonlocal best,best_score
-            if not chosen or len(chosen)>=len(sessions):
+            if not chosen or len(chosen)>=len(groups):
                 return
-            hold_counts=Counter()
-            hold_count=0
-            for session in chosen:
-                hold_counts.update(session_counts[session])
-                hold_count+=session_sizes[session]
-            complete=all(0<hold_counts[key]<totals[key] for key in totals)
-            score=(0 if complete else 1,0 if hold_count>=150 else 1,abs(hold_count-target),len(chosen))
+            hold_counts=Counter(); hold_count=0
+            for group in chosen:
+                hold_counts.update(group_counts[group]); hold_count+=group_sizes[group]
+            shared=sum(1 for key,total in totals.items() if 0<hold_counts[key]<total)
+            missing=sum(1 for key,total in totals.items() if hold_counts[key] in {0,total})
+            complete=shared>0 and all(hold_counts[key]<totals[key] for key in totals)
+            score=(0 if complete else 1,missing,0 if hold_count>=VersionedThresholdConfig.review_min_holdout else 1,abs(hold_count-target),len(chosen))
             if best_score is None or score<best_score:
-                best=set(chosen)
-                best_score=score
-        count=len(sessions)
+                best=set(chosen); best_score=score
+        count=len(groups)
         if count<=16:
             for mask in range(1,(1<<count)-1):
-                consider({sessions[index] for index in range(count) if mask&(1<<index)})
+                consider({groups[index] for index in range(count) if mask&(1<<index)})
         else:
-            generator=random.Random(int(hashlib.sha256("|".join(sessions).encode("utf-8","replace")).hexdigest()[:16],16))
-            for order in (sessions,sorted(sessions,key=lambda value:session_sizes[value]),sorted(sessions,key=lambda value:session_sizes[value],reverse=True)):
+            generator=random.Random(int(hashlib.sha256("|".join(groups).encode("utf-8","replace")).hexdigest()[:16],16))
+            for order in (groups,sorted(groups,key=lambda value:group_sizes[value]),sorted(groups,key=lambda value:group_sizes[value],reverse=True)):
                 for length in range(1,min(len(order),16)+1):
                     consider(set(order[:length]))
             for _ in range(5000):
-                consider({session for session in sessions if generator.random()<0.25})
+                consider({group for group in groups if generator.random()<0.25})
         if not best:
-            return list(valid),[],{"complete":False,"mode":"independent_session","holdout_sessions":[],"reason":"无法建立完整session留出集","strata":len(totals),"session_count":len(sessions)}
-        train=[item for item in valid if self.session_of(item) not in best]
-        holdout=[item for item in valid if self.session_of(item) in best]
+            return list(valid),[],{"complete":False,"mode":"session_family_backend_visual_group","holdout_sessions":[],"reason":"无法建立视觉组与session级留出集","strata":len(totals),"session_count":len(sessions),"visual_group_count":len(groups),"visual_group_intersection":[]}
+        hold_sessions=set().union(*(group_sessions[group] for group in best))
+        train=[item for item in valid if self.session_of(item) not in hold_sessions]
+        holdout=[item for item in valid if self.session_of(item) in hold_sessions]
         assert_disjoint_checksums(train,holdout)
+        train_sessions={self.session_of(item) for item in train}; holdout_sessions={self.session_of(item) for item in holdout}
+        visual_intersection=sorted({visual_perceptual_hash(item["f"]) for item in train}&{visual_perceptual_hash(item["f"]) for item in holdout})
+        if train_sessions&holdout_sessions or visual_intersection:
+            raise RuntimeError("训练集与留出集session或视觉近重复组发生重叠")
         hold_counts=Counter(self.stratum_of(item) for item in holdout)
-        complete=bool(train and holdout and all(0<hold_counts[key]<totals[key] for key in totals))
-        return train,holdout,{"complete":complete,"mode":"independent_session","holdout_sessions":sorted(best),"reason":"" if complete else "完整session划分后无法同时覆盖全部原始动作签名与采集后端","strata":len(totals),"session_count":len(sessions)}
+        complete=bool(train and holdout and not any(hold_counts[key]>=totals[key] for key in totals) and any(0<hold_counts[key]<totals[key] for key in totals))
+        reason="" if complete else "视觉组划分无法为动作族与采集后端保留训练数据"
+        return train,holdout,{"complete":complete,"mode":"session_family_backend_visual_group","holdout_sessions":sorted(holdout_sessions),"reason":reason,"strata":len(totals),"session_count":len(sessions),"visual_group_count":len(groups),"training_sessions":sorted(train_sessions),"session_intersection":[],"visual_group_intersection":visual_intersection}
     def map_holdout(self,holdout,clusters):
         by_family=defaultdict(list)
         for cluster in clusters:
@@ -2809,10 +3433,25 @@ class ReviewController:
             item["_uncovered_action"]=False
         return uncovered
     def run(self):
-        return self.app._review_worker_impl()
+        return self.app._run_review_process()
 class TrainingController:
     def __init__(self,app):
         self.app=app
+        self.interference_detector=TrainingInterferenceDetector()
+        self.frame_gate=TrainingFrameGate()
+        self.confirmer=TrainingCandidateConfirmer()
+        self.authorizer=TrainingActionAuthorizer()
+        self.post_verifier=TrainingPostActionVerifier()
+    def interference(self,mouse_event,keyboard_event):
+        return self.interference_detector.tripped(mouse_event,keyboard_event)
+    def usable_frame(self,frame,backend):
+        return self.frame_gate.usable(frame,backend)
+    def confirmed(self,count,required):
+        return self.confirmer.confirmed(count,required)
+    def authorized(self,proto):
+        return self.authorizer.authorized(proto)
+    def changed(self,before,after,threshold):
+        return self.post_verifier.changed(before,after,threshold)
     def run(self):
         return self.app._training_worker_impl()
 class TeachingController:
@@ -2827,6 +3466,7 @@ class TeachingController:
             model=app.store.load_model(game["id"])
         except Exception:
             model=None
+        app.active_model_runtime=model
         prototypes=[item for item in (model.get("prototypes",[]) if model else []) if feature_valid(item.get("f")) and normalize_action(item.get("a"))]
         historical=[]
         for index,item in enumerate(samples):
@@ -2923,11 +3563,7 @@ class TeachingController:
                     message="请教数据库或题目处理失败："+str(error)
                     if callback:
                         app.ui(lambda callback=callback,message=message:callback(None,message))
-                    app.lifecycle.request_stop("failed",message)
-                    app.mode_state=MODE_STOPPING
-                    if app.stop_event is not None:
-                        app.stop_event.set()
-                    app.api.block_input()
+                    app.request_mode_stop("failed",message)
                     break
         try:
             app.store.flush_samples()
@@ -2940,74 +3576,246 @@ class TeachingController:
             return ModeResult("failed",app.lifecycle.snapshot()[4] or summary)
         return ModeResult(status if status in {"completed","stopped"} else "stopped",summary,{"samples":stats.get("valid",0)})
 class DataStore:
-    def __init__(self):
+    def __init__(self,base=None):
         local=os.environ.get("LOCALAPPDATA")
-        self.base=(Path(local) if local else Path.home()/"AppData"/"Local")/APP_NAME
+        self.base=Path(base) if base is not None else (Path(local) if local else Path.home()/"AppData"/"Local")/APP_NAME
         self.base.mkdir(parents=True,exist_ok=True)
+        usage=shutil.disk_usage(self.base)
+        if int(usage.free)<MIN_FREE_DISK:
+            raise RuntimeError("剩余磁盘空间不足256MB，拒绝启动以避免数据库损坏")
         self.db_path=self.base/"universal_game_ai.db"
         self.lock=threading.RLock()
+        self.pending_lock=threading.RLock()
+        self.writer_condition=threading.Condition(self.pending_lock)
         self.model_cache={}
         self.closed=False
         self.closing=False
+        self.read_only=False
+        self.read_only_reason=""
+        self.corrupt_backup=None
         self.invalid_rows=defaultdict(int)
         self.pending_samples=[]
         self.pending_event=threading.Event()
         self.writer_stop=threading.Event()
         self.writer_error=None
+        self.writer_error_callback=None
         self.writer_thread=None
-        self.db=sqlite3.connect(str(self.db_path),timeout=3.0,check_same_thread=False)
-        self.db.row_factory=sqlite3.Row
-        with self.db:
-            self.db.execute("PRAGMA foreign_keys=ON")
-            self.db.execute("PRAGMA journal_mode=WAL")
-            self.db.execute("PRAGMA synchronous=NORMAL")
-            self.db.execute("PRAGMA temp_store=MEMORY")
-            self.db.execute("PRAGMA busy_timeout=3000")
+        self.writer_db=None
+        self.db=ThreadLocalSQLite(self.db_path,False)
+        try:
+            result=self.db.execute("PRAGMA quick_check").fetchone()
+            if not result or str(result[0]).lower()!="ok":
+                raise RuntimeError(str(result[0]) if result else "quick_check无结果")
+        except Exception as error:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            self.corrupt_backup=self.create_recovery_backup("quick_check_failed")
+            self.db=ThreadLocalSQLite(self.db_path,True)
+            self.read_only=True
+            self.read_only_reason="数据库quick_check失败，已只读打开；恢复备份："+str(self.corrupt_backup)+"；"+str(error)
+            return
         self._initialize_schema()
         self._migrate_legacy()
         self.writer_thread=threading.Thread(target=self._writer_loop,name="UniversalGameAI-SampleWriter",daemon=True)
         self.writer_thread.start()
+    def set_writer_error_callback(self,callback):
+        self.writer_error_callback=callback
+    def _notify_writer_error(self,value):
+        callback=self.writer_error_callback
+        if callback is not None:
+            try:
+                callback(value)
+            except Exception:
+                pass
+    def _ensure_writable(self):
+        if self.read_only:
+            raise RuntimeError(self.read_only_reason or "数据库处于只读恢复模式")
+    def create_recovery_backup(self,reason="manual"):
+        stamp=time.strftime("%Y%m%d_%H%M%S")
+        folder=self.base/("recovery_"+stamp+"_"+str(reason).replace(" ","_"))
+        folder.mkdir(parents=True,exist_ok=True)
+        for suffix in ("","-wal","-shm"):
+            source=Path(str(self.db_path)+suffix)
+            if source.exists():
+                shutil.copy2(source,folder/source.name)
+        self._trim_recovery_backups()
+        return folder
+    def _trim_recovery_backups(self):
+        folders=sorted((item for item in self.base.glob("recovery_*") if item.is_dir()),key=lambda item:item.stat().st_mtime,reverse=True)
+        total=0
+        for folder in folders:
+            size=sum(path.stat().st_size for path in folder.rglob("*") if path.is_file())
+            total+=size
+            if total>RECOVERY_BACKUP_LIMIT:
+                shutil.rmtree(folder,ignore_errors=True)
+    def light_checkpoint(self):
+        self.flush_samples()
+        with self.lock:
+            try:
+                self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                self.db.execute("PRAGMA optimize")
+            except Exception:
+                pass
+    def default_game_profile(self):
+        return {"goal":"模仿已学习的鼠标操作并在不确定时停止","allowed_families":["no_op","click|left","move","hover","scroll_v|1","scroll_v|-1"],"max_consecutive_failures":3,"exploration_enabled":False,"restart_action":None,"success_states":[],"failure_states":[],"success_reward":1.0,"failure_reward":-1.0,"step_penalty":-0.01,"updated":0.0}
+    def load_game_profile(self,gid):
+        profile=self.default_game_profile()
+        try:
+            with self.lock:
+                row=self.db.execute("SELECT payload,checksum FROM game_profiles WHERE game_id=?",(str(gid),)).fetchone()
+            if row:
+                raw=str(row["payload"])
+                if hashlib.sha256(raw.encode("utf-8")).hexdigest()==str(row["checksum"]):
+                    value=json.loads(raw)
+                    if isinstance(value,dict):
+                        profile.update(value)
+        except Exception:
+            pass
+        return profile
+    def save_game_profile(self,gid,profile):
+        self._ensure_writable()
+        value=self.default_game_profile()
+        if isinstance(profile,dict):
+            value.update(profile)
+        value["goal"]=str(value.get("goal","")).strip()[:2000] or "模仿已学习的鼠标操作并在不确定时停止"
+        value["allowed_families"]=sorted({str(item) for item in value.get("allowed_families",[]) if str(item)})
+        value["success_states"]=sorted({str(item) for item in value.get("success_states",[]) if str(item)})
+        value["failure_states"]=sorted({str(item) for item in value.get("failure_states",[]) if str(item)})
+        value["max_consecutive_failures"]=safe_int(value.get("max_consecutive_failures",3),3,1,20)
+        value["exploration_enabled"]=bool(value.get("exploration_enabled",False))
+        value["restart_action"]=normalize_action(value.get("restart_action")) if value.get("restart_action") else None
+        value["updated"]=time.time()
+        raw=json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(",",":"))
+        checksum=hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        with self.lock,self.db:
+            self.db.execute("INSERT OR REPLACE INTO game_profiles(game_id,updated,payload,checksum) VALUES(?,?,?,?)",(str(gid),value["updated"],raw,checksum))
+            self.db.execute("UPDATE games SET needs_review=1 WHERE id=?",(str(gid),))
+        self.model_cache.pop(str(gid),None)
+        return value
+    def quarantine_corrupt_row(self,table_name,row_id,game_id,reason,payload=""):
+        if self.read_only:
+            return
+        try:
+            with self.lock,self.db:
+                self.db.execute("INSERT OR IGNORE INTO corrupt_rows(source_table,source_id,game_id,created,reason,payload) VALUES(?,?,?,?,?,?)",(str(table_name),safe_int(row_id,0),str(game_id),time.time(),str(reason)[:2000],str(payload)[:16000]))
+        except Exception:
+            pass
+    @contextmanager
+    def critical_transaction(self):
+        self._ensure_writable()
+        with self.lock:
+            self.db.execute("PRAGMA synchronous=FULL")
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+            finally:
+                self.db.execute("PRAGMA synchronous=NORMAL")
     def _raise_writer_error(self):
         if self.writer_error:
             raise RuntimeError("样本批量写入失败："+str(self.writer_error))
-    def _flush_pending(self):
-        with self.lock:
+    def _flush_pending(self,connection):
+        self._ensure_writable()
+        with self.pending_lock:
             if not self.pending_samples:
                 self.pending_event.clear()
-                self._raise_writer_error()
+                self.writer_condition.notify_all()
                 return 0
             batch=self.pending_samples
             self.pending_samples=[]
             self.pending_event.clear()
             rows=[item["row"] for item in batch]
             review_games=sorted({item["gid"] for item in batch if item.get("mark_review")})
+        last_error=None
+        for attempt in range(5):
             try:
-                with self.db:
-                    self.db.executemany("INSERT OR IGNORE INTO samples(game_id,created,kind,action_signature,action_family,repeat_policy,feature_algorithm_version,action_algorithm_version,feature,coarse,action,source,session_id,capture_method,context,thumbnail,weight,fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",rows)
+                with connection:
+                    connection.executemany("INSERT OR IGNORE INTO samples(game_id,created,kind,action_signature,action_family,repeat_policy,feature_algorithm_version,action_algorithm_version,feature,coarse,action,source,session_id,capture_method,context,thumbnail,weight,fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",rows)
                     for gid in review_games:
-                        self.db.execute("UPDATE games SET needs_review=1 WHERE id=?",(gid,))
-            except Exception:
-                self.pending_samples=batch+self.pending_samples
-                self.writer_error=traceback.format_exc()
-                raise
-            return len(batch)
+                        connection.execute("UPDATE games SET needs_review=1 WHERE id=?",(gid,))
+                if self.writer_error is not None:
+                    self.writer_error=None
+                    self._notify_writer_error(None)
+                with self.pending_lock:
+                    self.writer_condition.notify_all()
+                return len(batch)
+            except sqlite3.OperationalError as error:
+                last_error=error
+                text_error=str(error).lower()
+                if "locked" not in text_error and "busy" not in text_error:
+                    break
+                if self.writer_stop.wait(min(1.2,0.05*(2**attempt))):
+                    break
+            except Exception as error:
+                last_error=error
+                break
+        with self.pending_lock:
+            self.pending_samples=batch+self.pending_samples
+            self.pending_event.set()
+            self.writer_condition.notify_all()
+        self.writer_error="".join(traceback.format_exception_only(type(last_error),last_error)).strip() if last_error is not None else "未知写入错误"
+        self._notify_writer_error(self.writer_error)
+        raise RuntimeError(self.writer_error)
     def flush_samples(self):
-        self._raise_writer_error()
-        return self._flush_pending()
+        if self.read_only:
+            with self.pending_lock:
+                if self.pending_samples:
+                    self._ensure_writable()
+            return 0
+        with self.pending_lock:
+            if not self.pending_samples:
+                self._raise_writer_error()
+                return 0
+            initial=len(self.pending_samples)
+            self.pending_event.set()
+            deadline=time.monotonic()+5.0
+            while self.pending_samples and not self.writer_error and time.monotonic()<deadline:
+                self.writer_condition.wait(min(0.2,max(0.0,deadline-time.monotonic())))
+            if self.pending_samples:
+                self._raise_writer_error()
+                raise RuntimeError("样本写线程在5秒内未完成提交")
+            self._raise_writer_error()
+            return initial
     def _writer_loop(self):
-        while not self.writer_stop.is_set():
-            self.pending_event.wait(0.35)
-            if self.writer_stop.is_set():
-                break
-            try:
-                self._flush_pending()
-            except Exception:
-                self.writer_stop.set()
-                break
+        connection=sqlite3.connect(str(self.db_path),timeout=3.0,check_same_thread=False)
+        connection.row_factory=sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA busy_timeout=3000")
+        self.writer_db=connection
         try:
-            self._flush_pending()
-        except Exception:
-            pass
+            while not self.writer_stop.is_set():
+                self.pending_event.wait(0.35)
+                with self.pending_lock:
+                    empty=not self.pending_samples
+                if self.writer_stop.is_set() and empty:
+                    break
+                try:
+                    self._flush_pending(connection)
+                except Exception:
+                    if self.writer_stop.wait(0.8):
+                        break
+            with self.pending_lock:
+                pending=bool(self.pending_samples)
+            if pending:
+                try:
+                    self._flush_pending(connection)
+                except Exception:
+                    pass
+        finally:
+            try:
+                connection.close()
+            except Exception:
+                pass
+            self.writer_db=None
+            with self.pending_lock:
+                self.writer_condition.notify_all()
     def _table_exists(self,name):
         return bool(self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(str(name),)).fetchone())
     def _columns(self,name):
@@ -3028,6 +3836,8 @@ class DataStore:
         self.db.execute("CREATE TABLE IF NOT EXISTS rejections(id INTEGER PRIMARY KEY AUTOINCREMENT,game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,created REAL NOT NULL,feature_algorithm_version INTEGER NOT NULL,feature BLOB NOT NULL,coarse BLOB NOT NULL,thumbnail BLOB,candidates TEXT NOT NULL,source TEXT NOT NULL,session_id TEXT NOT NULL,capture_method TEXT NOT NULL)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_rejections_game_created ON rejections(game_id,created DESC)")
         self.db.execute("CREATE TABLE IF NOT EXISTS capture_calibrations(identity_key TEXT NOT NULL,backend TEXT NOT NULL,saved REAL NOT NULL,payload TEXT NOT NULL,checksum TEXT NOT NULL,PRIMARY KEY(identity_key,backend))")
+        self.db.execute("CREATE TABLE IF NOT EXISTS game_profiles(game_id TEXT PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE,updated REAL NOT NULL,payload TEXT NOT NULL,checksum TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS corrupt_rows(id INTEGER PRIMARY KEY AUTOINCREMENT,source_table TEXT NOT NULL,source_id INTEGER NOT NULL,game_id TEXT NOT NULL,created REAL NOT NULL,reason TEXT NOT NULL,payload TEXT NOT NULL,UNIQUE(source_table,source_id))")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_capture_calibrations_saved ON capture_calibrations(saved DESC)")
     def _initialize_schema(self):
         with self.lock:
@@ -3083,6 +3893,10 @@ class DataStore:
                         self.db.execute("CREATE TABLE IF NOT EXISTS capture_calibrations(identity_key TEXT NOT NULL,backend TEXT NOT NULL,saved REAL NOT NULL,payload TEXT NOT NULL,checksum TEXT NOT NULL,PRIMARY KEY(identity_key,backend))")
                         self.db.execute("CREATE INDEX IF NOT EXISTS idx_capture_calibrations_saved ON capture_calibrations(saved DESC)")
                         version=5
+                    elif version==5:
+                        self.db.execute("CREATE TABLE IF NOT EXISTS game_profiles(game_id TEXT PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE,updated REAL NOT NULL,payload TEXT NOT NULL,checksum TEXT NOT NULL)")
+                        self.db.execute("CREATE TABLE IF NOT EXISTS corrupt_rows(id INTEGER PRIMARY KEY AUTOINCREMENT,source_table TEXT NOT NULL,source_id INTEGER NOT NULL,game_id TEXT NOT NULL,created REAL NOT NULL,reason TEXT NOT NULL,payload TEXT NOT NULL,UNIQUE(source_table,source_id))")
+                        version=6
                     else:
                         raise RuntimeError("没有从数据库版本"+str(version)+"开始的迁移路径")
                     self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",(str(version),))
@@ -3240,7 +4054,6 @@ class DataStore:
             return None
         return next((game for game in self.games() if game["id"]==row[0]),None)
     def replace_games(self,games,selected):
-        self.flush_samples()
         cleaned=[]
         names=set()
         for item in games:
@@ -3251,24 +4064,33 @@ class DataStore:
                 raise RuntimeError("游戏名称重复")
             names.add(name.casefold())
             cleaned.append({"id":str(item["id"]),"name":name,"created":float(item.get("created",time.time())),"needs_review":1 if item.get("needs_review") else 0,"last_review":item.get("last_review")})
-        if selected not in {item["id"] for item in cleaned}:
+        keep={item["id"] for item in cleaned}
+        if selected not in keep:
             raise RuntimeError("所选游戏不存在")
-        with self.lock,self.db:
+        with self.pending_lock:
+            removed_pending=[item for item in self.pending_samples if item.get("gid") not in keep]
+            self.pending_samples=[item for item in self.pending_samples if item.get("gid") in keep]
+            if not self.pending_samples:
+                self.pending_event.clear()
+            self.writer_condition.notify_all()
+        self.flush_samples()
+        with self.critical_transaction():
             self.db.execute("INSERT INTO config_backups(created,payload) VALUES(?,?)",(time.time(),json.dumps(self._config_snapshot(),ensure_ascii=False,separators=(",",":"))))
             self.db.execute("DELETE FROM config_backups WHERE id NOT IN (SELECT id FROM config_backups ORDER BY id DESC LIMIT 5)")
-            keep={item["id"] for item in cleaned}
             existing={row[0] for row in self.db.execute("SELECT id FROM games")}
             for gid in existing-keep:
-                self.db.execute("DELETE FROM model_backups WHERE game_id=?",(gid,))
                 self.db.execute("DELETE FROM games WHERE id=?",(gid,))
                 self.model_cache.pop(gid,None)
             for item in cleaned:
                 self.db.execute("INSERT INTO games(id,name,created,needs_review,last_review) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,created=excluded.created,needs_review=excluded.needs_review,last_review=excluded.last_review",(item["id"],item["name"],item["created"],item["needs_review"],item["last_review"]))
             self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('selected_game',?)",(selected,))
+        return {"deleted_games":sorted(existing-keep),"discarded_pending_samples":len(removed_pending)}
     def delete_game(self,gid):
-        self.flush_samples()
         game_id=str(gid)
-        with self.lock,self.db:
+        with self.lock:
+            self.pending_samples=[item for item in self.pending_samples if item.get("gid")!=game_id]
+        self.flush_samples()
+        with self.critical_transaction():
             row=self.db.execute("SELECT 1 FROM games WHERE id=?",(game_id,)).fetchone()
             if not row:
                 return False
@@ -3289,7 +4111,7 @@ class DataStore:
         if not fields:
             return
         values.append(gid)
-        with self.lock,self.db:
+        with self.critical_transaction():
             self.db.execute("UPDATE games SET "+",".join(fields)+" WHERE id=?",values)
     def _sample_fingerprint(self,feature,action,context=None):
         temporal=temporal_from_context(context or {})
@@ -3323,6 +4145,7 @@ class DataStore:
                 continue
         return False
     def _insert_sample(self,gid,feature,action,source,context,thumbnail,weight,enforce_quota,mark_review,created=None):
+        self._ensure_writable()
         self._raise_writer_error()
         clean=normalize_action(action)
         if not clean or not feature_valid(feature):
@@ -3391,6 +4214,7 @@ class DataStore:
     def append_sample(self,gid,feature,action,source,context=None,thumbnail=None,weight=1.0):
         return self._insert_sample(gid,feature,action,source,context or {},thumbnail,weight,True,True)
     def append_rejection(self,gid,feature,candidates,source="teach_reject",thumbnail=None,context=None):
+        self._ensure_writable()
         if not feature_valid(feature):
             raise RuntimeError("拒绝记录的特征无效")
         candidate_data=[]
@@ -3405,7 +4229,7 @@ class DataStore:
     def load_samples(self,gid,limit=MAX_SAMPLES):
         self.flush_samples()
         with self.lock:
-            rows=self.db.execute("SELECT created,feature_algorithm_version,action_algorithm_version,feature,coarse,action,source,session_id,capture_method,context,thumbnail,weight,fingerprint,repeat_policy FROM samples WHERE game_id=? ORDER BY created DESC,id DESC LIMIT ?",(gid,int(limit))).fetchall()
+            rows=self.db.execute("SELECT id,created,feature_algorithm_version,action_algorithm_version,feature,coarse,action,source,session_id,capture_method,context,thumbnail,weight,fingerprint,repeat_policy FROM samples WHERE game_id=? ORDER BY created DESC,id DESC LIMIT ?",(gid,int(limit))).fetchall()
         result=[]
         invalid=0
         for row in reversed(rows):
@@ -3414,8 +4238,7 @@ class DataStore:
                 action=normalize_action(json.loads(row["action"]))
                 coarse=bytes(row["coarse"]) if row["coarse"] is not None and len(row["coarse"])==COARSE_LEN else coarse_feature(feature)
                 if not feature_valid(feature) or len(coarse)!=COARSE_LEN or not action:
-                    invalid+=1
-                    continue
+                    raise ValueError("样本特征、粗特征或动作无效")
                 thumbnail=bounded_decompress(row["thumbnail"],PIXELS*4) if row["thumbnail"] is not None else None
                 thumbnail=upgrade_gray_image(thumbnail) if thumbnail is not None else None
                 context=json.loads(row["context"])
@@ -3423,13 +4246,14 @@ class DataStore:
                     context={}
                 context.update({"session_id":row["session_id"],"capture_method":row["capture_method"],"repeat_policy":row["repeat_policy"]})
                 result.append({"format_version":FORMAT_VERSION,"feature_width":FEATURE_W,"feature_height":FEATURE_H,"feature_algorithm_version":FEATURE_ALGORITHM_VERSION,"action_algorithm_version":ACTION_ALGORITHM_VERSION,"created":row["created"],"game_id":gid,"f":feature,"coarse":coarse,"a":action,"source":row["source"],"session_id":row["session_id"],"capture_method":row["capture_method"],"repeat_policy":row["repeat_policy"],"context":context,"thumbnail":thumbnail,"weight":row["weight"],"checksum":row["fingerprint"]})
-            except Exception:
+            except Exception as error:
                 invalid+=1
+                self.quarantine_corrupt_row("samples",row["id"],gid,error,row["fingerprint"])
         self.invalid_rows[str(gid)]=max(self.invalid_rows.get(str(gid),0),invalid)
         return result,{"valid":len(result),"invalid":invalid,"total":len(rows)}
     def load_rejections(self,gid,limit=500):
         with self.lock:
-            rows=self.db.execute("SELECT created,feature_algorithm_version,feature,coarse,thumbnail,candidates,source,session_id,capture_method FROM rejections WHERE game_id=? ORDER BY created DESC,id DESC LIMIT ?",(gid,int(limit))).fetchall()
+            rows=self.db.execute("SELECT id,created,feature_algorithm_version,feature,coarse,thumbnail,candidates,source,session_id,capture_method FROM rejections WHERE game_id=? ORDER BY created DESC,id DESC LIMIT ?",(gid,int(limit))).fetchall()
         result=[]
         invalid=0
         for row in rows:
@@ -3439,12 +4263,12 @@ class DataStore:
                 candidates=json.loads(row["candidates"])
                 thumbnail=bounded_decompress(row["thumbnail"],PIXELS*4) if row["thumbnail"] is not None else None
                 thumbnail=upgrade_gray_image(thumbnail) if thumbnail is not None else None
-                if feature_valid(feature) and len(coarse)==COARSE_LEN and isinstance(candidates,list):
-                    result.append({"created":row["created"],"f":feature,"coarse":coarse,"thumbnail":thumbnail,"candidates":candidates,"source":row["source"],"session_id":row["session_id"],"capture_method":row["capture_method"]})
-                else:
-                    invalid+=1
-            except Exception:
+                if not feature_valid(feature) or len(coarse)!=COARSE_LEN or not isinstance(candidates,list):
+                    raise ValueError("拒绝记录特征或候选无效")
+                result.append({"created":row["created"],"f":feature,"coarse":coarse,"thumbnail":thumbnail,"candidates":candidates,"source":row["source"],"session_id":row["session_id"],"capture_method":row["capture_method"]})
+            except Exception as error:
                 invalid+=1
+                self.quarantine_corrupt_row("rejections",row["id"],gid,error,str(row["source"]))
         self.invalid_rows["rejections:"+str(gid)]=max(self.invalid_rows.get("rejections:"+str(gid),0),invalid)
         return result
     def sample_stats(self,gid):
@@ -3582,13 +4406,30 @@ class DataStore:
             self.db.execute("DELETE FROM rejections WHERE game_id=?",(gid,))
             self.db.execute("UPDATE games SET needs_review=0,last_review=NULL WHERE id=?",(gid,))
         self.model_cache.pop(gid,None)
+    def save_window_descriptor(self,target):
+        self._ensure_writable()
+        rule=dict(target.get("title_rule") or {"mode":"none","value":""})
+        if str(rule.get("mode","none")) not in TITLE_RULE_MODES:
+            rule={"mode":"none","value":""}
+        descriptor={"process_path":os.path.normcase(str(target.get("process_path",""))),"class":str(target.get("class","")),"title_rule":rule,"client_size":list(target.get("client_size",[]))[:2],"dpi":safe_int(target.get("selected_dpi",target.get("dpi",0)),0),"integrity":safe_int(target.get("integrity",-1),-1),"content_rect_norm":[round(safe_float(value,0.0),8) for value in target.get("content_rect_norm",[0,0,1,1])[:4]],"content_aspect":safe_float(target.get("content_aspect",0.0),0.0),"content_source":str(target.get("content_source","manual")),"window_rule_version":WINDOW_RULE_VERSION,"saved":time.time()}
+        with self.lock,self.db:
+            self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('last_window_descriptor',?)",(json.dumps(descriptor,ensure_ascii=False,separators=(",",":")),))
+        return descriptor
+    def load_window_descriptor(self):
+        try:
+            with self.lock:
+                row=self.db.execute("SELECT value FROM meta WHERE key='last_window_descriptor'").fetchone()
+            value=json.loads(row[0]) if row else None
+            return value if isinstance(value,dict) else None
+        except Exception:
+            return None
     def _calibration_identity_key(self,target):
         if not isinstance(target,dict):
             return ""
         raw_size=target.get("client_size")
         if not isinstance(raw_size,(list,tuple)):
             raw_size=[0,0]
-        payload={"process_path":os.path.normcase(str(target.get("process_path",""))),"class":str(target.get("class","")),"client_size":[safe_int(value,0,0) for value in list(raw_size)[:2]],"dpi":safe_int(target.get("selected_dpi",target.get("dpi",0)),0,0)}
+        payload={"process_path":os.path.normcase(str(target.get("process_path",""))),"class":str(target.get("class","")),"client_size":[safe_int(value,0,0) for value in list(raw_size)[:2]],"dpi":safe_int(target.get("selected_dpi",target.get("dpi",0)),0,0),"content_rect_norm":[round(safe_float(value,0.0),6) for value in target.get("content_rect_norm",[0,0,1,1])[:4]],"window_rule_version":WINDOW_RULE_VERSION,"capture_backend_version":CAPTURE_BACKEND_VERSION}
         while len(payload["client_size"])<2:
             payload["client_size"].append(0)
         if not payload["process_path"] or not payload["class"] or payload["client_size"]==[0,0] or payload["dpi"]<=0:
@@ -3673,14 +4514,21 @@ class DataStore:
             return None
     def _model_valid(self,item,gid,complete=True):
         try:
-            if not isinstance(item,dict) or item.get("format_version")!=FORMAT_VERSION or item.get("feature_width")!=FEATURE_W or item.get("feature_height")!=FEATURE_H or item.get("feature_algorithm_version")!=FEATURE_ALGORITHM_VERSION or item.get("action_algorithm_version")!=ACTION_ALGORITHM_VERSION or item.get("game_id")!=gid or bool(item.get("complete"))!=bool(complete):
+            if not isinstance(item,dict) or item.get("format_version")!=FORMAT_VERSION or item.get("feature_width")!=FEATURE_W or item.get("feature_height")!=FEATURE_H or item.get("feature_algorithm_version")!=FEATURE_ALGORITHM_VERSION or item.get("action_algorithm_version")!=ACTION_ALGORITHM_VERSION or item.get("game_id")!=gid or bool(item.get("complete"))!=bool(complete) or item.get("algorithm_snapshot")!=algorithm_snapshot():
+                return False
+            binding=item.get("model_binding")
+            if not isinstance(binding,dict) or binding.get("window_rule_version")!=WINDOW_RULE_VERSION or binding.get("capture_backend_version")!=CAPTURE_BACKEND_VERSION or not binding.get("process_paths") or not binding.get("window_classes") or not binding.get("content_rect_norms") or not finite_number(binding.get("content_aspect_min")) or not finite_number(binding.get("content_aspect_max")) or float(binding.get("content_aspect_min",0))<=0 or float(binding.get("content_aspect_max",0))<=0 or safe_int(binding.get("dpi_min",0),0)<=0 or safe_int(binding.get("dpi_max",0),0)<=0 or not binding.get("capture_methods"):
+                return False
+            if not isinstance(item.get("sequence_model"),dict) or len(str(item.get("safety_profile_checksum","")))!=64:
                 return False
             prototypes=item.get("prototypes")
             if not isinstance(prototypes,list) or not prototypes or len(prototypes)>MAX_PROTOTYPES:
                 return False
             for proto in prototypes:
+                if not isinstance(proto,dict):
+                    return False
                 temporal=temporal_from_context(proto.get("temporal",{}))
-                if not isinstance(proto,dict) or not str(proto.get("id","")) or not str(proto.get("cluster_id","")) or not str(proto.get("canonical_action_signature","")) or not feature_valid(proto.get("f")) or not isinstance(proto.get("coarse"),(bytes,bytearray)) or len(proto.get("coarse"))!=COARSE_LEN or not normalize_action(proto.get("a")) or not finite_number(proto.get("threshold")) or float(proto.get("threshold"))<=0 or int(proto.get("support",0))<=0 or not temporal.get("complete") or not finite_number(proto.get("temporal_threshold",0)) or float(proto.get("temporal_threshold",0))<=0:
+                if not str(proto.get("id","")) or not str(proto.get("cluster_id","")) or not str(proto.get("canonical_action_signature","")) or not feature_valid(proto.get("f")) or not isinstance(proto.get("coarse"),(bytes,bytearray)) or len(proto.get("coarse"))!=COARSE_LEN or not normalize_action(proto.get("a")) or not finite_number(proto.get("threshold")) or float(proto.get("threshold"))<=0 or int(proto.get("support",0))<=0 or not temporal.get("complete") or not finite_number(proto.get("temporal_threshold",0)) or float(proto.get("temporal_threshold",0))<=0:
                     return False
                 conflict=proto.get("nearest_conflicting_distance")
                 if conflict is not None and (not finite_number(conflict) or float(conflict)<0):
@@ -3691,24 +4539,29 @@ class DataStore:
                 if not finite_number(proto.get("minimum_second_candidate_gap",0)) or str(proto.get("repeat_policy","one_shot")) not in REPEAT_POLICIES or not finite_number(proto.get("max_rate",1.0)) or float(proto.get("max_rate",1.0))<=0:
                     return False
             validation=item.get("validation")
+            if complete and not any(bool(proto.get("authorized",False)) for proto in prototypes):
+                return False
             return isinstance(validation,dict) and isinstance(item.get("capture_backends"),list) and bool(item.get("capture_backends"))
         except Exception:
             return False
     def save_model(self,gid,model,complete=True):
         item=dict(model)
-        item.update({"format_version":FORMAT_VERSION,"feature_width":FEATURE_W,"feature_height":FEATURE_H,"feature_algorithm_version":FEATURE_ALGORITHM_VERSION,"action_algorithm_version":ACTION_ALGORITHM_VERSION,"game_id":gid,"complete":bool(complete),"saved":time.time()})
+        item.update({"format_version":FORMAT_VERSION,"feature_width":FEATURE_W,"feature_height":FEATURE_H,"feature_algorithm_version":FEATURE_ALGORITHM_VERSION,"action_algorithm_version":ACTION_ALGORITHM_VERSION,"game_id":gid,"complete":bool(complete),"algorithm_snapshot":algorithm_snapshot(),"saved":time.time()})
         clean_prototypes=[]
         for proto in item.get("prototypes",[]):
             entry=dict(proto)
-            action=normalize_action(entry.get("a"))
+            runtime=action_runtime_metadata(entry.get("a"))
+            action=runtime["action"]
             if action:
                 entry["a"]=action
                 entry["canonical_action_signature"]=str(entry.get("canonical_action_signature") or action_signature(action))
-                entry["cluster_id"]=str(entry.get("cluster_id") or "action|"+action_family_key(action)+"|"+hashlib.sha256(canonical_bytes(action)).hexdigest()[:20])
+                entry["cluster_id"]=str(entry.get("cluster_id") or "action|"+runtime["family"]+"|"+hashlib.sha256(canonical_bytes(action)).hexdigest()[:20])
             if "coarse" not in entry and feature_valid(entry.get("f")):
                 entry["coarse"]=coarse_feature(entry["f"])
             entry["repeat_policy"]=str(entry.get("repeat_policy","one_shot")) if str(entry.get("repeat_policy","one_shot")) in REPEAT_POLICIES else "one_shot"
             entry["max_rate"]=float(entry.get("max_rate",3.0)) if finite_number(entry.get("max_rate",3.0)) else 3.0
+            entry["capture_methods"]=sorted({str(value) for value in entry.get("capture_methods",[])})
+            entry["authorized"]=bool(entry.get("authorized",False))
             clean_prototypes.append(entry)
         item["prototypes"]=clean_prototypes
         if not self._model_valid(item,gid,complete):
@@ -3717,7 +4570,7 @@ class DataStore:
         checksum=hashlib.sha256(payload).hexdigest()
         slot="complete" if complete else "partial"
         validation=json.dumps(item.get("validation",{}),ensure_ascii=False,separators=(",",":"))
-        with self.lock,self.db:
+        with self.critical_transaction():
             if complete:
                 old=self.db.execute("SELECT saved,prototype_count,validation,payload,checksum FROM models WHERE game_id=? AND slot='complete'",(gid,)).fetchone()
                 if old:
@@ -3728,7 +4581,33 @@ class DataStore:
                 self.db.execute("DELETE FROM models WHERE game_id=? AND slot='partial'",(gid,))
                 self.db.execute("UPDATE games SET needs_review=0,last_review=? WHERE id=?",(float(item.get("created",time.time())),gid))
         if complete:
-            self.model_cache[gid]=item
+            self.model_cache[gid]=self._prepare_model_runtime(item)
+    def _prepare_model_runtime(self,item):
+        model=dict(item)
+        prototypes=[]
+        backend_index=defaultdict(list)
+        bucket_index=defaultdict(list)
+        for index,proto in enumerate(model.get("prototypes",[])):
+            entry=dict(proto)
+            runtime=action_runtime_metadata(entry.get("a"))
+            entry["a"]=runtime["action"]
+            entry["action_family"]=runtime["family"]
+            entry["feature_view"]=memoryview(entry["f"]).toreadonly()
+            entry["channel_offsets"]=(0,PIXELS,PIXELS*2,PIXELS*3,PIXELS*4)
+            entry["dangerous"]=runtime["dangerous"]
+            entry["strictness"]=runtime["strictness"]
+            entry["cooldown"]=runtime["cooldown"]
+            entry["capture_methods"]=frozenset(str(value) for value in entry.get("capture_methods",[]))
+            entry["temporal_cached"]=temporal_from_context(entry.get("temporal",{}))
+            entry["coarse_bucket"]=coarse_bucket_key(entry.get("coarse"))
+            prototypes.append(entry)
+            for backend in entry["capture_methods"] or frozenset({"unknown"}):
+                backend_index[backend].append(index)
+                bucket_index[(backend,entry["coarse_bucket"])].append(index)
+        model["prototypes"]=prototypes
+        model["runtime_index"]={"backend":dict(backend_index),"bucket":dict(bucket_index)}
+        model["runtime_token"]=hashlib.sha256((str(model.get("saved",0))+"|"+str(len(prototypes))).encode()).hexdigest()[:16]
+        return model
     def _row_model(self,row,gid,complete):
         try:
             if not row or hashlib.sha256(row["payload"]).hexdigest()!=row["checksum"]:
@@ -3746,6 +4625,7 @@ class DataStore:
             row=self.db.execute("SELECT payload,checksum FROM models WHERE game_id=? AND slot='complete'",(gid,)).fetchone()
         item=self._row_model(row,gid,True)
         if item:
+            item=self._prepare_model_runtime(item)
             self.model_cache[gid]=item
             return item
         with self.lock:
@@ -3755,8 +4635,10 @@ class DataStore:
             if recovered:
                 payload=self._pack_model(recovered)
                 checksum=hashlib.sha256(payload).hexdigest()
-                with self.lock,self.db:
-                    self.db.execute("INSERT OR REPLACE INTO models(game_id,slot,saved,created,prototype_count,validation,payload,checksum) VALUES(?,?,?,?,?,?,?,?)",(gid,"complete",float(recovered.get("saved",backup["created"])),float(recovered.get("created",backup["created"])),len(recovered["prototypes"]),json.dumps(recovered.get("validation",{}),ensure_ascii=False,separators=(",",":")),sqlite3.Binary(payload),checksum))
+                if not self.read_only:
+                    with self.critical_transaction():
+                        self.db.execute("INSERT OR REPLACE INTO models(game_id,slot,saved,created,prototype_count,validation,payload,checksum) VALUES(?,?,?,?,?,?,?,?)",(gid,"complete",float(recovered.get("saved",backup["created"])),float(recovered.get("created",backup["created"])),len(recovered["prototypes"]),json.dumps(recovered.get("validation",{}),ensure_ascii=False,separators=(",",":")),sqlite3.Binary(payload),checksum))
+                recovered=self._prepare_model_runtime(recovered)
                 self.model_cache[gid]=recovered
                 return recovered
         if row:
@@ -3790,35 +4672,49 @@ class DataStore:
         with self.lock:
             row=self.db.execute("PRAGMA quick_check").fetchone()
         return bool(row and str(row[0]).lower()=="ok")
-    def close(self,timeout=5.0):
-        with self.lock:
-            if self.closed:
-                return True
-            if self.closing:
-                return False
-            self.closing=True
+    def emergency_checkpoint(self,reason="forced_exit"):
+        record={"created":time.time(),"reason":str(reason),"pending_samples":len(self.pending_samples),"writer_error":self.writer_error,"read_only":self.read_only}
+        try:
+            path=self.base/"recovery.log"
+            with path.open("a",encoding="utf-8") as handle:
+                handle.write(json.dumps(record,ensure_ascii=False,separators=(",",":"))+"\n")
+        except Exception:
+            pass
+        try:
+            if self.db is not None and not self.read_only:
+                with self.lock:
+                    self.db.execute("PRAGMA wal_checkpoint(FULL)")
+        except Exception:
+            pass
+        return record
+    def close(self,timeout=4.0):
+        if self.closed:
+            return True
+        self.closing=True
+        if not self.read_only:
+            try:
+                self.flush_samples()
+            except Exception:
+                pass
         self.writer_stop.set()
         self.pending_event.set()
-        if self.writer_thread and self.writer_thread.is_alive() and self.writer_thread is not threading.current_thread() and float(timeout)>0:
-            self.writer_thread.join(float(timeout))
-        if self.writer_thread and self.writer_thread.is_alive():
-            with self.lock:
-                self.closing=False
+        thread=self.writer_thread
+        if thread and thread.is_alive() and thread is not threading.current_thread() and timeout>0:
+            thread.join(max(0.0,float(timeout)))
+        stopped=not bool(thread and thread.is_alive())
+        if not stopped:
             return False
         try:
-            with self.lock:
-                self._flush_pending()
-                if self.db is not None:
-                    self.db.execute("PRAGMA wal_checkpoint(FULL)")
-                    self.db.close()
-                    self.db=None
-                self.closed=True
-                self.closing=False
-            return True
+            if not self.read_only:
+                self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:
-            with self.lock:
-                self.closing=False
-            raise
+            pass
+        try:
+            self.db.close()
+        except Exception:
+            pass
+        self.closed=True
+        return True
 class App:
     def __init__(self,root):
         self.root=root
@@ -3826,17 +4722,23 @@ class App:
         self.store=DataStore()
         self.selected_game=self.store.selected_game()
         self.selected_window=None
+        self.window_recommendation=self.store.load_window_descriptor()
         self.lifecycle=ModeLifecycle()
         self.mode=None
         self.mode_state=MODE_IDLE
         self.stop_event=None
         self.mode_thread=None
         self.active_session=None
+        self.review_process=None
         self.pending_mode_result=None
         self.pending_mode_error=None
         self.mode_shutdown_deadline=None
         self.mode_shutdown_forced=[]
+        self.mode_stop_lock=threading.RLock()
+        self.mode_stop_started=False
+        self.mode_shutdown_polling=False
         self.controls=[]
+        self.control_buttons={}
         self.stop_button=None
         self.ask_window=None
         self.ask_buffer=None
@@ -3854,7 +4756,10 @@ class App:
         self.closing=False
         self.shutdown_started=False
         self.shutdown_deadline=None
-        self.review_distance_cache={}
+        self.review_distance_cache=BoundedLRU(50000)
+        self.candidate_cache=BoundedLRU(64)
+        self.storage_fault=bool(self.store.read_only)
+        self.active_model_runtime=None
         self.learning_controller=LearningController(self)
         self.review_controller=ReviewController(self)
         self.training_controller=TrainingController(self)
@@ -3870,20 +4775,62 @@ class App:
         self.input_text=tk.StringVar(value="自动输入：已锁定")
         self.progress_value=tk.DoubleVar(value=0.0)
         self.root.report_callback_exception=self.tk_exception
+        self.store.set_writer_error_callback(self._writer_status_changed)
         self._build()
         self._refresh_all()
+        self._apply_storage_controls()
+        if self.store.read_only:
+            self.status.set(self.store.read_only_reason)
         self.root.protocol("WM_DELETE_WINDOW",self.close)
         self.root.after(25,self.process_ui_queue)
         self.root.after(35,self.poll_global_escape)
         self.root.after(1200,self.periodic_refresh)
+    def _writer_status_changed(self,error):
+        def apply():
+            self.storage_fault=bool(error) or bool(self.store.read_only)
+            if error:
+                self.status.set("样本写入失败，学习与请教已锁定："+str(error))
+                if self.mode in {"学习","请教"}:
+                    self.request_mode_stop("failed","样本写入失败")
+            else:
+                self.status.set("样本写入线程已恢复")
+            self._apply_storage_controls()
+        self.ui(apply)
+    def _apply_storage_controls(self):
+        blocked=bool(self.storage_fault or self.store.read_only)
+        for name in ("学习","复习","请教"):
+            button=self.control_buttons.get(name)
+            if button is not None and self.mode_state==MODE_IDLE:
+                button.configure(state="disabled" if blocked else "normal")
+    def _forced_exit(self,reason,exit_function=os._exit):
+        self.api.block_input()
+        self.api.release_all_buttons()
+        try:
+            if self.review_process is not None:
+                self.review_process.terminate(0.2)
+        except Exception:
+            pass
+        try:
+            self.api.stop_capture_processes(0.0,True)
+        except Exception:
+            pass
+        try:
+            self.store.emergency_checkpoint(reason)
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        exit_function(2)
     def _build(self):
         self.root.title("通用游戏AI")
-        self.root.geometry("800x680")
-        self.root.minsize(720,610)
+        self.root.geometry("800x720")
+        self.root.minsize(720,650)
         self.root.option_add("*Font",("Microsoft YaHei UI",10))
         outer=ttk.Frame(self.root,padding=18)
         outer.pack(fill="both",expand=True)
-        ttk.Label(outer,text="通用游戏AI控制面板",font=("Microsoft YaHei UI",18,"bold")).pack(anchor="w",pady=(0,12))
+        ttk.Label(outer,text="任务型游戏AI控制面板",font=("Microsoft YaHei UI",18,"bold")).pack(anchor="w",pady=(0,12))
         info=ttk.LabelFrame(outer,text="当前状态",padding=12)
         info.pack(fill="x",pady=(0,12))
         labels=[("当前游戏：",self.game_text),("目标窗口：",self.window_text),("窗口身份：",self.window_detail),("采集兼容性：",self.capture_text),("输入权限：",self.input_text),("数据统计：",self.sample_text),("模型状态：",self.model_text),("识别状态：",self.confidence_text)]
@@ -3893,9 +4840,10 @@ class App:
         info.columnconfigure(1,weight=1)
         grid=ttk.Frame(outer)
         grid.pack(fill="both",expand=True)
-        specs=[("游戏",self.open_game_dialog),("选择窗口",self.open_window_dialog),("重新测试采集后端",self.retest_capture_backends),("学习",self.start_learning),("复习",self.start_review),("训练",self.start_training),("请教",self.start_ask),("停止",self.request_stop),("数据清理",self.open_data_dialog)]
+        specs=[("游戏",self.open_game_dialog),("选择窗口",self.open_window_dialog),("任务与安全",self.open_task_dialog),("重新测试采集后端",self.retest_capture_backends),("学习",self.start_learning),("复习",self.start_review),("训练",self.start_training),("请教",self.start_ask),("停止",self.request_stop),("数据清理",self.open_data_dialog)]
         for index,(text,command) in enumerate(specs):
             button=ttk.Button(grid,text=text,command=command)
+            self.control_buttons[text]=button
             button.grid(row=index//3,column=index%3,sticky="nsew",padx=6,pady=6,ipady=10)
             if text=="停止":
                 self.stop_button=button
@@ -3904,7 +4852,7 @@ class App:
                 self.controls.append(button)
         for column in range(3):
             grid.columnconfigure(column,weight=1)
-        for row in range(3):
+        for row in range(4):
             grid.rowconfigure(row,weight=1)
         ttk.Progressbar(outer,variable=self.progress_value,maximum=100).pack(fill="x",pady=(12,8))
         bottom=ttk.Frame(outer)
@@ -3951,19 +4899,22 @@ class App:
             return
         if result is None:
             result=ModeResult("failed",str(self.mode or "模式")+"失败")
+        priority={"completed":0,"stopped":1,"failed":2}
+        _,_,_,requested,reason=self.lifecycle.snapshot()
+        effective=result.status
+        if priority.get(requested,1)>priority.get(effective,0):
+            effective=requested
+        if effective!=result.status:
+            summary=reason or (str(self.mode or "模式")+("失败" if effective=="failed" else "已停止"))
+            result=ModeResult(effective,summary,dict(result.details))
         self.pending_mode_result=result
         self.pending_mode_error=error
-        self.lifecycle.mark_stopping(result.status,result.summary if result.status=="failed" else "")
-        self.mode_state=MODE_STOPPING
-        if self.stop_event is not None:
-            self.stop_event.set()
-        self.api.block_input()
-        self._destroy_ask_window()
-        if self.active_session is not None:
-            self.active_session.request_stop()
+        self.request_mode_stop(result.status,result.summary if result.status=="failed" else reason or result.summary)
         self.mode_shutdown_deadline=time.monotonic()+5.0
         self.status.set(str(self.mode or "模式")+"正在停止资源，控制按钮保持禁用")
-        self.root.after(25,self._poll_mode_shutdown)
+        if not self.mode_shutdown_polling:
+            self.mode_shutdown_polling=True
+            self.root.after(25,self._poll_mode_shutdown)
     def _poll_mode_shutdown(self):
         if self.mode_state!=MODE_STOPPING:
             return
@@ -3975,8 +4926,15 @@ class App:
             session_done=self.active_session.close(0.0)
             if not session_done:
                 pending.extend(self.active_session.pending_names())
-        capture_pending=self.api.stop_capture_processes(0.0,False)
         deadline_reached=bool(self.mode_shutdown_deadline is not None and time.monotonic()>=self.mode_shutdown_deadline)
+        if self.review_process is not None:
+            self.review_process.request_stop()
+            if deadline_reached and self.review_process.alive():
+                self.review_process.terminate(0.2)
+                self.mode_shutdown_forced.append("OfflineReviewProcess")
+            if self.review_process.alive():
+                pending.append("OfflineReviewProcess")
+        capture_pending=self.api.stop_capture_processes(0.0,False)
         if deadline_reached and capture_pending:
             forced=self.api.stop_capture_processes(0.0,True)
             self.mode_shutdown_forced.extend(name for name in capture_pending if name not in self.mode_shutdown_forced)
@@ -3985,8 +4943,11 @@ class App:
         if thread_alive:
             pending.append("模式线程")
         pending.extend("CaptureProcess:"+name for name in capture_pending)
+        if deadline_reached and thread_alive and (self.review_process is None or not self.review_process.alive()):
+            self._forced_exit("模式停止超过5秒，Python模式线程未退出")
+            return
         if pending or not session_done:
-            suffix="；已到关闭期限并强制终止采集子进程："+"、".join(self.mode_shutdown_forced) if self.mode_shutdown_forced else ""
+            suffix="；已到关闭期限并执行强制停止："+"、".join(self.mode_shutdown_forced) if self.mode_shutdown_forced else ""
             self.status.set("STOPPING：等待资源退出："+"、".join(sorted(set(pending)))+suffix)
             self.root.after(50,self._poll_mode_shutdown)
             return
@@ -3994,10 +4955,11 @@ class App:
         error=self.pending_mode_error
         name=str(self.mode or "模式")
         if self.mode_shutdown_forced:
-            result.details["forced_capture_processes"]=list(dict.fromkeys(self.mode_shutdown_forced))
-            result.summary+="；以下采集子进程未正常退出并已强制终止："+"、".join(result.details["forced_capture_processes"])
+            result.details["forced_processes"]=list(dict.fromkeys(self.mode_shutdown_forced))
+            result.summary+="；已强制停止："+"、".join(result.details["forced_processes"])
         self.mode_thread=None
         self.active_session=None
+        self.review_process=None
         self.ask_buffer=None
         self.ask_producer=None
         self.ask_answer_queue=None
@@ -4010,6 +4972,8 @@ class App:
         self.pending_mode_result=None
         self.pending_mode_error=None
         self.mode_shutdown_deadline=None
+        self.mode_stop_started=False
+        self.mode_shutdown_polling=False
         self.set_controls(False)
         self.progress_value.set(0)
         self.status.set(result.summary)
@@ -4039,12 +5003,7 @@ class App:
             except Exception:
                 pass
     def _fail_active_mode(self,message):
-        self.lifecycle.request_stop("failed",str(message))
-        self.mode_state=MODE_STOPPING
-        if self.stop_event is not None:
-            self.stop_event.set()
-        self.api.block_input()
-        self._destroy_ask_window()
+        self.request_mode_stop("failed",str(message))
     def retest_capture_backends(self):
         self.start_worker("重测采集",self.retest_capture_worker,True)
     def retest_capture_worker(self):
@@ -4232,17 +5191,19 @@ class App:
         if self.selected_window:
             self.window_text.set(self.selected_window.get("title","未命名窗口"))
             try:
-                rect=self.api.validate_target(self.selected_window,False)
+                content=self.api.validate_target(self.selected_window,False)
+                client=self.api.client_rect(self.selected_window["hwnd"])
                 dpi=self.api.dpi_for_window(self.selected_window["hwnd"])
                 path=str(self.selected_window.get("process_path","-"))
-                self.window_detail.set("PID："+str(self.selected_window["pid"])+"  TID："+str(self.selected_window.get("window_thread_id","-"))+"  类名："+self.selected_window["class"]+"  客户区："+str(rect[2])+"×"+str(rect[3])+"  DPI："+str(dpi)+"  完整性："+str(self.selected_window.get("integrity","-"))+"  路径："+path)
+                rule=self.selected_window.get("title_rule",{"mode":"none"})
+                self.window_detail.set("PID："+str(self.selected_window["pid"])+"  TID："+str(self.selected_window.get("window_thread_id","-"))+"  类名："+self.selected_window["class"]+"  客户区："+str(client[2])+"×"+str(client[3])+"  游戏区域："+str(content[2])+"×"+str(content[3])+"  DPI："+str(dpi)+"  标题规则："+str(rule.get("mode","none"))+"  路径："+path)
                 self.capture_text.set(self.api.capture_status(self.selected_window["hwnd"]))
             except Exception as error:
                 self.window_detail.set("PID："+str(self.selected_window.get("pid","-"))+"  类名："+str(self.selected_window.get("class","-"))+"  "+str(error))
                 self.capture_text.set("采集方式：等待目标窗口恢复")
         else:
             self.window_text.set("未选择")
-            self.window_detail.set("PID：-  类名：-  客户区：-")
+            self.window_detail.set("PID：-  类名：-  客户区：-  游戏区域：-")
             self.capture_text.set("采集方式：未检测")
         self.refresh_data_stats()
     def refresh_data_stats(self):
@@ -4292,8 +5253,9 @@ class App:
         if self.mode:
             self.show_error("请先停止当前模式")
             return
-        games=[dict(item) for item in self.store.games()]
-        selected_id=self.selected_game["id"] if self.selected_game else None
+        working_games=[dict(item) for item in self.store.games()]
+        original_selected=self.selected_game["id"] if self.selected_game else None
+        working_selected=original_selected
         win=tk.Toplevel(self.root)
         win.title("游戏")
         win.geometry("540x450")
@@ -4302,6 +5264,7 @@ class App:
         frame=ttk.Frame(win,padding=16)
         frame.pack(fill="both",expand=True)
         ttk.Label(frame,text="选择、新建、编辑或删除游戏名称",font=("Microsoft YaHei UI",13,"bold")).pack(anchor="w",pady=(0,10))
+        ttk.Label(frame,text="所有修改仅保存在本对话框的临时副本中；只有点击总“确认”才一次性写入数据库。",wraplength=500).pack(anchor="w",pady=(0,8))
         list_frame=ttk.Frame(frame)
         list_frame.pack(fill="both",expand=True)
         box=tk.Listbox(list_frame,exportselection=False,font=("Microsoft YaHei UI",11))
@@ -4310,80 +5273,99 @@ class App:
         box.pack(side="left",fill="both",expand=True)
         scroll.pack(side="right",fill="y")
         def refresh(target=None):
+            nonlocal working_selected
             box.delete(0,"end")
-            for game in games:
+            for game in working_games:
                 suffix="  [需要复习]" if game.get("needs_review") else ""
                 box.insert("end",game["name"]+suffix)
-            wanted=target or selected_id
-            for index,game in enumerate(games):
-                if game["id"]==wanted:
-                    box.selection_set(index)
-                    box.see(index)
-                    break
+            wanted=target if target is not None else working_selected
+            if wanted is not None:
+                for index,game in enumerate(working_games):
+                    if game["id"]==wanted:
+                        box.selection_set(index)
+                        box.see(index)
+                        working_selected=wanted
+                        return
+            working_selected=None
         def current_index():
             selection=box.curselection()
             return selection[0] if selection else None
         def add_game():
+            nonlocal working_selected
             name=self.prompt_text("新建游戏","输入游戏名称")
             if name is None:
                 return
-            if any(item["name"].casefold()==name.casefold() for item in games):
+            if any(item["name"].casefold()==name.casefold() for item in working_games):
                 self.show_error("游戏名称已存在")
                 return
             game={"id":uuid.uuid4().hex,"name":name,"created":time.time(),"needs_review":False,"last_review":None}
-            games.append(game)
-            refresh(game["id"])
+            working_games.append(game)
+            working_selected=game["id"]
+            refresh(working_selected)
         def edit_game():
             index=current_index()
             if index is None:
                 self.show_error("请先选择一个游戏")
                 return
-            name=self.prompt_text("编辑游戏","修改游戏名称",games[index]["name"])
+            name=self.prompt_text("编辑游戏","修改游戏名称",working_games[index]["name"])
             if name is None:
                 return
-            if any(position!=index and item["name"].casefold()==name.casefold() for position,item in enumerate(games)):
+            if any(position!=index and item["name"].casefold()==name.casefold() for position,item in enumerate(working_games)):
                 self.show_error("游戏名称已存在")
                 return
-            games[index]["name"]=name
-            refresh(games[index]["id"])
+            working_games[index]["name"]=name
+            refresh(working_games[index]["id"])
         def delete_game():
+            nonlocal working_selected
             index=current_index()
             if index is None:
                 self.show_error("请先选择一个游戏")
                 return
-            item=dict(games[index])
-            if not self.confirm_dialog("立即删除游戏","确认立即删除“"+item["name"]+"”及其学习数据、模型和备份吗？此操作不依赖对话框总“确认”。"):
+            item=dict(working_games[index])
+            if not self.confirm_dialog("标记删除游戏","确认将“"+item["name"]+"”加入待删除列表吗？只有随后点击总“确认”才会删除游戏、样本、模型和备份；点击“取消”不会写数据库。"):
                 return
-            if not self.store.delete_game(item["id"]):
-                self.show_error("游戏已不存在")
-                return
-            games.pop(index)
-            if self.selected_game and self.selected_game.get("id")==item["id"]:
-                self.selected_game=None
-            refresh(games[min(index,len(games)-1)]["id"] if games else None)
-            self._refresh_all()
-            self.status.set("已立即删除游戏："+item["name"])
+            working_games.pop(index)
+            box.selection_clear(0,"end")
+            if item["id"]==original_selected or item["id"]==working_selected:
+                working_selected=None
+            elif working_games:
+                working_selected=working_games[min(index,len(working_games)-1)]["id"]
+            refresh(working_selected)
         def confirm():
+            nonlocal working_selected
             selection=box.curselection()
             if not selection:
-                self.show_error("请先选择一个游戏；如果列表为空，请先新建游戏")
+                self.show_error("请重新选择一个仍存在的游戏；删除当前游戏后不能提交无效选择")
                 return
-            chosen=games[selection[0]]
-            self.store.replace_games(games,chosen["id"])
+            chosen=working_games[selection[0]]
+            working_selected=chosen["id"]
+            result=self.store.replace_games(working_games,working_selected)
             self.selected_game=dict(chosen)
             self._refresh_all()
-            self.status.set("已选择游戏："+chosen["name"])
+            deleted=len(result.get("deleted_games",[])) if isinstance(result,dict) else 0
+            self.status.set("已提交游戏列表并选择："+chosen["name"]+("；已删除"+str(deleted)+"个游戏及其全部数据" if deleted else ""))
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+        def cancel():
+            try:
+                win.grab_release()
+            except Exception:
+                pass
             win.destroy()
         tools=ttk.Frame(frame)
         tools.pack(fill="x",pady=10)
         ttk.Button(tools,text="新建",command=add_game).pack(side="left",padx=(0,6))
         ttk.Button(tools,text="编辑",command=edit_game).pack(side="left",padx=6)
-        ttk.Button(tools,text="删除（立即）",command=delete_game).pack(side="left",padx=6)
+        ttk.Button(tools,text="删除",command=delete_game).pack(side="left",padx=6)
         actions=ttk.Frame(frame)
         actions.pack(fill="x")
         ttk.Button(actions,text="确认",command=confirm).pack(side="right",padx=(6,0))
-        ttk.Button(actions,text="取消",command=win.destroy).pack(side="right")
+        ttk.Button(actions,text="取消",command=cancel).pack(side="right")
         box.bind("<Double-Button-1>",lambda event:confirm())
+        win.protocol("WM_DELETE_WINDOW",cancel)
         refresh()
         win.wait_visibility()
         box.focus_set()
@@ -4393,41 +5375,81 @@ class App:
             return
         win=tk.Toplevel(self.root)
         win.title("选择窗口")
-        win.geometry("820x540")
+        win.geometry("980x650")
         win.transient(self.root)
         win.grab_set()
         frame=ttk.Frame(win,padding=16)
         frame.pack(fill="both",expand=True)
         ttk.Label(frame,text="选择雷电模拟器窗口或其他窗口",font=("Microsoft YaHei UI",13,"bold")).pack(anchor="w",pady=(0,6))
-        ttk.Label(frame,text="确认按钮只保存窗口身份，不再要求画面变化。学习、训练或请教开始前，程序会单独执行动态采集验收；静态菜单、暂停画面和棋盘画面可通过稳定性校准。",wraplength=760).pack(anchor="w",pady=(0,10))
+        ttk.Label(frame,text="窗口身份主要使用进程完整路径、创建时间、PID、窗口类和窗口线程。标题默认不检查；确认窗口后必须继续确认游戏渲染区域。",wraplength=920).pack(anchor="w",pady=(0,10))
         list_frame=ttk.Frame(frame)
         list_frame.pack(fill="both",expand=True)
-        box=tk.Listbox(list_frame,exportselection=False,font=("Microsoft YaHei UI",10))
+        box=tk.Listbox(list_frame,exportselection=False,font=("Microsoft YaHei UI",9))
         scroll=ttk.Scrollbar(list_frame,orient="vertical",command=box.yview)
         box.configure(yscrollcommand=scroll.set)
         box.pack(side="left",fill="both",expand=True)
         scroll.pack(side="right",fill="y")
+        rule_frame=ttk.LabelFrame(frame,text="可选标题规则",padding=8)
+        rule_frame.pack(fill="x",pady=(8,0))
+        rule_label=tk.StringVar(value="不检查")
+        rule_value=tk.StringVar(value="")
+        mode_map={"不检查":"none","包含":"contains","前缀":"prefix","精确":"exact"}
+        combo=ttk.Combobox(rule_frame,textvariable=rule_label,values=list(mode_map),state="readonly",width=10)
+        combo.pack(side="left")
+        entry=ttk.Entry(rule_frame,textvariable=rule_value)
+        entry.pack(side="left",fill="x",expand=True,padx=(8,0))
         status=tk.StringVar(value="请选择窗口")
-        ttk.Label(frame,textvariable=status,wraplength=760).pack(anchor="w",fill="x",pady=(8,2))
+        ttk.Label(frame,textvariable=status,wraplength=920).pack(anchor="w",fill="x",pady=(8,2))
         windows=[]
         state={"closed":False}
+        def update_rule(event=None):
+            selection=box.curselection()
+            if not selection or selection[0]>=len(windows):
+                return
+            item=windows[selection[0]]
+            existing=item.get("title_rule") if isinstance(item.get("title_rule"),dict) else None
+            if self.selected_window and item.get("hwnd")==self.selected_window.get("hwnd"):
+                existing=self.selected_window.get("title_rule")
+            if not isinstance(existing,dict):
+                existing={"mode":"none","value":""}
+            reverse={value:key for key,value in mode_map.items()}
+            rule_label.set(reverse.get(str(existing.get("mode","none")),"不检查"))
+            rule_value.set(str(existing.get("value","")))
+            status.set("进程路径："+str(item.get("process_path","读取失败")))
         def refresh():
             nonlocal windows
             try:
-                windows=self.api.enum_windows()
+                raw=self.api.enum_windows()
             except Exception as error:
                 self.show_error(str(error))
                 return
+            hydrated=[]
+            for item in raw:
+                candidate=dict(item)
+                try:
+                    candidate=self.api.target_identity(candidate)
+                except Exception as error:
+                    candidate["identity_error"]=str(error)
+                hydrated.append(candidate)
+            windows=hydrated
             box.delete(0,"end")
             selected_index=None
+            scored=[window_descriptor_score(self.window_recommendation,item) for item in windows]
+            recommended=None
+            if scored and max(scored)>=8 and scored.count(max(scored))==1:
+                recommended=scored.index(max(scored))
             for index,item in enumerate(windows):
-                prefix="[最小化] " if item["minimized"] else ""
-                box.insert("end",prefix+item["title"]+"  [PID "+str(item["pid"])+"]  ["+item["class"]+"]")
-                if self.selected_window and item["hwnd"]==self.selected_window["hwnd"] and item["pid"]==self.selected_window["pid"] and item["class"]==self.selected_window["class"]:
+                prefix=("[推荐] " if index==recommended else "")+("[最小化] " if item.get("minimized") else "")
+                path=str(item.get("process_path","路径读取失败"))
+                box.insert("end",prefix+str(item.get("title",""))+"  [PID "+str(item.get("pid","-"))+"]  ["+str(item.get("class",""))+"]  "+path)
+                if self.selected_window and item.get("hwnd")==self.selected_window.get("hwnd") and item.get("pid")==self.selected_window.get("pid") and item.get("class")==self.selected_window.get("class"):
                     selected_index=index
+            if selected_index is None:
+                selected_index=recommended
             if selected_index is not None:
                 box.selection_set(selected_index)
                 box.see(selected_index)
+                update_rule()
         def confirm():
             selection=box.curselection()
             if not selection:
@@ -4436,22 +5458,43 @@ class App:
             item=dict(windows[selection[0]])
             try:
                 item=self.api.target_identity(item)
-                rect=self.api.validate_target(item,False)
+                client=self.api.client_rect(item["hwnd"])
                 item["integrity"]=self.api.validate_uipi(item)
-                item["selected_rect"]=list(rect)
-                item["client_size"]=[int(rect[2]),int(rect[3])]
+                item["selected_rect"]=list(client)
+                item["client_size"]=[int(client[2]),int(client[3])]
                 item["selected_dpi"]=self.api.dpi_for_window(item["hwnd"])
+                mode=mode_map.get(rule_label.get(),"none")
+                value=rule_value.get().strip()
+                if mode!="none" and not value:
+                    raise RuntimeError("标题规则不是“不检查”时必须填写匹配文本")
+                item["title_rule"]={"mode":mode,"value":value}
+                try:
+                    win.grab_release()
+                except Exception:
+                    pass
+                region=self.select_content_region(item,win)
+                if region is None:
+                    win.grab_set()
+                    return
+                item.update(region)
+                item=self.api.target_identity(item)
+                self.api.validate_target(item,False)
             except Exception as error:
+                try:
+                    win.grab_set()
+                except Exception:
+                    pass
                 self.show_error(str(error))
                 return
             previous=self.selected_window
             self.selected_window=item
-            if not previous or any(previous.get(key)!=item.get(key) for key in ("hwnd","pid","class","process_created")):
+            if not previous or any(previous.get(key)!=item.get(key) for key in ("hwnd","pid","class","process_created","content_rect_norm")):
                 self.api.calibrations.pop(int(item["hwnd"]),None)
+            self.window_recommendation=self.store.save_window_descriptor(item)
             self.api.reset_capture_backends(item)
             self.api.reset_frame_history(item["hwnd"])
             self._refresh_all()
-            self.status.set("已保存窗口身份："+item["title"]+"；采集动态或稳定性验收将在学习、训练或请教开始前执行")
+            self.status.set("已保存窗口身份和游戏内容区域："+item["title"]+"；标题规则="+item["title_rule"]["mode"])
             state["closed"]=True
             try:
                 win.grab_release()
@@ -4472,11 +5515,104 @@ class App:
         ttk.Button(tools,text="刷新",command=refresh).pack(side="left")
         ttk.Button(tools,text="确认",command=confirm).pack(side="right",padx=(6,0))
         ttk.Button(tools,text="取消",command=cancel).pack(side="right")
+        box.bind("<<ListboxSelect>>",update_rule)
         box.bind("<Double-Button-1>",lambda event:confirm())
         win.protocol("WM_DELETE_WINDOW",cancel)
         refresh()
         win.wait_visibility()
         box.focus_set()
+    def select_content_region(self,target,parent=None):
+        client=self.api.client_rect(int(target["hwnd"]))
+        auto=self.api.auto_content_region(target)
+        temporary=dict(target)
+        temporary["content_rect_norm"]=[0.0,0.0,1.0,1.0]
+        temporary["content_aspect"]=client[2]/max(1,client[3])
+        preview=bytes(PREVIEW_W*PREVIEW_H*3)
+        preview_error=""
+        try:
+            captured=self.api.capture_gray(temporary,False,True,True)
+            preview=preview_rgb_bytes(captured.get("preview_rgb")) or preview
+        except Exception as error:
+            preview_error=str(error)
+        win=tk.Toplevel(parent or self.root)
+        win.title("确认游戏渲染区域")
+        win.geometry("760x560")
+        win.transient(parent or self.root)
+        frame=ttk.Frame(win,padding=14)
+        frame.pack(fill="both",expand=True)
+        ttk.Label(frame,text="框选真正的游戏渲染区域",font=("Microsoft YaHei UI",13,"bold")).pack(anchor="w")
+        ttk.Label(frame,text="学习、预览、坐标归一化、点击校验和截图全部使用此区域；区域外工具栏永远不允许自动点击。"+("  预览告警："+preview_error if preview_error else ""),wraplength=720).pack(anchor="w",pady=(4,8))
+        canvas_w=640
+        canvas_h=360
+        canvas=tk.Canvas(frame,width=canvas_w,height=canvas_h,bg="black",highlightthickness=1,highlightbackground="#777777")
+        canvas.pack()
+        ppm=b"P6\n"+str(PREVIEW_W).encode("ascii")+b" "+str(PREVIEW_H).encode("ascii")+b"\n255\n"+preview
+        image=tk.PhotoImage(data=base64.b64encode(ppm).decode("ascii"),format="PPM")
+        scaled=image.zoom(2,2)
+        canvas.create_image(0,0,image=scaled,anchor="nw")
+        state={"norm":list(auto["norm"]),"start":None,"rect_id":None,"result":None,"image":(image,scaled)}
+        info=tk.StringVar()
+        ttk.Label(frame,textvariable=info).pack(anchor="w",pady=(6,0))
+        def redraw():
+            if state["rect_id"] is not None:
+                canvas.delete(state["rect_id"])
+            x,y,w,h=state["norm"]
+            state["rect_id"]=canvas.create_rectangle(x*canvas_w,y*canvas_h,(x+w)*canvas_w,(y+h)*canvas_h,outline="#00ffff",width=3)
+            rect=apply_normalized_rect(client,state["norm"])
+            info.set("游戏区域："+str(rect[2])+"×"+str(rect[3])+"  归一化："+",".join(str(round(value,4)) for value in state["norm"]))
+        def press(event):
+            state["start"]=(max(0,min(canvas_w,event.x)),max(0,min(canvas_h,event.y)))
+        def drag(event):
+            if state["start"] is None:
+                return
+            x0,y0=state["start"]
+            x1=max(0,min(canvas_w,event.x)); y1=max(0,min(canvas_h,event.y))
+            left=min(x0,x1)/canvas_w; top=min(y0,y1)/canvas_h; width=abs(x1-x0)/canvas_w; height=abs(y1-y0)/canvas_h
+            if width>=0.02 and height>=0.02:
+                state["norm"]=[left,top,width,height]
+                redraw()
+        def release(event):
+            drag(event)
+            state["start"]=None
+        def set_auto():
+            state["norm"]=list(auto["norm"])
+            redraw()
+        def set_full():
+            state["norm"]=[0.0,0.0,1.0,1.0]
+            redraw()
+        def confirm():
+            rect=apply_normalized_rect(client,state["norm"])
+            if rect[2]<FEATURE_W or rect[3]<FEATURE_H:
+                self.show_error("游戏区域过小")
+                return
+            state["result"]={"content_rect_norm":[round(value,8) for value in state["norm"]],"content_aspect":round(rect[2]/max(1,rect[3]),8),"content_source":"manual" if state["norm"]!=auto["norm"] else auto["source"],"content_child_class":auto.get("child_class",""),"window_rule_version":WINDOW_RULE_VERSION}
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+        def cancel():
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+        canvas.bind("<Button-1>",press)
+        canvas.bind("<B1-Motion>",drag)
+        canvas.bind("<ButtonRelease-1>",release)
+        tools=ttk.Frame(frame)
+        tools.pack(fill="x",pady=(10,0))
+        ttk.Button(tools,text="自动最大可见子窗口",command=set_auto).pack(side="left")
+        ttk.Button(tools,text="整个客户区",command=set_full).pack(side="left",padx=6)
+        ttk.Button(tools,text="确认",command=confirm).pack(side="right",padx=(6,0))
+        ttk.Button(tools,text="取消",command=cancel).pack(side="right")
+        win.protocol("WM_DELETE_WINDOW",cancel)
+        redraw()
+        win.wait_visibility()
+        win.grab_set()
+        win.focus_force()
+        win.wait_window()
+        return state["result"]
     def require_game(self):
         if not self.selected_game:
             raise RuntimeError("请先点击“游戏”按钮选择或新建游戏")
@@ -4525,12 +5661,16 @@ class App:
             button.configure(state="disabled" if running else "normal")
         if self.stop_button:
             self.stop_button.configure(state="normal" if running else "disabled")
+        if not running:
+            self._apply_storage_controls()
     def start_worker(self,name,target,needs_window=False):
         if self.mode_state!=MODE_IDLE or self.closing:
             self.show_error("当前已有操作正在运行，请先停止")
             return
         try:
             self.require_game()
+            if self.storage_fault and name in {"学习","复习","请教"}:
+                raise RuntimeError(self.store.read_only_reason or self.store.writer_error or "样本存储故障，相关模式已锁定")
             if needs_window:
                 self.require_window(False)
             stop_event=self.lifecycle.begin(name)
@@ -4544,6 +5684,8 @@ class App:
         self.pending_mode_error=None
         self.mode_shutdown_deadline=None
         self.mode_shutdown_forced=[]
+        self.mode_stop_started=False
+        self.mode_shutdown_polling=False
         self.api.block_input()
         self.set_input_status("已锁定")
         self.set_controls(True)
@@ -4565,8 +5707,8 @@ class App:
                 result=ModeResult(status,str(value if value is not None else name+"已结束"))
         except InputStopped as stopped_error:
             requested=self.lifecycle.snapshot()[3]
-            status=requested if requested in {"completed","stopped","failed"} else "stopped"
-            result=ModeResult(status,name+("已完成" if status=="completed" else "已停止"),{"reason":str(stopped_error)})
+            status=requested if requested in {"failed","stopped"} else "stopped"
+            result=ModeResult(status,name+("失败" if status=="failed" else "已停止"),{"reason":str(stopped_error)})
         except Exception:
             error=traceback.format_exc()
             result=ModeResult("failed",name+"失败")
@@ -4574,27 +5716,41 @@ class App:
             self.api.block_input()
             self.set_input_status("已锁定")
         self.ui(lambda:self._begin_mode_stopping(result,error))
-    def request_stop(self):
+    def request_mode_stop(self,status="stopped",reason=""):
         if self.mode_state==MODE_IDLE:
-            return
-        self.lifecycle.request_stop("stopped","用户请求停止")
-        self.mode_state=MODE_STOPPING
-        if self.stop_event:
-            self.stop_event.set()
-        self.lock_input("因停止请求锁定")
-        self._destroy_ask_window()
-        if self.active_session is not None:
-            self.active_session.request_stop()
-        self.status.set("正在停止，已阻止新的鼠标按下并释放全部鼠标键")
-    def _keyboard_escape(self,event=None):
-        if self.mode_state==MODE_IDLE:
-            return
-        self.lifecycle.request_stop("stopped","ESC停止")
-        self.mode_state=MODE_STOPPING
-        if self.stop_event:
-            self.stop_event.set()
+            return False
+        with self.mode_stop_lock:
+            first=not self.mode_stop_started
+            self.mode_stop_started=True
+            self.lifecycle.request_stop(status,reason)
+            self.mode_state=MODE_STOPPING
+            event=self.stop_event
+            if event is not None:
+                event.set()
         self.api.block_input()
-        self.set_input_status("因ESC锁定")
+        self.api.release_all_buttons()
+        review=self.review_process
+        if review is not None:
+            try:
+                review.request_stop()
+            except Exception:
+                pass
+        session=self.active_session
+        if session is not None:
+            try:
+                session.request_stop()
+            except Exception:
+                pass
+        def apply_ui():
+            self._destroy_ask_window()
+            self.set_input_status("已锁定："+(str(reason) if reason else "停止请求"))
+            self.status.set("正在停止，已阻止新的鼠标按下并释放全部鼠标键"+("；"+str(reason) if reason else ""))
+        self.ui(apply_ui)
+        return first
+    def request_stop(self):
+        self.request_mode_stop("stopped","用户请求停止")
+    def _keyboard_escape(self,event=None):
+        self.request_mode_stop("stopped","ESC停止")
     def wait_escape_release(self):
         while self.api.key_down(0x1B) and self.stop_event and not self.stop_event.is_set():
             time.sleep(0.04)
@@ -4603,10 +5759,7 @@ class App:
             self.api.block_input()
             return True
         if self.api.key_down(0x1B):
-            self.lifecycle.request_stop("stopped","ESC停止")
-            self.mode_state=MODE_STOPPING
-            self.stop_event.set()
-            self.api.block_input()
+            self.request_mode_stop("stopped","ESC停止")
             return True
         return False
     def inside(self,x,y,rect):
@@ -4620,7 +5773,9 @@ class App:
         return x+round(max(0.0,min(1.0,float(point[0])))*max(1,width-1)),y+round(max(0.0,min(1.0,float(point[1])))*max(1,height-1))
     def sample_context(self,last_signature,last_time,last_changed,motion_valid=True,session_id="",capture_method="unknown",repeat_policy="one_shot",temporal=None):
         calibration=self.api.calibration_for(self.selected_window.get("hwnd") if self.selected_window else 0)
-        result={"previous_action":last_signature or "","seconds_since_previous":round(max(0.0,min(60.0,time.time()-last_time)) if last_time else 60.0,3),"previous_action_changed_frame":bool(last_changed),"motion_channel_valid":bool(motion_valid),"session_id":str(session_id or "unspecified"),"capture_method":str(capture_method or "unknown"),"repeat_policy":repeat_policy if repeat_policy in REPEAT_POLICIES else "one_shot","duplicate_threshold":float(calibration.get("duplicate",3.0)),"calibration":dict(calibration)}
+        target=self.selected_window or {}
+        content=self.api.validate_target(target,False) if target else (0,0,1,1)
+        result={"previous_action":last_signature or "","seconds_since_previous":round(max(0.0,min(60.0,time.time()-last_time)) if last_time else 60.0,3),"previous_action_changed_frame":bool(last_changed),"motion_channel_valid":bool(motion_valid),"session_id":str(session_id or "unspecified"),"capture_method":str(capture_method or "unknown"),"repeat_policy":repeat_policy if repeat_policy in REPEAT_POLICIES else "one_shot","duplicate_threshold":float(calibration.get("duplicate",3.0)),"calibration":dict(calibration),"process_path":os.path.normcase(str(target.get("process_path",""))),"window_class":str(target.get("class","")),"content_rect_norm":[round(safe_float(value,0.0),6) for value in target.get("content_rect_norm",[0,0,1,1])[:4]],"content_aspect":content[2]/max(1,content[3]),"window_rule_version":WINDOW_RULE_VERSION,"capture_backend_version":CAPTURE_BACKEND_VERSION}
         if isinstance(temporal,dict):
             result.update(temporal)
         return result
@@ -4692,7 +5847,7 @@ class App:
                     keyboard_state["generation"]=safe_int(keyboard_state["generation"],0)+1
                     keyboard_state["last_time"]=safe_float(events[0].get("time"),time.time())
                     isolation.signal("keyboard",keyboard_state["last_time"])
-                    self.lifecycle.request_stop("stopped","学习检测到非ESC键盘输入，整段session无效")
+                    self.request_mode_stop("stopped","学习检测到非ESC键盘输入，整段session无效")
                     self.mode_state=MODE_STOPPING
                     self.api.block_input()
                     self.api.release_all_buttons()
@@ -4788,14 +5943,17 @@ class App:
                 if not focused:
                     time.sleep(0.05)
                     continue
-                for event in events:
+                for raw_event in events:
+                    event=self.learning_controller.convert_event(raw_event,rect)
+                    if event is None:
+                        continue
                     if paused(event["time"]) or self.should_stop():
                         break
                     etype=event["type"]
                     x=event["x"]
                     y=event["y"]
                     event_time=event["time"]
-                    inside=self.inside(x,y,rect)
+                    inside=event["inside"]
                     if etype.endswith("_down"):
                         button=etype.split("_")[0]
                         if button in SUPPORTED_BUTTONS and inside:
@@ -4869,9 +6027,10 @@ class App:
                                 if previous:
                                     click_gap=item["start"]-previous["time"]
                                     close=math.hypot(point[0]-previous["point"][0],point[1]-previous["point"][1])<=0.035
-                                    if click_gap<=0.42 and close:
+                                    merged=self.learning_controller.merge_clicks(previous,button,point,item["start"],event_time) if close else None
+                                    if merged is not None:
                                         pending_click.pop(button,None)
-                                        save(previous["frame"],{"kind":"double_click","button":button,"path":[previous["point"]],"duration":max(0.06,event_time-previous["time"])},"learn",1.3,previous["point"])
+                                        save(previous["frame"],merged,"learn",1.3,previous["point"])
                                         continue
                                     save_click(button,previous)
                                 pending_click[button]={"frame":item["frame"],"point":point,"duration":duration,"time":event_time}
@@ -4917,7 +6076,7 @@ class App:
                         else:
                             hover_point=current_point
                             hover_start=now
-                if not active and not pending_click and now-last_negative>0.9 and now-last_motion_time>0.35:
+                if not active and not pending_click and self.learning_controller.negative_due(last_negative,now,last_motion_time):
                     frame=capture_safe(now)
                     if frame is not None:
                         cursor_point=self.normalize_point(polled_x,polled_y,rect) if polled_inside else None
@@ -4927,13 +6086,55 @@ class App:
                     self.set_status("学习中：有效"+str(learned)+"  重复"+str(duplicates)+"  越界废弃"+str(discarded)+"  无效画面"+str(invalid_frames)+"  非ESC键"+str(keyboard_count)+"  键盘关联废弃"+str(keyboard_discarded))
                     last_update=now
                 time.sleep(0.012)
-        self.store.flush_samples()
+        self.learning_controller.submit(self.store,game["id"],session_id)
         if strict_violation:
             removed=self.store.discard_session(game["id"],session_id)
             keyboard_discarded=max(keyboard_discarded,removed)
             return ModeResult("stopped","学习因检测到非ESC键盘输入而严格停止；整段session已作废并删除"+str(removed)+"个样本",{"invalid_session":session_id,"keyboard_events":keyboard_count})
         summary="学习已停止：有效"+str(learned)+"，重复或配额抑制"+str(duplicates)+"，越界废弃"+str(discarded)+"，无效画面"+str(invalid_frames)
         return ModeResult("stopped" if self.stop_event and self.stop_event.is_set() else "completed",summary)
+    def _run_review_process(self):
+        game=self.require_game()
+        self.store.flush_samples()
+        samples,stats=self.store.load_samples(game["id"])
+        rejections=self.store.load_rejections(game["id"],500)
+        worker=ReviewProcessWorker({"game":game,"samples":samples,"stats":stats,"rejections":rejections,"profile":self.store.load_game_profile(game["id"]),"cache_capacity":50000})
+        self.review_process=worker
+        packet=None
+        try:
+            while True:
+                if self.should_stop():
+                    worker.request_stop()
+                message=worker.receive(0.08)
+                if message is not None:
+                    kind,payload=message
+                    if kind=="progress":
+                        self.set_progress(payload)
+                    elif kind=="status":
+                        self.set_status(payload)
+                    elif kind in {"result","error"}:
+                        packet=(kind,payload)
+                        break
+                if not worker.alive():
+                    message=worker.receive(0.0)
+                    if message is not None:
+                        packet=message
+                    break
+            if packet is None:
+                if self.stop_event is not None and self.stop_event.is_set():
+                    raise InputStopped("复习子进程已停止")
+                raise RuntimeError("复习子进程异常退出且未返回结果")
+            kind,payload=packet
+            for gid,model,complete in payload.get("models",[]):
+                self.store.save_model(gid,model,complete)
+            if kind=="error":
+                raise RuntimeError(payload.get("traceback","复习子进程失败"))
+            return ModeResult(payload.get("status","failed"),payload.get("summary","复习结束"),payload.get("details",{}))
+        finally:
+            worker.request_stop()
+            worker.close(0.2)
+            if self.review_process is worker:
+                self.review_process=None
     def _prototype_medoid(self,members):
         if len(members)==1:
             return members[0]
@@ -4953,12 +6154,12 @@ class App:
         cache=self.review_distance_cache
         for candidate in candidates:
             total=0.0
-            candidate_key=str(candidate.get("checksum") or candidate.get("created") or id(candidate))
+            candidate_key=compact_checksum_key(candidate)
             for other in comparisons:
                 operations+=1
                 if operations%32==0 and self.should_stop():
                     raise InputStopped("复习已停止")
-                other_key=str(other.get("checksum") or other.get("created") or id(other))
+                other_key=compact_checksum_key(other)
                 key=(candidate_key,other_key) if candidate_key<=other_key else (other_key,candidate_key)
                 distance=cache.get(key)
                 if distance is None:
@@ -5128,57 +6329,90 @@ class App:
             methods=sorted({str(item.get("capture_method") or item.get("context",{}).get("capture_method") or "unknown") for item in cluster})
             result.append({"id":uuid.uuid4().hex,"cluster_id":cluster_id,"canonical_action_signature":canonical,"f":feature_bytes(medoid["f"]),"coarse":bytes(medoid.get("coarse")) if isinstance(medoid.get("coarse"),(bytes,bytearray)) and len(medoid.get("coarse"))==COARSE_LEN else coarse_feature(medoid["f"]),"a":normalize_action(action),"support":len(cluster),"action_support":int(action_support),"mean_distance":round(mean,6),"std_distance":round(std,6),"limit95":round(limit95,6),"limit99":round(limit99,6),"intra_threshold":round(threshold_value,6),"threshold":round(threshold_value,6),"temporal":temporal,"temporal_threshold":round(temporal_threshold,6),"capture_methods":methods,"previous_action":prev,"repeat_policy":repeat_policy if repeat_policy in REPEAT_POLICIES else "one_shot","max_rate":max(0.25,min(12.0,float(max_rate))),"ambiguous":False,"created_from_sample_checksum":medoid.get("checksum","")})
         return result
-    def rank_action_candidates(self,feature,prototypes,last_action_signature="",full_limit=16,temporal_context=None,query_coarse=None):
+    def rank_action_candidates(self,feature,prototypes,last_action_signature="",full_limit=8,temporal_context=None,query_coarse=None):
         if not feature_valid(feature):
             return []
         query_temporal=temporal_from_context(temporal_context or {})
         if not isinstance(query_coarse,(bytes,bytearray)) or len(query_coarse)!=COARSE_LEN:
             query_coarse=coarse_feature(feature)
+        backend=str(query_temporal.get("capture_method","unknown"))
+        digest=hashlib.blake2b(feature_bytes(feature),digest_size=8).digest()
+        cache_key=(id(prototypes),len(prototypes),digest,backend,str(last_action_signature),coarse_bucket_key(query_coarse))
+        cached=self.candidate_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        runtime_model=getattr(self,"active_model_runtime",None)
+        runtime_index=runtime_model.get("runtime_index",{}) if isinstance(runtime_model,dict) and runtime_model.get("prototypes") is prototypes else {}
+        backend_indices=runtime_index.get("backend",{}).get(backend) if isinstance(runtime_index,dict) else None
+        source_indices=list(backend_indices) if backend_indices is not None else list(range(len(prototypes)))
+        bucket_indices=set(runtime_index.get("bucket",{}).get((backend,coarse_bucket_key(query_coarse)),[])) if isinstance(runtime_index,dict) else set()
+        eligible=[]
+        for position,index in enumerate(source_indices):
+            proto=prototypes[index]
+            if position%64==0 and self.stop_event is not None and self.should_stop():
+                return []
+            if "authorized" in proto and not proto.get("authorized"):
+                continue
+            methods=proto.get("capture_methods",frozenset())
+            if not isinstance(methods,frozenset):
+                methods=frozenset(str(value) for value in methods)
+                proto["capture_methods"]=methods
+            if methods and backend not in methods:
+                continue
+            if index in bucket_indices:
+                proto["bucket_priority"]=0
+            else:
+                proto["bucket_priority"]=1
+            eligible.append(proto)
         coarse_rank=[]
         best_per_cluster={}
-        for index,proto in enumerate(prototypes):
-            if index%64==0 and self.stop_event is not None and self.should_stop():
-                return []
+        for proto in eligible:
             pc=proto.get("coarse")
             if not isinstance(pc,(bytes,bytearray)) or len(pc)!=COARSE_LEN:
-                pc=coarse_feature(proto["f"])
-                proto["coarse"]=pc
+                pc=coarse_feature(proto["f"]); proto["coarse"]=pc
             distance=coarse_distance(query_coarse,pc)
-            coarse_rank.append((distance,proto))
+            coarse_rank.append((int(proto.get("bucket_priority",1)),distance,proto))
             cluster_id=str(proto.get("cluster_id",proto.get("action_signature","")))
             if cluster_id and (cluster_id not in best_per_cluster or distance<best_per_cluster[cluster_id][0]):
                 best_per_cluster[cluster_id]=(distance,proto)
-        coarse_rank.sort(key=lambda item:item[0])
+        coarse_rank.sort(key=lambda item:(item[0],item[1]))
+        exact_limit=max(12,min(VersionedThresholdConfig.candidate_full_limit,int(full_limit) if int(full_limit)>0 else VersionedThresholdConfig.candidate_full_limit))
         selected=[]
         selected_ids=set()
-        for distance,proto in coarse_rank[:max(8,min(12,int(full_limit)))]:
+        for priority,distance,proto in coarse_rank:
             if proto["id"] not in selected_ids:
-                selected.append(proto)
-                selected_ids.add(proto["id"])
-        for distance,proto in sorted(best_per_cluster.values(),key=lambda item:item[0])[:12]:
-            if proto["id"] not in selected_ids:
-                selected.append(proto)
-                selected_ids.add(proto["id"])
+                selected.append(proto); selected_ids.add(proto["id"])
+            if len(selected)>=exact_limit:
+                break
+        if len(selected)<exact_limit:
+            for distance,proto in sorted(best_per_cluster.values(),key=lambda item:item[0]):
+                if proto["id"] not in selected_ids:
+                    selected.append(proto); selected_ids.add(proto["id"])
+                if len(selected)>=exact_limit:
+                    break
         grouped=defaultdict(list)
         for proto in selected:
-            raw=feature_distance(feature,proto["f"])
+            raw=runtime_feature_distance(feature,proto)
             expected=str(proto.get("previous_action",""))
-            penalty=0.0
-            if expected and last_action_signature and expected!=last_action_signature:
-                penalty=min(120.0,raw*0.08+18.0)
-            tdistance=temporal_distance(query_temporal,proto.get("temporal",{}))
+            penalty=min(120.0,raw*0.08+18.0) if expected and last_action_signature and expected!=last_action_signature else 0.0
+            proto_temporal=proto.get("temporal_cached") or temporal_from_context(proto.get("temporal",{}))
+            proto["temporal_cached"]=proto_temporal
+            tdistance=temporal_distance(query_temporal,proto_temporal)
             temporal_penalty=tdistance*max(40.0,float(proto.get("threshold",100.0))*0.35)
             cluster_id=str(proto.get("cluster_id",proto.get("action_signature","")))
+            sequence_model=runtime_model.get("sequence_model",{}) if isinstance(runtime_model,dict) else {}
+            sequence_penalty=TaskAgentPolicy({}).sequence_penalty(query_temporal.get("recent_actions",[last_action_signature]),cluster_id,sequence_model)
             if cluster_id:
-                grouped[cluster_id].append((raw+penalty+temporal_penalty,raw,tdistance,proto))
+                grouped[cluster_id].append((raw+penalty+temporal_penalty+sequence_penalty,raw,tdistance,proto))
         result=[]
         for cluster_id,items in grouped.items():
             items.sort(key=lambda item:item[0])
             best_score,best_distance,best_temporal,best_proto=items[0]
             vote_score=best_score if len(items)==1 else 0.88*best_score+0.12*items[1][0]
-            action=normalize_action(best_proto["a"])
+            action=best_proto.get("a") if normalize_action(best_proto.get("a")) else normalize_action(best_proto["a"])
             result.append({"cluster_id":cluster_id,"canonical_action_signature":str(best_proto.get("canonical_action_signature") or action_signature(action)),"score":vote_score,"best_score":best_score,"distance":best_distance,"temporal_distance":best_temporal,"proto":best_proto,"a":action,"support":max(int(item[3].get("action_support",item[3].get("support",0))) for item in items),"prototype_votes":len(items)})
         result.sort(key=lambda item:item["score"])
+        self.candidate_cache[cache_key]=result
         return result
     def evaluate_action_candidates(self,ranked):
         if not ranked:
@@ -5186,7 +6420,7 @@ class App:
         best=ranked[0]
         second=ranked[1] if len(ranked)>1 else None
         proto=best["proto"]
-        strict_multiplier,min_support,margin_ratio=self.action_strictness(best["a"])
+        strict_multiplier,min_support,margin_ratio=tuple(proto.get("strictness") or self.action_strictness(best["a"]))
         threshold=float(proto["threshold"])/strict_multiplier
         second_score=second["score"] if second else float("inf")
         margin=second_score-best["score"]
@@ -5196,18 +6430,169 @@ class App:
         rejected_distance=proto.get("nearest_rejected_distance")
         rejection_ok=rejected_distance is None or best["distance"]<float(rejected_distance)*0.65
         temporal_ok=float(best.get("temporal_distance",1.0))<=float(proto.get("temporal_threshold",0.0))
-        query_backend=str(temporal_from_context(proto.get("temporal",{})).get("capture_method","unknown"))
+        query_backend=str((proto.get("temporal_cached") or temporal_from_context(proto.get("temporal",{}))).get("capture_method","unknown"))
         ambiguous=bool(proto.get("ambiguous",False))
-        accepted=not ambiguous and best["distance"]<threshold and margin_ok and support>=min_support and rejection_ok and temporal_ok
+        authorized=bool(proto.get("authorized",True))
+        accepted=authorized and not ambiguous and best["distance"]<threshold and margin_ok and support>=min_support and rejection_ok and temporal_ok
         confidence=max(0.0,min(1.0,1.0-best["distance"]/max(1.0,threshold)))*(1.0-min(1.0,float(best.get("temporal_distance",1.0))))
-        if ambiguous:
+        if not authorized:
+            reason="动作簇未通过独立session验证，拒绝执行"
+        elif ambiguous:
             reason="视觉与短时序状态仍对应不同动作，必须请教"
         elif not temporal_ok:
             reason="最近3至5帧、最近动作、状态时长或鼠标位置不匹配"
         else:
             reason="未达到动作阈值、差距或支持数要求"
-        return {"accepted":accepted,"best":best,"second":second,"threshold":threshold,"margin":margin,"required_gap":required_gap,"support":support,"min_support":min_support,"confidence":confidence,"margin_ok":margin_ok,"rejection_ok":rejection_ok,"temporal_ok":temporal_ok,"ambiguous":ambiguous,"reason":reason,"nearest_rejected_distance":rejected_distance,"query_backend":query_backend}
+        return {"accepted":accepted,"best":best,"second":second,"threshold":threshold,"margin":margin,"required_gap":required_gap,"support":support,"min_support":min_support,"confidence":confidence,"margin_ok":margin_ok,"rejection_ok":rejection_ok,"temporal_ok":temporal_ok,"ambiguous":ambiguous,"authorized":authorized,"reason":reason,"nearest_rejected_distance":rejected_distance,"query_backend":query_backend}
+    def open_task_dialog(self):
+        try:
+            game=self.require_game()
+            if self.mode_state!=MODE_IDLE:
+                raise RuntimeError("请先停止当前模式")
+        except Exception as error:
+            self.show_error(str(error))
+            return
+        profile=self.store.load_game_profile(game["id"])
+        win=tk.Toplevel(self.root)
+        win.title("任务目标与安全边界")
+        win.geometry("760x700")
+        win.minsize(700,620)
+        frame=ttk.Frame(win,padding=16)
+        frame.pack(fill="both",expand=True)
+        ttk.Label(frame,text="该系统是按游戏配置的任务型模仿智能体，不保证适用于所有游戏。未进入白名单的动作永远不会自动执行。",wraplength=710).pack(anchor="w",fill="x",pady=(0,10))
+        ttk.Label(frame,text="游戏目标或奖励说明").pack(anchor="w")
+        goal=tk.Text(frame,height=4,wrap="word")
+        goal.pack(fill="x",pady=(4,10))
+        goal.insert("1.0",str(profile.get("goal","")))
+        allowed_frame=ttk.LabelFrame(frame,text="自动动作白名单",padding=10)
+        allowed_frame.pack(fill="x")
+        families=[("等待","no_op"),("左键单击","click|left"),("左键双击","double_click|left"),("左键长按","long_press|left"),("左键拖动","drag|left"),("右键单击","click|right"),("中键单击","click|middle"),("移动","move"),("悬停","hover"),("向上滚轮","scroll_v|1"),("向下滚轮","scroll_v|-1"),("横向正滚轮","scroll_h|1"),("横向负滚轮","scroll_h|-1")]
+        variables={family:tk.BooleanVar(value=family in set(profile.get("allowed_families",[]))) for _,family in families}
+        for index,(label,family) in enumerate(families):
+            ttk.Checkbutton(allowed_frame,text=label,variable=variables[family]).grid(row=index//3,column=index%3,sticky="w",padx=6,pady=3)
+        safety=ttk.LabelFrame(frame,text="失败停机与回滚",padding=10)
+        safety.pack(fill="x",pady=(10,0))
+        ttk.Label(safety,text="连续失败或动作后无变化达到").grid(row=0,column=0,sticky="w")
+        max_failures=tk.IntVar(value=safe_int(profile.get("max_consecutive_failures",3),3,1,20))
+        ttk.Spinbox(safety,from_=1,to=20,textvariable=max_failures,width=6).grid(row=0,column=1,sticky="w")
+        ttk.Label(safety,text="次后自动停机").grid(row=0,column=2,sticky="w")
+        exploration=tk.BooleanVar(value=bool(profile.get("exploration_enabled",False)))
+        ttk.Checkbutton(safety,text="不确定时允许安全探索（仅等待，不产生鼠标输入）",variable=exploration).grid(row=1,column=0,columnspan=3,sticky="w",pady=(6,0))
+        restart=normalize_action(profile.get("restart_action"))
+        restart_enabled=tk.BooleanVar(value=bool(restart))
+        ttk.Checkbutton(safety,text="失败状态后执行一次左键单击重新开始",variable=restart_enabled).grid(row=2,column=0,columnspan=3,sticky="w",pady=(6,0))
+        restart_x=tk.StringVar(value=str(round((restart or {"path":[[0.5,0.5]]})["path"][-1][0],4)))
+        restart_y=tk.StringVar(value=str(round((restart or {"path":[[0.5,0.5]]})["path"][-1][1],4)))
+        ttk.Label(safety,text="归一化X").grid(row=3,column=0,sticky="e",pady=(4,0))
+        ttk.Entry(safety,textvariable=restart_x,width=10).grid(row=3,column=1,sticky="w",pady=(4,0))
+        ttk.Label(safety,text="Y").grid(row=3,column=1,sticky="e",pady=(4,0))
+        ttk.Entry(safety,textvariable=restart_y,width=10).grid(row=3,column=2,sticky="w",pady=(4,0))
+        state_frame=ttk.LabelFrame(frame,text="成功、失败状态",padding=10)
+        state_frame.pack(fill="both",expand=True,pady=(10,0))
+        success_states=set(str(value) for value in profile.get("success_states",[]))
+        failure_states=set(str(value) for value in profile.get("failure_states",[]))
+        state_text=tk.StringVar()
+        feedback=tk.StringVar(value="选择目标窗口后，可把当前内容区域画面记录为成功或失败状态")
+        def refresh_state_text():
+            state_text.set("成功状态："+str(len(success_states))+"个    失败状态："+str(len(failure_states))+"个")
+        def record_state(kind):
+            try:
+                target=self.require_window(False)
+                packet=self.api.capture(target,False)
+                value=visual_perceptual_hash(packet["f"])
+                if kind=="success":
+                    success_states.add(value)
+                    failure_states.discard(value)
+                    feedback.set("已记录成功状态："+value)
+                else:
+                    failure_states.add(value)
+                    success_states.discard(value)
+                    feedback.set("已记录失败状态："+value)
+                refresh_state_text()
+            except Exception as error:
+                feedback.set("记录失败："+str(error))
+        ttk.Label(state_frame,textvariable=state_text).pack(anchor="w")
+        button_row=ttk.Frame(state_frame)
+        button_row.pack(fill="x",pady=(6,0))
+        ttk.Button(button_row,text="记录当前画面为成功",command=lambda:record_state("success")).pack(side="left",padx=(0,6))
+        ttk.Button(button_row,text="记录当前画面为失败",command=lambda:record_state("failure")).pack(side="left",padx=(0,6))
+        ttk.Button(button_row,text="清空成功状态",command=lambda:(success_states.clear(),refresh_state_text(),feedback.set("已清空成功状态"))).pack(side="left",padx=(0,6))
+        ttk.Button(button_row,text="清空失败状态",command=lambda:(failure_states.clear(),refresh_state_text(),feedback.set("已清空失败状态"))).pack(side="left")
+        ttk.Label(state_frame,textvariable=feedback,wraplength=690).pack(anchor="w",fill="x",pady=(8,0))
+        refresh_state_text()
+        def save():
+            try:
+                allowed=sorted(family for family,variable in variables.items() if variable.get())
+                if not allowed:
+                    raise RuntimeError("至少选择一个安全动作；建议保留“等待”")
+                restart_action=None
+                if restart_enabled.get():
+                    x=safe_float(restart_x.get(),0.5,0.0,1.0)
+                    y=safe_float(restart_y.get(),0.5,0.0,1.0)
+                    restart_action=normalize_action({"kind":"click","button":"left","path":[[x,y]],"duration":0.08})
+                    if action_family_key(restart_action) not in allowed:
+                        raise RuntimeError("启用重新开始动作时，必须把“左键单击”加入白名单")
+                value=dict(profile)
+                value.update({"goal":goal.get("1.0","end").strip(),"allowed_families":allowed,"max_consecutive_failures":safe_int(max_failures.get(),3,1,20),"exploration_enabled":bool(exploration.get()),"restart_action":restart_action,"success_states":sorted(success_states),"failure_states":sorted(failure_states)})
+                self.store.save_game_profile(game["id"],value)
+                self._refresh_all()
+                win.destroy()
+                self.show_info("任务与安全","配置已保存。安全配置或状态定义改变后，必须重新复习才能训练。")
+            except Exception as error:
+                feedback.set("无法保存："+str(error))
+        actions=ttk.Frame(frame)
+        actions.pack(fill="x",pady=(12,0))
+        ttk.Button(actions,text="取消",command=win.destroy).pack(side="right")
+        ttk.Button(actions,text="确认",command=save).pack(side="right",padx=(0,8))
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW",win.destroy)
+        win.wait_visibility()
+        win.grab_set()
+        win.focus_force()
+    def validate_model_binding(self,model,target):
+        if not isinstance(model,dict):
+            raise RuntimeError("模型不存在或格式无效")
+        binding=model.get("model_binding")
+        if not isinstance(binding,dict):
+            raise RuntimeError("模型缺少不可变窗口绑定快照，请重新复习")
+        current=self.api.target_identity(target)
+        target.update(current)
+        rect=self.api.validate_target(target,False)
+        errors=[]
+        path=os.path.normcase(str(current.get("process_path","")))
+        stored_paths={os.path.normcase(str(value)) for value in binding.get("process_paths",[])}
+        if path not in stored_paths:
+            errors.append("可执行文件路径改变")
+        if str(current.get("class","")) not in {str(value) for value in binding.get("window_classes",[])}:
+            errors.append("窗口类改变")
+        norm=[round(safe_float(value,0.0),6) for value in current.get("content_rect_norm",[])[:4]]
+        norms=[[round(safe_float(value,0.0),6) for value in item[:4]] for item in binding.get("content_rect_norms",[]) if isinstance(item,(list,tuple)) and len(item)==4]
+        if not norms or not any(max(abs(norm[index]-item[index]) for index in range(4))<=0.0005 for item in norms):
+            errors.append("内容区域定义改变")
+        aspect=rect[2]/max(1,rect[3])
+        low=safe_float(binding.get("content_aspect_min",0.0),0.0)
+        high=safe_float(binding.get("content_aspect_max",0.0),0.0)
+        tolerance=VersionedThresholdConfig.content_aspect_tolerance
+        if low<=0 or high<=0 or aspect<low*(1.0-tolerance) or aspect>high*(1.0+tolerance):
+            errors.append("内容区域宽高比改变")
+        dpi=safe_int(current.get("dpi",current.get("selected_dpi",0)),0)
+        if dpi<safe_int(binding.get("dpi_min",0),0) or dpi>safe_int(binding.get("dpi_max",0),0):
+            errors.append("DPI超出训练范围")
+        if binding.get("window_rule_version")!=WINDOW_RULE_VERSION or binding.get("capture_backend_version")!=CAPTURE_BACKEND_VERSION:
+            errors.append("窗口规则或采集后端版本改变")
+        profile=self.store.load_game_profile(self.require_game()["id"])
+        if str(model.get("safety_profile_checksum",""))!=profile_checksum(profile):
+            errors.append("任务目标或安全白名单改变")
+        if errors:
+            raise RuntimeError("模型与当前窗口/任务绑定不一致："+"、".join(errors)+"；请重新学习或复习")
+        return True
     def start_review(self):
+        try:
+            self.require_game()
+            self.store.light_checkpoint()
+        except Exception as error:
+            self.show_error(str(error))
+            return
         self.start_worker("复习",self.review_controller.run,False)
     def _limit_prototypes(self,prototypes,limit):
         limit=int(limit)
@@ -5252,7 +6637,7 @@ class App:
         if not valid:
             raise RuntimeError("没有同时具备已验收采集后端和完整短时序上下文的学习数据；数据不足时只允许请教")
         self.wait_escape_release()
-        self.review_distance_cache={}
+        self.review_distance_cache=BoundedLRU(50000)
         decorrelated,decorrelated_removed=self.review_controller.decorrelate(valid)
         if not decorrelated:
             raise RuntimeError("连续帧去相关后没有独立样本")
@@ -5287,9 +6672,12 @@ class App:
                 prototypes.extend(self._cluster_action_group(cluster_id,cluster["a"],len(items),items,progress,cluster.get("repeat_policy","one_shot"),cluster.get("max_rate",3.0)))
                 processed+=len(items)
                 prototypes=self._limit_prototypes(prototypes,MAX_PROTOTYPES)
+                cache_used=len(self.review_distance_cache)
+                self.set_status("复习阶段：动作簇"+str(len(prototypes))+"；距离缓存"+str(cache_used)+"/"+str(self.review_distance_cache.capacity)+"；剩余样本约"+str(max(0,len(train)-processed)))
+                self.review_distance_cache.clear()
         except InputStopped:
             if prototypes:
-                partial={"created":time.time(),"samples":len(decorrelated),"training_samples":len(train),"invalid_samples":stats["invalid"],"prototypes":prototypes,"capture_backends":sorted({str(item.get("capture_method")) for item in train}),"validation":{"status":"stopped","training_checksums":train_checksums,"holdout_checksums":holdout_checksums},"stopped":True}
+                partial={"created":time.time(),"samples":len(decorrelated),"training_samples":len(train),"invalid_samples":stats["invalid"],"prototypes":prototypes,"capture_backends":sorted({str(item.get("capture_method")) for item in train}),"validation":{"status":"stopped","training_checksums":train_checksums,"holdout_checksums":holdout_checksums},"sequence_model":{},"model_binding":model_binding_from_samples(train),"safety_profile_checksum":profile_checksum(self.store.load_game_profile(game["id"])),"stopped":True}
                 self.store.save_model(game["id"],partial,False)
             raise
         operations=0
@@ -5344,7 +6732,12 @@ class App:
         correct=0
         by_action=defaultdict(lambda:{"total":0,"accepted":0,"correct":0,"errors":0,"unrecognized":0,"negative_total":0,"false_positive":0})
         by_method=defaultdict(lambda:{"total":0,"accepted":0,"correct":0,"errors":0})
+        by_scene=defaultdict(lambda:{"total":0,"accepted":0,"correct":0,"errors":0})
+        action_sessions=defaultdict(set)
         dangerous_false=0
+        uncovered_rejected=0
+        uncovered_false_accept=0
+        covered_holdout=0
         dangerous_signatures={cluster["canonical_action_signature"] for cluster in action_clusters if cluster["a"]["kind"] in {"double_click","long_press","drag"} or cluster["a"].get("button") in {"right","middle"}}
         for index,sample in enumerate(holdout):
             if index%8==0 and self.should_stop():
@@ -5354,30 +6747,47 @@ class App:
             expected=sample.get("_action_cluster")
             canonical=sample.get("_canonical_action_signature") or action_signature(sample["a"])
             method=str(sample.get("capture_method") or sample.get("context",{}).get("capture_method") or "unknown")
+            scene=visual_scene_key(sample)
             arow=by_action[canonical]
             mrow=by_method[method]
+            srow=by_scene[scene]
+            action_sessions[canonical].add(self.review_controller.session_of(sample))
             arow["total"]+=1
             mrow["total"]+=1
+            srow["total"]+=1
             predicted_signature=""
+            if expected is not None:
+                covered_holdout+=1
             if decision.get("accepted"):
                 accepted+=1
                 arow["accepted"]+=1
                 mrow["accepted"]+=1
+                srow["accepted"]+=1
                 predicted=decision["best"]
                 predicted_signature=str(predicted.get("canonical_action_signature") or action_signature(predicted["a"]))
                 if expected is not None and predicted["cluster_id"]==expected:
                     correct+=1
                     arow["correct"]+=1
                     mrow["correct"]+=1
+                    srow["correct"]+=1
                 else:
                     errors+=1
                     arow["errors"]+=1
                     mrow["errors"]+=1
+                    srow["errors"]+=1
+                    if expected is None:
+                        uncovered_false_accept+=1
                     predicted_action=normalize_action(predicted["a"])
                     if predicted_action["kind"] in {"double_click","long_press","drag"} or predicted_action.get("button") in {"right","middle"}:
                         dangerous_false+=1
             else:
                 arow["unrecognized"]+=1
+                if expected is None:
+                    uncovered_rejected+=1
+                    correct+=1
+                    arow["correct"]+=1
+                    mrow["correct"]+=1
+                    srow["correct"]+=1
             for signature in dangerous_signatures:
                 if canonical!=signature:
                     by_action[signature]["negative_total"]+=1
@@ -5386,13 +6796,14 @@ class App:
             if index%5==0:
                 self.set_progress(85+13*(index+1)/max(1,len(holdout)))
         holdout_count=len(holdout)
-        coverage=accepted/holdout_count if holdout_count else 0.0
+        coverage=accepted/covered_holdout if covered_holdout else 0.0
         accepted_error_rate=errors/accepted if accepted else None
         error_upper_95=binomial_error_upper(errors,accepted,0.95)
         overall_accuracy=correct/holdout_count if holdout_count else 0.0
         dangerous_false_rate=dangerous_false/max(1,holdout_count)
         per_action={}
         action_rules_pass=True
+        authorized_clusters=set()
         train_signatures={str(item.get("_canonical_action_signature",action_signature(item["a"]))) for item in train}
         for signature in sorted(train_signatures|set(by_action)):
             row=dict(by_action[signature])
@@ -5400,15 +6811,17 @@ class App:
             row["coverage"]=row["accepted"]/row["total"] if row["total"] else 0.0
             row["accepted_error_rate"]=row["errors"]/row["accepted"] if row["accepted"] else None
             row["error_upper_95"]=binomial_error_upper(row["errors"],row["accepted"],0.95)
+            row["independent_sessions"]=len(action_sessions.get(signature,set()))
             action=next((cluster["a"] for cluster in action_clusters if cluster["canonical_action_signature"]==signature),{"kind":"no_op"})
             dangerous=action["kind"] in {"double_click","long_press","drag"} or action.get("button") in {"right","middle"}
             row["dangerous"]=dangerous
-            if dangerous:
-                row_pass=row["total"]>=50 and row["negative_total"]>=50 and row["errors"]==0 and row["false_positive"]==0 and row["coverage"]>=0.80
-            else:
-                row_pass=row["total"]>=20 and row["errors"]==0 and row["coverage"]>=0.80
+            row_pass=ReviewValidator().authorize(row,dangerous)
             row["passed"]=bool(row_pass)
-            action_rules_pass=action_rules_pass and bool(row_pass)
+            row["authorized"]=bool(row_pass)
+            if row_pass:
+                cluster_id=next((cluster["id"] for cluster in action_clusters if cluster["canonical_action_signature"]==signature),None)
+                if cluster_id:
+                    authorized_clusters.add(cluster_id)
             per_action[signature]=row
         train_methods=sorted({str(item.get("capture_method")) for item in train})
         per_method={}
@@ -5419,19 +6832,52 @@ class App:
             row["coverage"]=row["accepted"]/row["total"] if row["total"] else 0.0
             row["accepted_error_rate"]=row["errors"]/row["accepted"] if row["accepted"] else None
             row["error_upper_95"]=binomial_error_upper(row["errors"],row["accepted"],0.95)
-            row["passed"]=bool(row["total"]>=20 and row["errors"]==0 and row["coverage"]>=0.80)
+            row["passed"]=bool(row["total"]>=20 and row["errors"]==0 and row["accuracy"]>=0.80)
             method_rules_pass=method_rules_pass and row["passed"]
             per_method[method]=row
-        enough=bool(split_info.get("complete")) and int(split_info.get("session_count",0))>=2 and holdout_count>=150 and accepted>=150 and bool(train_methods)
-        global_pass=coverage>=0.80 and overall_accuracy>=0.80 and error_upper_95<0.02 and dangerous_false==0 and uncovered_actions==0
-        passed=bool(enough and global_pass and action_rules_pass and method_rules_pass and prototypes and not any(proto.get("ambiguous") for proto in prototypes))
+        per_scene={}
+        scene_rules_pass=True
+        for scene,row_value in sorted(by_scene.items()):
+            row=dict(row_value)
+            row["accuracy"]=row["correct"]/row["total"] if row["total"] else 0.0
+            row["coverage"]=row["accepted"]/row["total"] if row["total"] else 0.0
+            row["error_upper_95"]=binomial_error_upper(row["errors"],row["accepted"],0.95)
+            row["passed"]=bool(row["total"]>=10 and row["errors"]==0 and row["accuracy"]>=0.75)
+            scene_rules_pass=scene_rules_pass and row["passed"]
+            per_scene[scene]=row
+        for proto in prototypes:
+            proto["authorized"]=bool(proto.get("cluster_id") in authorized_clusters and not proto.get("ambiguous"))
+            runtime=action_runtime_metadata(proto.get("a"))
+            proto["strictness"]=runtime["strictness"]
+            proto["cooldown"]=runtime["cooldown"]
+            proto["dangerous"]=runtime["dangerous"]
+        authorized_prototypes=sum(1 for proto in prototypes if proto.get("authorized"))
+        enough=bool(split_info.get("complete")) and int(split_info.get("session_count",0))>=2 and holdout_count>=150 and covered_holdout>=50 and bool(train_methods)
+        global_pass=overall_accuracy>=0.80 and error_upper_95<0.02 and dangerous_false==0 and uncovered_false_accept==0
+        action_rules_pass=authorized_prototypes>0
+        passed=bool(enough and global_pass and action_rules_pass and method_rules_pass and scene_rules_pass and prototypes)
         validation_status="passed" if passed else "insufficient" if not enough or not action_rules_pass or not method_rules_pass else "failed"
-        validation={"status":validation_status,"split":str(split_info.get("mode","unknown")),"split_complete":bool(split_info.get("complete")),"split_reason":str(split_info.get("reason","")),"strata":int(split_info.get("strata",0)),"session_count":int(split_info.get("session_count",0)),"holdout_sessions":sorted(holdout_sessions),"minimum_holdout":150,"minimum_accepted":150,"minimum_ordinary_action_holdout":20,"minimum_dangerous_positive":50,"minimum_dangerous_negative":50,"minimum_coverage":0.80,"maximum_error_upper_95":0.02,"minimum_overall_accuracy":0.80,"maximum_dangerous_false":0,"holdout":holdout_count,"accepted":accepted,"errors":errors,"correct":correct,"coverage":coverage,"accepted_error_rate":accepted_error_rate,"error_upper_95":error_upper_95,"overall_accuracy":overall_accuracy,"dangerous_false":dangerous_false,"dangerous_false_rate":dangerous_false_rate,"uncovered_actions":uncovered_actions,"decorrelated_removed":decorrelated_removed,"per_action":per_action,"per_capture_method":per_method,"ambiguous_prototypes":sum(1 for proto in prototypes if proto.get("ambiguous")),"training_checksums":train_checksums,"holdout_checksums":holdout_checksums,"checksum_intersection":[]}
-        model={"created":time.time(),"samples":len(decorrelated),"training_samples":len(train),"holdout_samples":len(holdout),"invalid_samples":stats["invalid"],"action_clusters":len(action_clusters),"rejection_constraints":rejection_constraints,"prototypes":prototypes,"capture_backends":train_methods,"validation":validation,"training_checksums":train_checksums,"holdout_checksums":holdout_checksums,"stopped":False}
+        validation={"status":validation_status,"split":str(split_info.get("mode","unknown")),"split_complete":bool(split_info.get("complete")),"split_reason":str(split_info.get("reason","")),"strata":int(split_info.get("strata",0)),"session_count":int(split_info.get("session_count",0)),"holdout_sessions":sorted(holdout_sessions),"minimum_holdout":VersionedThresholdConfig.review_min_holdout,"minimum_accepted":VersionedThresholdConfig.review_min_accepted,"minimum_ordinary_action_holdout":VersionedThresholdConfig.ordinary_min_positive,"minimum_ordinary_sessions":VersionedThresholdConfig.ordinary_min_sessions,"minimum_dangerous_positive":VersionedThresholdConfig.dangerous_min_positive,"minimum_dangerous_negative":VersionedThresholdConfig.dangerous_min_negative,"minimum_dangerous_sessions":VersionedThresholdConfig.dangerous_min_sessions,"minimum_coverage":VersionedThresholdConfig.minimum_coverage,"maximum_error_upper_95":VersionedThresholdConfig.maximum_error_upper_95,"minimum_overall_accuracy":VersionedThresholdConfig.minimum_overall_accuracy,"maximum_dangerous_false":0,"holdout":holdout_count,"accepted":accepted,"errors":errors,"correct":correct,"coverage":coverage,"accepted_error_rate":accepted_error_rate,"error_upper_95":error_upper_95,"overall_accuracy":overall_accuracy,"dangerous_false":dangerous_false,"dangerous_false_rate":dangerous_false_rate,"uncovered_actions":uncovered_actions,"uncovered_rejected":uncovered_rejected,"uncovered_false_accept":uncovered_false_accept,"covered_holdout":covered_holdout,"authorized_prototypes":authorized_prototypes,"decorrelated_removed":decorrelated_removed,"per_action":per_action,"per_capture_method":per_method,"per_scene":per_scene,"visual_group_intersection":list(split_info.get("visual_group_intersection",[])),"ambiguous_prototypes":sum(1 for proto in prototypes if proto.get("ambiguous")),"training_checksums":train_checksums,"holdout_checksums":holdout_checksums,"checksum_intersection":[]}
+        sequence_counts=defaultdict(Counter)
+        for session in sorted({self.review_controller.session_of(item) for item in train}):
+            ordered_session=sorted((item for item in train if self.review_controller.session_of(item)==session),key=lambda item:float(item.get("created",0.0)))
+            history=deque(["<START>","<START>","<START>","<START>"],maxlen=4)
+            for item in ordered_session:
+                cluster_id=str(item.get("_action_cluster") or "")
+                if cluster_id:
+                    for size in range(1,5):
+                        sequence_counts[str(size)+"|"+"|".join(list(history)[-size:])][cluster_id]+=1
+                    signature=str(item.get("_canonical_action_signature") or action_signature(item["a"]))
+                    sequence_counts[history[-1]][cluster_id]+=1
+                    history.append(signature)
+        sequence_model={key:dict(value) for key,value in sequence_counts.items()}
+        profile=self.store.load_game_profile(game["id"])
+        binding=model_binding_from_samples(train)
+        model={"created":time.time(),"samples":len(decorrelated),"training_samples":len(train),"holdout_samples":len(holdout),"invalid_samples":stats["invalid"],"action_clusters":len(action_clusters),"rejection_constraints":rejection_constraints,"prototypes":prototypes,"capture_backends":train_methods,"validation":validation,"training_checksums":train_checksums,"holdout_checksums":holdout_checksums,"sequence_model":sequence_model,"model_binding":binding,"safety_profile_checksum":profile_checksum(profile),"stopped":False}
         if not prototypes:
             raise RuntimeError("复习未生成可用原型")
         self.store.save_model(game["id"],model,validation_status=="passed")
-        self.review_distance_cache={}
+        self.review_distance_cache.clear()
         self.set_progress(100)
         label="通过验收" if validation_status=="passed" else "验证不足，仅保存临时模型并禁止训练" if validation_status=="insufficient" else "验证失败，仅保存临时模型并禁止训练"
         error_text="无可计算值" if accepted_error_rate is None else str(round(accepted_error_rate*100,2))+"%"
@@ -5441,6 +6887,9 @@ class App:
         lines.append("各采集后端独立验证：")
         for method,row in sorted(per_method.items()):
             lines.append(method+"：留出"+str(row["total"])+"，覆盖率"+str(round(row["coverage"]*100,2))+"%，错误"+str(row["errors"])+"，"+("通过" if row["passed"] else "未通过"))
+        lines.append("各视觉场景分层验证：")
+        for scene,row in sorted(per_scene.items()):
+            lines.append(scene+"：留出"+str(row["total"])+"，准确率"+str(round(row["accuracy"]*100,2))+"%，错误"+str(row["errors"])+"，"+("通过" if row["passed"] else "未通过"))
         return ModeResult("completed","\n".join(lines),{"validation":validation_status})
     def review_worker(self):
         return self.review_controller.run()
@@ -5464,20 +6913,9 @@ class App:
         label={"click":"单击","double_click":"双击","long_press":"长按","drag":"拖动"}.get(kind,kind)
         return names.get(item.get("button"),"左键")+label+" "+position
     def action_cooldown(self,action):
-        kind=normalize_action(action)["kind"]
-        return {"click":0.8,"double_click":1.5,"long_press":2.0,"drag":1.2,"scroll_v":0.8,"scroll_h":1.0,"move":0.45,"hover":1.0,"no_op":0.25}.get(kind,1.0)
+        return action_runtime_metadata(action)["cooldown"]
     def action_strictness(self,action):
-        kind=normalize_action(action)["kind"]
-        button=normalize_action(action).get("button")
-        if kind in {"double_click","long_press","drag"} or button in {"right","middle"}:
-            return 1.35,4,0.78
-        if kind in {"scroll_v","scroll_h"}:
-            return 1.2,3,0.80
-        if kind in {"move","hover"}:
-            return 1.0,2,0.84
-        if kind=="no_op":
-            return 1.0,1,0.88
-        return 1.0,2,0.84
+        return action_runtime_metadata(action)["strictness"]
     def execute_action(self,target,action,expected_frame=None,mouse_interrupt=None,keyboard_monitor=None,keyboard_interrupt=None):
         item=normalize_action(action)
         if not item:
@@ -5599,7 +7037,7 @@ class App:
     def start_training(self):
         try:
             game=self.require_game()
-            self.require_window(False)
+            target=self.require_window(False)
             model=self.store.load_model(game["id"])
             if not model or not model.get("prototypes"):
                 raise RuntimeError("没有可用完整模型，请先学习并完成复习")
@@ -5608,6 +7046,7 @@ class App:
             current=next((item for item in self.store.games() if item["id"]==game["id"]),{})
             if current.get("needs_review"):
                 raise RuntimeError("模型需要复习：请先点击“复习”完成离线优化")
+            self.validate_model_binding(model,target)
         except Exception as error:
             self.show_error(str(error))
             return
@@ -5618,6 +7057,12 @@ class App:
         game=self.require_game()
         target=self.require_window(False)
         model=self.store.load_model(game["id"])
+        self.validate_model_binding(model,target)
+        profile=self.store.load_game_profile(game["id"])
+        agent_policy=TaskAgentPolicy(profile)
+        if not agent_policy.allowed:
+            raise RuntimeError("当前游戏未配置任何自动动作白名单，请先打开“任务与安全”")
+        self.active_model_runtime=model
         prototypes=model["prototypes"]
         allowed_backends=set(model.get("capture_backends",[]))
         calibration=self.ensure_capture_calibration(target,"训练")
@@ -5654,21 +7099,45 @@ class App:
             self.mode_state=MODE_RUNNING
             keyboard_interrupt=keyboard.other_event
             mouse_interrupt=mouse.input_event
+            def execute_profile_restart(frame):
+                nonlocal actions
+                restart=normalize_action(profile.get("restart_action"))
+                if not restart:
+                    return False
+                if not agent_policy.allowed_action(restart):
+                    raise InputStopped("重新开始动作不在安全白名单")
+                if not self.training_controller.usable_frame(frame,validated_backend) or frame.get("method") not in allowed_backends:
+                    raise InputStopped("重新开始前画面或采集后端不可用")
+                if mouse_interrupt.is_set() or keyboard_interrupt.is_set() or not keyboard.all_released() or not mouse.stable_for(0.45):
+                    raise InputStopped("重新开始前检测到人工输入")
+                self.api.validate_target(target,True)
+                self.api.validate_uipi(target)
+                try:
+                    if restart.get("kind")!="no_op":
+                        self.api.allow_input(self.stop_event)
+                        self.set_input_status("允许执行一次已配置的重新开始动作")
+                    self.execute_action(target,restart,frame,mouse_interrupt,keyboard,keyboard_interrupt)
+                    actions+=1
+                    recent_actions.append(action_signature(restart))
+                    return True
+                finally:
+                    self.api.block_input()
+                    self.api.release_all_buttons()
             while not self.should_stop():
                 key_events=[event for event in keyboard.drain() if event.get("kind")=="other" and event.get("down")]
                 mouse_events=mouse.drain()
-                if key_events or mouse_events:
+                if self.training_controller.interference(mouse_interrupt,keyboard_interrupt) or key_events or mouse_events:
                     keyboard_count+=len(key_events)
                     mouse_count+=len(mouse_events)
-                    if key_events:
-                        isolation.signal("keyboard",key_events[0].get("time"))
+                    if key_events or keyboard_interrupt.is_set():
+                        isolation.signal("keyboard",key_events[0].get("time") if key_events else time.time())
                         reason="检测到非ESC键盘输入，训练立即停止"
                         self.set_input_status("因键盘输入锁定")
                     else:
                         isolation.signal("mouse",mouse_events[0].get("time") if mouse_events else time.time())
-                        reason="检测到物理鼠标输入，训练立即停止"
+                        reason="检测到物理或其他程序注入的鼠标输入，训练立即停止"
                         self.set_input_status("因人工鼠标输入锁定")
-                    self.lifecycle.request_stop("stopped",reason)
+                    self.request_mode_stop("stopped",reason)
                     self.mode_state=MODE_STOPPING
                     self.api.block_input()
                     self.api.release_all_buttons()
@@ -5679,7 +7148,6 @@ class App:
                 try:
                     self.api.validate_target(target,True)
                 except TargetUnavailable as error:
-                    self.api.block_input()
                     candidate_id=None
                     candidate_count=0
                     self.set_confidence("训练置信度：0%")
@@ -5688,8 +7156,7 @@ class App:
                     time.sleep(0.08)
                     continue
                 captured=frame_buffer.latest(None,0.8)
-                if captured is None or not captured.get("usable_for_training"):
-                    self.api.block_input()
+                if not self.training_controller.usable_frame(captured,validated_backend):
                     self.set_input_status("检测到黑屏，已锁定" if captured and captured.get("black_frame") else "画面不可用，已锁定")
                     self.set_status("采集画面不可用于训练；等待已验收、非受保护黑屏且后端未冻结的最新帧；"+(frame_buffer.last_error or "尚无画面"))
                     time.sleep(0.08)
@@ -5701,35 +7168,43 @@ class App:
                         candidate_id=None
                         candidate_count=0
                         candidate_frame_stamp=0.0
-                        self.api.block_input()
                         self.set_input_status("采集后端切换，等待连续确认")
                         self.set_status("原采集后端已熔断，已切换到剩余已验证后端："+validated_backend)
                         time.sleep(0.1)
                         continue
-                    self.api.block_input()
                     self.set_status("替代采集后端未在模型中验证，拒绝自动动作")
                     time.sleep(0.1)
                     continue
                 if captured.get("method")!=validated_backend or captured.get("method") not in allowed_backends:
-                    self.api.block_input()
                     self.set_status("采集后端变化或未在模型中验证，拒绝自动动作；请重新学习和复习")
                     time.sleep(0.1)
                     continue
                 feature=captured["f"]
-                frame_change=float("inf")
+                current_state,current_reward=agent_policy.classify(feature)
+                if current_state=="success":
+                    self.request_mode_stop("completed","检测到已定义的成功状态，训练完成")
+                    break
+                if current_state=="failure":
+                    outcome=agent_policy.register(feature,{"kind":"no_op","duration":0.1},feature,False)
+                    if outcome["stop"]:
+                        self.request_mode_stop("stopped","失败状态连续出现达到安全上限"+str(agent_policy.max_failures)+"次，已自动停机")
+                        break
+                    try:
+                        if execute_profile_restart(captured):
+                            self.set_status("检测到失败或死亡状态，已执行白名单内的重新开始动作")
+                            time.sleep(max(0.1,float(calibration.get("input_delay",0.24))))
+                            continue
+                    except InputStopped as error:
+                        self.request_mode_stop("stopped","失败状态回滚无法安全执行："+str(error))
+                        break
+                    self.set_status("检测到失败或死亡状态，但未配置重新开始动作；保持锁定")
+                    time.sleep(0.12)
+                    continue
                 if captured["time"]!=previous_frame_stamp:
-                    if previous_feature is not None:
-                        frame_change=visual_distance(previous_feature,feature)
-                        if frame_change>float(calibration.get("significant_change",60.0)):
-                            state_since=time.time()
+                    if previous_feature is not None and visual_distance(previous_feature,feature)>float(calibration.get("significant_change",60.0)):
+                        state_since=time.time()
                     previous_feature=feature
                     previous_frame_stamp=captured["time"]
-                if captured.get("capture_frozen"):
-                    self.api.block_input()
-                    self.set_input_status("采集后端冻结，已锁定")
-                    self.set_status("检测到采集后端冻结而其他后端仍变化，训练停止输入并等待恢复")
-                    time.sleep(0.1)
-                    continue
                 significant=last_action_feature is not None and visual_distance(last_action_feature,feature)>float(calibration.get("significant_change",60.0))
                 if significant:
                     state_unlocked=True
@@ -5737,20 +7212,19 @@ class App:
                     state_since=time.time()
                 temporal=self.build_temporal_context(frame_buffer,captured,recent_actions,state_since)
                 if not temporal_from_context({**temporal,"previous_action_changed_frame":significant}).get("complete"):
-                    self.api.block_input()
                     self.set_status("等待至少3帧短时序上下文")
                     time.sleep(0.05)
                     continue
                 temporal["previous_action_changed_frame"]=bool(significant)
-                ranked=self.rank_action_candidates(feature,prototypes,last_action_signature,18,temporal,captured.get("coarse"))
+                ranked=self.rank_action_candidates(feature,prototypes,last_action_signature,VersionedThresholdConfig.candidate_full_limit,temporal,captured.get("coarse"))
                 decision=self.evaluate_action_candidates(ranked)
                 if not decision.get("accepted"):
                     candidate_id=None
                     candidate_count=0
-                    self.api.block_input()
                     self.set_input_status("等待连续确认")
                     self.set_confidence("训练置信度："+str(round(float(decision.get("confidence",0.0))*100,1))+"%")
-                    self.set_status("训练中："+str(decision.get("reason","识别不确定"))+"；不执行动作并等待请教")
+                    suffix="；安全探索仅保持等待，不产生鼠标输入" if profile.get("exploration_enabled") else "；不执行动作并等待请教"
+                    self.set_status("训练中："+str(decision.get("reason","识别不确定"))+suffix)
                     time.sleep(0.12)
                     continue
                 best=decision["best"]
@@ -5766,24 +7240,31 @@ class App:
                 candidate_frame_stamp=captured["time"]
                 confirmations=max(3,int(calibration.get("confirm_frames",3)))
                 self.set_confidence("训练置信度："+str(round(decision["confidence"]*100,1))+"%  连续确认"+str(candidate_count)+"/"+str(confirmations))
-                if candidate_count<confirmations:
+                if not self.training_controller.confirmed(candidate_count,confirmations):
                     time.sleep(0.05)
                     continue
                 action=normalize_action(best["a"])
                 canonical=action_signature(action)
                 proto=best["proto"]
-                if captured["method"] not in set(proto.get("capture_methods",[])):
-                    self.api.block_input()
+                if not self.training_controller.authorized(proto):
+                    self.set_status("动作原型未通过独立留出授权，拒绝动作")
+                    time.sleep(0.1)
+                    continue
+                if not agent_policy.allowed_action(action):
+                    self.set_status("动作不在当前游戏安全白名单中，拒绝动作："+self.action_text(action))
+                    time.sleep(0.1)
+                    continue
+                if captured["method"] not in proto.get("capture_methods",frozenset()):
                     self.set_status("当前原型未在该采集后端训练，拒绝动作")
                     time.sleep(0.1)
                     continue
-                policy=str(proto.get("repeat_policy","one_shot"))
+                repeat_policy=str(proto.get("repeat_policy","one_shot"))
                 max_rate=max(0.25,min(12.0,float(proto.get("max_rate",3.0))))
-                if policy in {"one_shot","hold_until_change"} and last_cluster_id==cluster_id and not state_unlocked:
-                    self.set_status("等待画面变化：该动作策略为"+policy)
+                if repeat_policy in {"one_shot","hold_until_change"} and last_cluster_id==cluster_id and not state_unlocked:
+                    self.set_status("等待画面变化：该动作策略为"+repeat_policy)
                     time.sleep(0.1)
                     continue
-                minimum_gap=max(self.action_cooldown(action) if policy=="one_shot" else 0.0,1.0/max_rate if policy in {"rate_limited","repeatable"} else 0.0)
+                minimum_gap=max(self.action_cooldown(action) if repeat_policy=="one_shot" else 0.0,1.0/max_rate if repeat_policy in {"rate_limited","repeatable"} else 0.0)
                 if time.time()-last_action_time<minimum_gap:
                     time.sleep(0.03)
                     continue
@@ -5799,21 +7280,19 @@ class App:
                 try:
                     self.api.validate_target(target,True)
                     self.api.validate_uipi(target)
-                    if fresh is None or not fresh.get("usable_for_training") or fresh.get("black_frame") or fresh.get("capture_frozen") or fresh.get("frozen_backend"):
-                        raise InputStopped("动作前最后一帧不可用")
-                    if fresh.get("method")!=validated_backend or fresh.get("method") not in allowed_backends or fresh.get("method") not in set(proto.get("capture_methods",[])):
-                        raise InputStopped("动作前采集后端不匹配")
+                    if not self.training_controller.usable_frame(fresh,validated_backend) or fresh.get("method") not in allowed_backends or fresh.get("method") not in proto.get("capture_methods",frozenset()):
+                        raise InputStopped("动作前最后一帧或采集后端不可用")
                     if keyboard_interrupt.is_set() or not keyboard.all_released():
                         raise InputStopped("检测到键盘输入")
                     if mouse_interrupt.is_set() or not mouse.stable_for(0.45):
                         raise InputStopped("检测到人工鼠标干扰")
                     fresh_temporal=self.build_temporal_context(frame_buffer,fresh,recent_actions,state_since)
                     fresh_temporal["previous_action_changed_frame"]=bool(significant)
-                    fresh_ranked=self.rank_action_candidates(fresh["f"],prototypes,last_action_signature,18,fresh_temporal,fresh.get("coarse"))
+                    fresh_ranked=self.rank_action_candidates(fresh["f"],prototypes,last_action_signature,VersionedThresholdConfig.candidate_full_limit,fresh_temporal,fresh.get("coarse"))
                     fresh_decision=self.evaluate_action_candidates(fresh_ranked)
                     if not fresh_decision.get("accepted") or fresh_decision.get("best",{}).get("cluster_id")!=cluster_id:
                         raise InputStopped("动作前模型判断已变化")
-                    if candidate_count<confirmations:
+                    if not self.training_controller.confirmed(candidate_count,confirmations):
                         raise InputStopped("动作前连续帧确认不足")
                     before=fresh["f"]
                     needs_input=action.get("kind")!="no_op"
@@ -5821,7 +7300,6 @@ class App:
                         self.set_input_status("允许执行单个动作")
                         self.api.allow_input(self.stop_event)
                     else:
-                        self.api.block_input()
                         self.set_input_status("已锁定")
                     self.set_status("训练中："+self.action_text(action)+"；全部安全条件已通过；采集="+fresh["method"])
                     self.execute_action(target,action,fresh,mouse_interrupt,keyboard,keyboard_interrupt)
@@ -5829,8 +7307,8 @@ class App:
                     if mouse_interrupt.is_set() or keyboard_interrupt.is_set() or not keyboard.all_released():
                         kind="mouse" if mouse_interrupt.is_set() else "keyboard"
                         isolation.signal(kind,time.time())
-                        reason="检测到物理鼠标输入，训练立即停止" if kind=="mouse" else "检测到非ESC键盘输入，训练立即停止"
-                        self.lifecycle.request_stop("stopped",reason)
+                        reason="检测到物理或其他程序注入的鼠标输入，训练立即停止" if kind=="mouse" else "检测到非ESC键盘输入，训练立即停止"
+                        self.request_mode_stop("stopped",reason)
                         self.mode_state=MODE_STOPPING
                         self.api.block_input()
                         self.api.release_all_buttons()
@@ -5854,7 +7332,7 @@ class App:
                 last_cluster_id=cluster_id
                 last_action_time=action_end
                 last_action_feature=before
-                state_unlocked=policy in {"repeatable","rate_limited"}
+                state_unlocked=repeat_policy in {"repeatable","rate_limited"}
                 candidate_count=0
                 delay=float(calibration.get("input_delay",0.24))
                 deadline=time.monotonic()+delay
@@ -5864,24 +7342,40 @@ class App:
                 wait_end=time.monotonic()+max(0.35,delay*2.0)
                 while time.monotonic()<wait_end and not self.should_stop():
                     candidate_after=frame_buffer.latest_after(action_end)
-                    if candidate_after is not None and candidate_after.get("usable_for_training") and candidate_after.get("method")==validated_backend:
+                    if self.training_controller.usable_frame(candidate_after,validated_backend):
                         after=candidate_after
                         break
                     time.sleep(0.025)
-                change=visual_distance(before,after["f"]) if after is not None else 0.0
-                if change<float(calibration.get("post_action_change",45.0)):
-                    no_change_count+=1
-                    if policy in {"one_shot","hold_until_change"} and no_change_count>=2:
-                        state_unlocked=False
-                        self.api.block_input()
-                        self.set_status("动作后未出现预期画面变化，暂停并等待请教")
-                else:
+                changed=self.training_controller.changed(before,after,float(calibration.get("post_action_change",45.0)))
+                outcome=agent_policy.register(before,action,after["f"] if after is not None else None,changed)
+                if changed:
                     no_change_count=0
                     state_unlocked=True
                     state_since=time.time()
+                else:
+                    no_change_count+=1
+                    if repeat_policy in {"one_shot","hold_until_change"} and no_change_count>=2:
+                        state_unlocked=False
+                        self.set_status("动作后未出现预期画面变化，暂停并等待请教")
+                if outcome["state"]=="success":
+                    self.request_mode_stop("completed","检测到已定义的成功状态，训练完成")
+                    break
+                if outcome["stop"]:
+                    self.request_mode_stop("stopped","连续失败或无变化达到安全上限"+str(agent_policy.max_failures)+"次，已自动停机")
+                    break
+                if outcome["state"]=="failure" and profile.get("restart_action") and not self.should_stop():
+                    restart_frame=after or frame_buffer.latest(None,0.35)
+                    try:
+                        if execute_profile_restart(restart_frame):
+                            self.set_status("检测到失败状态，已执行白名单内的重新开始动作")
+                    except InputStopped as error:
+                        self.request_mode_stop("stopped","失败状态回滚无法安全执行："+str(error))
+                        break
                 time.sleep(0.05)
-        summary="训练已停止，AI执行"+str(actions)+"个鼠标动作；检测到非ESC键盘输入"+str(keyboard_count)+"次，物理鼠标输入"+str(mouse_count)+"次"
-        return ModeResult("stopped" if self.stop_event and self.stop_event.is_set() else "completed",summary,{"strict_input_violation":isolation.kind})
+        requested=self.lifecycle.snapshot()[3]
+        final_status=requested if requested in {"completed","stopped","failed"} else ("stopped" if self.stop_event and self.stop_event.is_set() else "completed")
+        summary=("训练完成" if final_status=="completed" else "训练已停止")+"，AI执行"+str(actions)+"个鼠标动作；检测到非ESC键盘输入"+str(keyboard_count)+"次，人工或外部注入鼠标输入"+str(mouse_count)+"次"
+        return ModeResult(final_status,summary,{"strict_input_violation":isolation.kind,"task_history":list(agent_policy.history)})
     def basic_actions(self):
         result=[]
         for y in (0.18,0.35,0.5,0.68,0.84):
@@ -6187,17 +7681,7 @@ class App:
             return
         status="completed" if str(reason)=="completed" else "stopped"
         text="用户结束请教" if status=="completed" else "请教已停止"
-        self.lifecycle.request_stop(status,text)
-        self.mode_state=MODE_STOPPING
-        if self.stop_event is not None:
-            self.stop_event.set()
-        self.api.block_input()
-        self.set_input_status("已锁定")
-        self._destroy_ask_window()
-        if self.active_session is not None:
-            self.active_session.request_stop()
-        if not self.closing:
-            self.status.set("请教正在停止，等待FrameBuffer、题目线程和采集进程退出")
+        self.request_mode_stop(status,text)
     def open_data_dialog(self):
         if self.mode:
             self.show_error("请先停止当前模式")
@@ -6235,6 +7719,9 @@ class App:
             self.show_info("模型恢复完成",message)
             refresh()
             self._refresh_all()
+        def backup():
+            path=self.store.create_recovery_backup("manual")
+            self.show_info("恢复备份已创建","数据库、WAL与SHM恢复备份已保存到："+str(path))
         def clear():
             if not self.confirm_dialog("清空数据","确认清空当前游戏的全部样本、模型和备份吗？此操作不可撤销。"):
                 return
@@ -6248,6 +7735,7 @@ class App:
         buttons.pack(side="bottom",fill="x",pady=(14,0))
         ttk.Button(buttons,text="压缩重复样本",command=compact).pack(side="left",padx=(0,6))
         ttk.Button(buttons,text="恢复模型备份",command=restore).pack(side="left",padx=6)
+        ttk.Button(buttons,text="创建恢复备份",command=backup).pack(side="left",padx=6)
         ttk.Button(buttons,text="清空全部数据",command=clear).pack(side="left",padx=6)
         ttk.Button(buttons,text="关闭",command=win.destroy).pack(side="right")
         refresh()
@@ -6259,7 +7747,7 @@ class App:
         self.status.set("正在安全关闭：锁定输入并停止模式与采集")
         self.set_input_status("关闭过程中已锁定")
         if self.mode_state!=MODE_IDLE:
-            self.lifecycle.request_stop("stopped","程序关闭")
+            self.request_mode_stop("stopped","程序关闭")
             self.mode_state=MODE_STOPPING
             if self.stop_event is not None:
                 self.stop_event.set()
@@ -6296,9 +7784,15 @@ class App:
         deadline_reached=bool(self.shutdown_deadline is not None and time.monotonic()>=self.shutdown_deadline)
         pending=[]
         if self.mode_state!=MODE_IDLE:
-            self.lifecycle.request_stop("stopped","程序关闭")
+            self.request_mode_stop("stopped","程序关闭")
             if self.stop_event is not None:
                 self.stop_event.set()
+            if self.review_process is not None:
+                self.review_process.request_stop()
+                if deadline_reached and self.review_process.alive():
+                    self.review_process.terminate(0.2)
+                if self.review_process.alive():
+                    pending.append("OfflineReviewProcess")
             self._destroy_ask_window()
             session_done=True
             if self.active_session is not None:
@@ -6311,13 +7805,16 @@ class App:
                 pending.append("模式线程")
             capture_pending=self.api.stop_capture_processes(0.0,deadline_reached)
             pending.extend("CaptureProcess:"+name for name in capture_pending)
+            if deadline_reached and (thread_alive or pending or not session_done):
+                self._forced_exit("程序关闭超过8秒，执行最终退出策略")
+                return
             if pending or not session_done:
-                suffix="；关闭期限已到，采集子进程已请求强制终止" if deadline_reached else ""
-                self.status.set("正在安全关闭：等待"+"、".join(sorted(set(pending)))+suffix)
+                self.status.set("正在安全关闭：等待"+"、".join(sorted(set(pending))))
                 self.root.after(50,self._poll_shutdown)
                 return
             self.mode_thread=None
             self.active_session=None
+            self.review_process=None
             self.ask_buffer=None
             self.ask_producer=None
             self.ask_answer_queue=None
@@ -6332,27 +7829,42 @@ class App:
             self.mode_shutdown_deadline=None
         capture_pending=self.api.stop_capture_processes(0.0,deadline_reached)
         if capture_pending:
-            self.status.set("正在安全关闭：等待采集子进程退出："+"、".join(capture_pending)+( "；已强制终止" if deadline_reached else ""))
+            if deadline_reached:
+                self._forced_exit("采集子进程未在关闭期限内退出")
+                return
+            self.status.set("正在安全关闭：等待采集子进程退出："+"、".join(capture_pending))
             self.root.after(50,self._poll_shutdown)
             return
         self.status.set("正在安全关闭：刷新待写样本并关闭SQLite")
         try:
             store_closed=self.store.close(0.0)
         except Exception as error:
+            if deadline_reached:
+                self._forced_exit("SQLite关闭失败："+str(error))
+                return
             self.status.set("SQLite关闭失败，输入仍保持锁定："+str(error))
             self.root.after(200,self._poll_shutdown)
             return
         if not store_closed:
+            if deadline_reached:
+                self._forced_exit("样本写入线程未在关闭期限内退出")
+                return
             self.status.set("正在安全关闭：等待样本写入线程退出")
             self.root.after(100,self._poll_shutdown)
             return
         self.status.set("正在安全关闭：释放WGC、GDI和系统资源")
         try:
             if not self.api.close():
+                if deadline_reached:
+                    self._forced_exit("采集资源未在关闭期限内释放")
+                    return
                 self.status.set("正在安全关闭：等待采集资源退出")
                 self.root.after(100,self._poll_shutdown)
                 return
         except Exception as error:
+            if deadline_reached:
+                self._forced_exit("采集资源关闭失败："+str(error))
+                return
             self.status.set("采集资源关闭失败："+str(error))
             self.root.after(200,self._poll_shutdown)
             return
@@ -6411,7 +7923,7 @@ def run_self_test(path=None):
         value=bool(condition)
         checks[str(name)]=value
         if not value:
-            failures.append(str(name)+("："+str(detail) if detail else ""))
+            failures.append(str(name)+(":"+str(detail) if detail else ""))
     check("源文件无空行",not any(not line.strip() for line in text.splitlines()))
     try:
         tokens=list(tokenize.tokenize(io.BytesIO(raw).readline))
@@ -6420,61 +7932,27 @@ def run_self_test(path=None):
         check("源文件可分词",False,error)
     try:
         compile(text,str(source_path),"exec")
-        tree=ast.parse(text,str(source_path))
+        ast.parse(text,str(source_path))
         check("源文件可编译",True)
     except Exception as error:
-        tree=None
         check("源文件可编译",False,error)
-    required_classes={"ModeLifecycle","LearningController","ReviewController","TrainingController","TeachingController","PreviewCoordinateMapper","ResourceShutdownBarrier"}
-    class_map={node.name:node for node in tree.body if isinstance(node,ast.ClassDef)} if tree is not None else {}
-    check("单文件职责类完整",required_classes.issubset(class_map),sorted(required_classes-set(class_map)))
-    app_methods={node.name for node in class_map["App"].body if isinstance(node,ast.FunctionDef)} if "App" in class_map else set()
-    check("模式生命周期方法归属App",{"_begin_mode_stopping","_poll_mode_shutdown","_poll_shutdown","_create_ask_window"}.issubset(app_methods))
     points=([0.0,0.0],[1.0,1.0],[0.5,0.5],[0.137,0.829])
-    roundtrip=True
-    for point in points:
-        canvas=PreviewCoordinateMapper.to_canvas(point)
-        restored=PreviewCoordinateMapper.to_normalized(canvas[0],canvas[1])
-        roundtrip=roundtrip and restored is not None and max(abs(restored[index]-point[index]) for index in range(2))<1e-9
-    check("请教坐标往返",roundtrip)
-    check("请教边框点击拒绝",PreviewCoordinateMapper.to_normalized(ASK_PREVIEW_X-1,ASK_PREVIEW_Y) is None and PreviewCoordinateMapper.to_normalized(ASK_PREVIEW_X,ASK_PREVIEW_Y-1) is None and PreviewCoordinateMapper.to_normalized(ASK_PREVIEW_X+ASK_PREVIEW_W,ASK_PREVIEW_Y) is None)
+    check("请教坐标行为",all((lambda restored,point:restored is not None and max(abs(restored[index]-point[index]) for index in range(2))<1e-9)(PreviewCoordinateMapper.to_normalized(*PreviewCoordinateMapper.to_canvas(point)),point) for point in points))
+    check("请教边框拒绝",PreviewCoordinateMapper.to_normalized(ASK_PREVIEW_X-1,ASK_PREVIEW_Y) is None and PreviewCoordinateMapper.to_normalized(ASK_PREVIEW_X,ASK_PREVIEW_Y-1) is None)
     actions=[{"kind":"click","button":"left","path":[[0.25,0.75]],"duration":0.08},{"kind":"double_click","button":"left","path":[[0.5,0.5]],"duration":0.16},{"kind":"long_press","button":"right","path":[[0.4,0.6]],"duration":0.8},{"kind":"drag","button":"left","path":[[0.1,0.2],[0.9,0.8]],"duration":0.5},{"kind":"scroll_v","delta":120,"path":[[0.5,0.5]],"duration":0.08},{"kind":"no_op","duration":0.3}]
-    check("动作规范化",all(normalize_action(action) is not None and action_signature(action) for action in actions))
-    check("INPUT仅鼠标联合体",[name for name,_ in INPUTUNION._fields_]==["mi"] and ("KEYBD"+"INPUT") not in text)
-    input_type_assignments=[]
-    if tree is not None:
-        for node in ast.walk(tree):
-            if isinstance(node,ast.Assign):
-                for target in node.targets:
-                    if isinstance(target,ast.Attribute) and target.attr=="type":
-                        input_type_assignments.append(node.value.value if isinstance(node.value,ast.Constant) else None)
-    check("自动INPUT类型恒为鼠标",bool(input_type_assignments) and all(value==0 for value in input_type_assignments),input_type_assignments)
-    payload=add_checksum({"version":FORMAT_VERSION,"items":[1,2,3]})
-    check("模型checksum",verify_checksum(payload) and not verify_checksum({**payload,"version":FORMAT_VERSION+1}))
-    compressed=zlib.compress(canonical_bytes(payload),9)
-    check("压缩上限正常",bounded_decompress(compressed,len(canonical_bytes(payload)))==canonical_bytes(payload))
-    try:
-        bounded_decompress(zlib.compress(b"x"*1024,9),128)
-        compression_rejected=False
-    except ValueError:
-        compression_rejected=True
-    check("压缩上限拒绝超限",compression_rejected)
-    connection=sqlite3.connect(":memory:")
-    try:
-        connection.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY,value TEXT NOT NULL)")
-        connection.execute("INSERT INTO sample(value) VALUES('ok')")
-        integrity=connection.execute("PRAGMA integrity_check").fetchone()[0]
-    finally:
-        connection.close()
-    check("数据库完整性",str(integrity).lower()=="ok")
-    train=[{"checksum":"train-a"},{"checksum":"train-b"}]
-    holdout=[{"checksum":"holdout-a"},{"checksum":"holdout-b"}]
-    try:
-        assert_disjoint_checksums(train,holdout)
-        disjoint=True
-    except Exception:
-        disjoint=False
-    check("训练留出checksum不相交",disjoint and not checksum_set(train).intersection(checksum_set(holdout)))
+    check("动作规范化行为",all(normalize_action(action) is not None and action_signature(action) for action in actions))
+    converter=LearningInputEventConverter()
+    converted=converter.convert({"x":20,"y":30,"time":1.0,"type":"move"},(10,20,100,100))
+    merged=ClickMerger().merge({"time":1.0,"button":"left","point":[0.2,0.3]},{"time":1.2,"button":"left","point":[0.2,0.3]},0.32)
+    check("学习控制器实际行为",converted.get("inside") and converted.get("point") and merged.get("kind")=="double_click" and NegativeSampleSampler().due(0.0,1.0,0.5))
+    gate=TrainingFrameGate()
+    confirmer=TrainingCandidateConfirmer()
+    authorizer=TrainingActionAuthorizer()
+    check("训练控制器实际行为",gate.usable({"usable_for_training":True,"black_frame":False,"capture_frozen":False,"method":"wgc"},"wgc") and confirmer.confirmed(3,3) and authorizer.authorized({"authorized":True,"ambiguous":False}) and not authorizer.authorized({"authorized":True,"ambiguous":True}))
+    validator=ReviewValidator()
+    ordinary={"total":VersionedThresholdConfig.ordinary_min_positive,"independent_sessions":VersionedThresholdConfig.ordinary_min_sessions,"errors":0,"false_positive":0,"coverage":1.0,"negative_total":0}
+    dangerous={"total":VersionedThresholdConfig.dangerous_min_positive,"independent_sessions":VersionedThresholdConfig.dangerous_min_sessions,"errors":0,"false_positive":0,"coverage":1.0,"negative_total":VersionedThresholdConfig.dangerous_min_negative}
+    check("危险动作独立session授权",validator.authorize(ordinary,False) and validator.authorize(dangerous,True) and not validator.authorize({**dangerous,"independent_sessions":VersionedThresholdConfig.dangerous_min_sessions-1},True))
     for stage in (MODE_STARTING,MODE_RUNNING,MODE_STOPPING):
         lifecycle=ModeLifecycle()
         event=lifecycle.begin("自检")
@@ -6483,12 +7961,50 @@ def run_self_test(path=None):
         if stage==MODE_STOPPING:
             lifecycle.request_stop("stopped","预置")
         lifecycle.request_stop("stopped","ESC")
-        check("ESC可中止"+stage,event.is_set() and lifecycle.snapshot()[0]==MODE_STOPPING)
+        lifecycle.request_stop("completed","后来完成")
+        check("ESC可中止且完成不可覆盖"+stage,event.is_set() and lifecycle.snapshot()[0]==MODE_STOPPING and lifecycle.snapshot()[3]=="stopped")
+    priority=ModeLifecycle()
+    priority.begin("自检")
+    priority.request_stop("failed","失败")
+    priority.request_stop("stopped","后来停止")
+    check("停止状态优先级",priority.snapshot()[3]=="failed")
+    class Stubborn:
+        def __init__(self):
+            self.running=True
+            self.forced=False
+        def stop(self,timeout=0.0):
+            return False
+        def alive(self):
+            return self.running
+        def force(self):
+            self.forced=True
+            self.running=False
+    stubborn=Stubborn()
+    barrier=ResourceShutdownBarrier("阻塞采集",0.01)
+    barrier.add("CaptureProcess",stubborn.stop,stubborn.alive,stubborn.force)
+    barrier.request_stop()
+    barrier.deadline=time.monotonic()-1
+    check("采集阻塞超时强制终止",barrier.poll() and stubborn.forced and not stubborn.alive())
+    check("仅识别本程序注入标记",own_injected_event(1,INPUT_EXTRA_INFO,3) and not own_injected_event(1,INPUT_EXTRA_INFO+1,3) and not own_injected_event(0,INPUT_EXTRA_INFO,3))
+    marker_bridge=object.__new__(WinBridge)
+    marker_bridge.input_lock=threading.RLock()
+    marker_bridge.input_blocked=False
+    marker_bridge.input_stop_event=None
+    marker_bridge.held=set()
+    class MarkerUser32:
+        def __init__(self):
+            self.extra=None
+        def SendInput(self,count,pointer,size):
+            self.extra=int(ctypes.cast(pointer,ctypes.POINTER(INPUT)).contents.mi.dwExtraInfo)
+            return 1
+    marker_bridge.user32=MarkerUser32()
+    marker_bridge._send(1)
+    check("SendInput写入专属标记",marker_bridge.user32.extra==INPUT_EXTRA_INFO)
     stop=threading.Event()
     isolation=StrictInputIsolation(stop)
     before=isolation.can_automate()
     isolation.signal("keyboard",time.time())
-    check("人工输入后禁止自动输入",before and stop.is_set() and not isolation.can_automate())
+    check("人工输入后自动化锁定",before and stop.is_set() and not isolation.can_automate())
     fake_bridge=object.__new__(WinBridge)
     fake_bridge.input_lock=threading.RLock()
     fake_bridge.input_blocked=False
@@ -6506,33 +8022,221 @@ def run_self_test(path=None):
         blocked=False
     except InputStopped:
         blocked=True
-    check("人工输入后无新SendInput",blocked and fake_bridge.user32.sent==0)
-    class FakeResource:
+    check("锁定后无新鼠标按下",blocked and fake_bridge.user32.sent==0)
+    release_bridge=object.__new__(WinBridge)
+    release_bridge.input_lock=threading.RLock()
+    release_bridge.input_blocked=True
+    release_bridge.input_stop_event=None
+    release_bridge.held={"left","middle","right"}
+    class ReleaseUser32:
         def __init__(self):
-            self.running=True
-        def stop(self,timeout=0.0):
-            self.running=False
-            return True
-        def alive(self):
-            return self.running
-    resources={name:FakeResource() for name in ("FrameBuffer","KeyboardHook","MouseHook","CaptureProcess")}
-    barrier=ResourceShutdownBarrier("自检",0.5)
-    for name,resource in resources.items():
-        barrier.add(name,resource.stop,resource.alive)
-    barrier.request_stop()
-    check("模式结束资源无存活",barrier.poll() and not barrier.pending_names() and not any(resource.alive() for resource in resources.values()))
-    if tree is not None:
-        for class_name in ("KeyboardMonitor","MouseMonitor"):
-            node=class_map.get(class_name)
-            segment=ast.get_source_segment(text,node) if node is not None else ""
-            check(class_name+"回调轻量",all(fragment not in segment for fragment in ("block_input(","release_all_buttons(","self.app.ui(","on_other(","on_input(")))
-    check("关闭期限已使用","shutdown_deadline=time.monotonic()+8.0" in text and "deadline_reached" in text)
-    check("ESC主线程轮询","poll_global_escape" in app_methods and "self.root.after(35,self.poll_global_escape)" in text)
-    check("危险验收样本阈值","positive_total>=50" in text and "negative_total>=50" in text and "holdout_count>=150" in text)
+            self.calls=0
+        def SendInput(self,count,pointer,size):
+            self.calls+=1
+            return 1
+    release_bridge.user32=ReleaseUser32()
+    release_bridge.release_all_buttons()
+    check("异常退出释放三键",not release_bridge.held and release_bridge.user32.calls>=3)
+    keyboard=KeyboardMonitor(None)
+    keyboard.pressed_non_escape.update({65,66})
+    keyboard.pressed_non_escape.discard(65)
+    one_still_pressed=not keyboard.all_released()
+    keyboard.pressed_non_escape.discard(66)
+    check("键盘多键集合状态",one_still_pressed and keyboard.all_released())
+    lazy=object.__new__(WinBridge)
+    lazy.wgc_lock=threading.RLock()
+    lazy.wgc=None
+    lazy.wgc_error="尚未初始化"
+    original_wgc=globals()["WindowsGraphicsCapture"]
+    class BrokenWGC:
+        def __init__(self,bridge):
+            raise RuntimeError("forced")
+    globals()["WindowsGraphicsCapture"]=BrokenWGC
+    try:
+        try:
+            lazy.get_wgc()
+            lazy_failed=False
+        except CaptureUnavailable:
+            lazy_failed=True
+    finally:
+        globals()["WindowsGraphicsCapture"]=original_wgc
+    lazy.other_backend=lambda:"ok"
+    check("WGC失败不破坏其他后端",lazy_failed and lazy.wgc is None and "不可用" in lazy.wgc_status() and lazy.other_backend()=="ok")
+    review_api=ReviewProcessApi()
+    check("复习路径SendInput恒零",not hasattr(review_api,"SendInput") and not hasattr(review_api,"_send"))
+    fake=object.__new__(WinBridge)
+    state={"pid":101,"thread":7,"class":"GameWnd","path":"c:\\game.exe","created":123,"integrity":8192,"dpi":96,"rect":(10,20,800,600),"title":"Game"}
+    fake.valid=lambda hwnd:True
+    fake.window_thread_pid=lambda hwnd:(state["thread"],state["pid"])
+    fake.class_name=lambda hwnd:state["class"]
+    fake.process_identity_for_pid=lambda pid:{"path":state["path"],"created":state["created"],"integrity":state["integrity"]}
+    fake.foreground_hwnd=lambda:1
+    fake.window_title=lambda hwnd:state["title"]
+    fake.client_rect=lambda hwnd:state["rect"]
+    fake.dpi_for_window=lambda hwnd:state["dpi"]
+    class IdentityUser32:
+        def IsIconic(self,hwnd):
+            return False
+    fake.user32=IdentityUser32()
+    expected={"hwnd":1,"pid":101,"window_thread_id":7,"class":"GameWnd","process_path":"c:\\game.exe","process_created":123,"integrity":8192,"client_size":[800,600],"selected_dpi":96,"title_rule":{"mode":"none","value":""},"content_rect_norm":[0.0,0.0,0.8,1.0],"content_aspect":640/600}
+    base_ok=fake.validate_target(expected,True)==(10,20,640,600)
+    state["title"]="Game | FPS 60 | Server A"
+    title_ok=fake.validate_target(expected,True)==(10,20,640,600)
+    state["rect"]=(50,60,800,600)
+    moved_ok=fake.validate_target(expected,True)==(50,60,640,600)
+    state["dpi"]=120
+    try:
+        fake.validate_target(expected,True)
+        dpi_rejected=False
+    except TargetUnavailable:
+        dpi_rejected=True
+    state["dpi"]=96
+    state["pid"]=102
+    try:
+        fake.validate_target(expected,True)
+        pid_rejected=False
+    except TargetUnavailable:
+        pid_rejected=True
+    state["pid"]=101
+    state["created"]=124
+    try:
+        fake.validate_target(expected,True)
+        restart_rejected=False
+    except TargetUnavailable:
+        restart_rejected=True
+    state["created"]=123
+    state["path"]="c:\\other.exe"
+    try:
+        fake.validate_target(expected,True)
+        path_rejected=False
+    except TargetUnavailable:
+        path_rejected=True
+    state["path"]="c:\\game.exe"
+    state["rect"]=(50,60,900,600)
+    try:
+        fake.validate_target(expected,True)
+        ratio_rejected=False
+    except TargetUnavailable:
+        ratio_rejected=True
+    check("标题变化不中断且身份内容变化拒绝",base_ok and title_ok and moved_ok and dpi_rejected and pid_rejected and restart_rejected and path_rejected and ratio_rejected)
+    content=apply_normalized_rect((0,0,1000,600),(0.0,0.0,0.8,1.0))
+    check("工具栏排除与移动归一化",content==(0,0,800,600) and not (content[0]<=900<content[0]+content[2]))
+    profile={"goal":"test","allowed_families":["no_op","click|left"],"max_consecutive_failures":2,"exploration_enabled":False,"restart_action":None,"success_states":[],"failure_states":[],"success_reward":1.0,"failure_reward":-1.0,"step_penalty":-0.01,"updated":1.0}
+    binding={"process_paths":["c:\\game.exe"],"window_classes":["GameWnd"],"content_rect_norms":[[0.0,0.0,0.8,1.0]],"content_aspect_min":640/600,"content_aspect_max":640/600,"dpi_min":96,"dpi_max":96,"capture_methods":["wgc"],"window_rule_version":WINDOW_RULE_VERSION,"capture_backend_version":CAPTURE_BACKEND_VERSION}
+    class BindingApi:
+        def __init__(self):
+            self.path="c:\\game.exe"
+        def target_identity(self,target):
+            return {**target,"process_path":self.path,"class":"GameWnd","content_rect_norm":[0.0,0.0,0.8,1.0],"dpi":96,"selected_dpi":96}
+        def validate_target(self,target,foreground):
+            return (0,0,640,600)
+    binding_api=BindingApi()
+    fake_app=object.__new__(App)
+    fake_app.api=binding_api
+    fake_app.store=type("BindingStore",(),{"load_game_profile":lambda self,gid:dict(profile)})()
+    fake_app.selected_game={"id":"g"}
+    fake_app.require_game=lambda:{"id":"g"}
+    binding_model={"model_binding":binding,"safety_profile_checksum":profile_checksum(profile)}
+    binding_ok=App.validate_model_binding(fake_app,binding_model,{"hwnd":1})
+    binding_api.path="c:\\changed.exe"
+    try:
+        App.validate_model_binding(fake_app,binding_model,{"hwnd":1})
+        binding_rejected=False
+    except RuntimeError:
+        binding_rejected=True
+    check("模型窗口安全快照绑定",binding_ok and binding_rejected)
+    split_app=type("SplitApp",(),{"should_stop":lambda self:False})()
+    controller=ReviewController(split_app)
+    sample_action_a=normalize_action({"kind":"click","button":"left","path":[[0.1,0.1]],"duration":0.08})
+    sample_action_b=normalize_action({"kind":"click","button":"left","path":[[0.9,0.9]],"duration":0.08})
+    def visual_pattern(descending):
+        plane=bytearray()
+        for y in range(FEATURE_H):
+            for x in range(FEATURE_W):
+                plane.append(20+(FEATURE_W-1-x if descending else x)*3)
+        return bytes(plane)*FEATURE_CHANNELS
+    samples=[]
+    for session,descending,start in (("s1",False,0),("s2",True,200)):
+        feature=visual_pattern(descending)
+        for action,offset in ((sample_action_a,0),(sample_action_b,100)):
+            for index in range(90):
+                samples.append({"session_id":session,"capture_method":"wgc","a":action,"checksum":session+"-"+str(start+offset+index),"created":start+offset+index,"f":feature,"coarse":coarse_feature(feature),"context":{}})
+    train,holdout,split=controller.split(samples)
+    train_sessions={controller.session_of(item) for item in train}
+    holdout_sessions={controller.session_of(item) for item in holdout}
+    visual_overlap={visual_perceptual_hash(item["f"]) for item in train}&{visual_perceptual_hash(item["f"]) for item in holdout}
+    check("训练留出按session与视觉近重复组隔离",bool(train and holdout) and not train_sessions.intersection(holdout_sessions) and not checksum_set(train).intersection(checksum_set(holdout)) and not visual_overlap and split.get("mode")=="session_family_backend_visual_group")
+    policy=TaskAgentPolicy({"allowed_families":["click|left"],"max_consecutive_failures":2,"success_states":[visual_perceptual_hash(visual_pattern(False))],"failure_states":[visual_perceptual_hash(visual_pattern(True))]})
+    allowed=policy.allowed_action(sample_action_a) and not policy.allowed_action({"kind":"click","button":"right","path":[[0.5,0.5]],"duration":0.08})
+    failure_one=policy.register(visual_pattern(False),sample_action_a,visual_pattern(True),True)
+    failure_two=policy.register(visual_pattern(True),sample_action_a,visual_pattern(True),False)
+    check("任务白名单成功失败与连续停机",allowed and failure_one["state"]=="failure" and not failure_one["stop"] and failure_two["stop"])
+    cache=BoundedLRU(32)
+    for index in range(200):
+        cache[index]=index
+    check("复习距离缓存硬上限",len(cache)<=32)
+    with tempfile.TemporaryDirectory() as folder:
+        store=DataStore(folder)
+        try:
+            g1={"id":"g1","name":"游戏一","created":1.0,"needs_review":False,"last_review":None}
+            g2={"id":"g2","name":"游戏二","created":2.0,"needs_review":False,"last_review":None}
+            store.replace_games([g1,g2],"g1")
+            valid_feature=bytes([1])*FEATURE_LEN
+            valid_action=json.dumps(sample_action_a,ensure_ascii=False,separators=(",",":"))
+            with store.lock,store.db:
+                store.db.execute("INSERT INTO samples(game_id,created,kind,action_signature,action_family,repeat_policy,feature_algorithm_version,action_algorithm_version,feature,coarse,action,source,session_id,capture_method,context,thumbnail,weight,fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",("g1",1.0,"click",action_signature(sample_action_a),action_family_key(sample_action_a),"one_shot",FEATURE_ALGORITHM_VERSION,ACTION_ALGORITHM_VERSION,sqlite3.Binary(zlib.compress(valid_feature)),sqlite3.Binary(coarse_feature(valid_feature)),valid_action,"learn","s1","wgc","{}",None,1.0,"valid"))
+                store.db.execute("INSERT INTO samples(game_id,created,kind,action_signature,action_family,repeat_policy,feature_algorithm_version,action_algorithm_version,feature,coarse,action,source,session_id,capture_method,context,thumbnail,weight,fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",("g1",2.0,"click",action_signature(sample_action_a),action_family_key(sample_action_a),"one_shot",FEATURE_ALGORITHM_VERSION,ACTION_ALGORITHM_VERSION,sqlite3.Binary(b"bad"),sqlite3.Binary(coarse_feature(valid_feature)),valid_action,"learn","s1","wgc","{}",None,1.0,"corrupt"))
+                store.db.execute("INSERT INTO models VALUES(?,?,?,?,?,?,?,?)",("g1","complete",1.0,1.0,1,"{}",sqlite3.Binary(b"x"),"x"))
+                store.db.execute("INSERT INTO model_backups(game_id,created,prototype_count,validation,payload,checksum) VALUES(?,?,?,?,?,?)",("g1",1.0,1,"{}",sqlite3.Binary(b"x"),"x"))
+                store.db.execute("INSERT INTO rejections(game_id,created,feature_algorithm_version,feature,coarse,thumbnail,candidates,source,session_id,capture_method) VALUES(?,?,?,?,?,?,?,?,?,?)",("g1",1.0,FEATURE_ALGORITHM_VERSION,sqlite3.Binary(zlib.compress(valid_feature)),sqlite3.Binary(coarse_feature(valid_feature)),None,"[]","test","s1","wgc"))
+            store.save_game_profile("g1",profile)
+            working=[dict(g1),dict(g2)]
+            working=[item for item in working if item["id"]!="g1"]
+            cancel_preserved=bool(store.db.execute("SELECT 1 FROM games WHERE id='g1'").fetchone()) and store.db.execute("SELECT COUNT(*) FROM samples WHERE game_id='g1'").fetchone()[0]==2
+            try:
+                store.replace_games([g2],"")
+                invalid_selection_rejected=False
+            except RuntimeError:
+                invalid_selection_rejected=True
+            loaded,stats=store.load_samples("g1")
+            quarantined=store.db.execute("SELECT COUNT(*) FROM corrupt_rows WHERE source_table='samples' AND game_id='g1'").fetchone()[0]==1 and stats["invalid"]==1
+            with store.pending_lock:
+                store.pending_samples.append({"gid":"g1","fingerprint":"pending-only"})
+            result=store.replace_games([g2],"g2")
+            cascade=not store.db.execute("SELECT 1 FROM games WHERE id='g1'").fetchone() and all(store.db.execute("SELECT COUNT(*) FROM "+table+" WHERE game_id='g1'").fetchone()[0]==0 for table in ("samples","models","model_backups","rejections","game_profiles"))
+            transactional=cancel_preserved and invalid_selection_rejected and quarantined and cascade and result["discarded_pending_samples"]==1 and store.selected_game()["id"]=="g2"
+        finally:
+            store.close(2.0)
+    check("游戏事务删除取消选择与级联清理",transactional)
+    with tempfile.TemporaryDirectory() as folder:
+        db_path=Path(folder)/"universal_game_ai.db"
+        connection=sqlite3.connect(str(db_path))
+        connection.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+        connection.execute("INSERT INTO meta VALUES('schema_version','1')")
+        connection.execute("CREATE TABLE games(id TEXT PRIMARY KEY,name TEXT NOT NULL COLLATE NOCASE UNIQUE,created REAL NOT NULL,needs_review INTEGER NOT NULL DEFAULT 0,last_review REAL)")
+        connection.execute("INSERT INTO games VALUES('g1','迁移游戏',1,0,NULL)")
+        connection.execute("CREATE TABLE samples(id INTEGER PRIMARY KEY AUTOINCREMENT,game_id TEXT NOT NULL,created REAL NOT NULL,kind TEXT NOT NULL,action_signature TEXT NOT NULL,feature BLOB NOT NULL,action TEXT NOT NULL,source TEXT NOT NULL,context TEXT NOT NULL,thumbnail BLOB,weight REAL NOT NULL DEFAULT 1.0,fingerprint TEXT NOT NULL)")
+        connection.execute("INSERT INTO samples(game_id,created,kind,action_signature,feature,action,source,context,weight,fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?)",("g1",1,"click","click|left|1|1",sqlite3.Binary(zlib.compress(bytes([0])*FEATURE_LEN)),json.dumps(sample_action_a),"learn","{}",1.0,"fp1"))
+        connection.execute("CREATE TABLE rejections(id INTEGER PRIMARY KEY AUTOINCREMENT,game_id TEXT NOT NULL,created REAL NOT NULL,feature BLOB NOT NULL,thumbnail BLOB,candidates TEXT NOT NULL,source TEXT NOT NULL)")
+        connection.commit()
+        connection.close()
+        store=DataStore(folder)
+        try:
+            game_name=store.db.execute("SELECT name FROM games WHERE id='g1'").fetchone()[0]
+            sample_count=store.db.execute("SELECT COUNT(*) FROM samples WHERE game_id='g1'").fetchone()[0]
+            version=store.db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        finally:
+            store.close(2.0)
+    check("数据库迁移保持样本和游戏名称",game_name=="迁移游戏" and sample_count==1 and int(version)==DATABASE_SCHEMA_VERSION)
+    payload=add_checksum({"version":FORMAT_VERSION,"items":[1,2,3]})
+    check("模型checksum行为",verify_checksum(payload) and not verify_checksum({**payload,"version":FORMAT_VERSION+1}))
+    check("模型不可变快照包含构建与算法",len(str(algorithm_snapshot().get("build_hash","")))==64 and algorithm_snapshot().get("thresholds")==VersionedThresholdConfig.snapshot())
+    check("freeze_support可调用",callable(multiprocessing.freeze_support))
     result={"status":"passed" if not failures else "failed","checks":checks,"failures":failures}
     sys.stdout.write(json.dumps(result,ensure_ascii=False,sort_keys=True,separators=(",",":"))+"\n")
     return 0 if not failures else 1
 def main():
+    multiprocessing.freeze_support()
     if "--self-test" in sys.argv:
         raise SystemExit(run_self_test())
     enable_dpi_awareness()
