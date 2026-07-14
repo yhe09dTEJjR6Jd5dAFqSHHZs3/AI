@@ -41,7 +41,8 @@ COARSE_LEN=COARSE_W*COARSE_H*FEATURE_CHANNELS
 SQUARED_DIFF=tuple(value*value for value in range(-255,256))
 FEATURE_ALGORITHM_VERSION=4
 ACTION_ALGORITHM_VERSION=6
-DATABASE_SCHEMA_VERSION=6
+DATABASE_SCHEMA_VERSION=7
+MODEL_SCHEMA_VERSION=1
 MAX_SAMPLES=1500
 MAX_PROTOTYPES=320
 SUPPORTED_BUTTONS={"left","right","middle"}
@@ -66,7 +67,8 @@ CAPTURE_BACKEND_VERSION=2
 RECOVERY_BACKUP_LIMIT=1024*1024*1024
 MIN_FREE_DISK=256*1024*1024
 class VersionedThresholdConfig:
-    version=1
+    version=2
+    required_sessions=2
     review_min_holdout=150
     review_min_accepted=150
     ordinary_min_positive=20
@@ -74,9 +76,17 @@ class VersionedThresholdConfig:
     dangerous_min_positive=50
     dangerous_min_negative=50
     dangerous_min_sessions=4
+    capture_min_holdout=20
+    capture_min_accuracy=0.80
+    capture_max_errors=0
+    scene_min_holdout=10
+    scene_min_accuracy=0.75
+    scene_max_errors=0
     minimum_coverage=0.80
     maximum_error_upper_95=0.02
     minimum_overall_accuracy=0.80
+    maximum_dangerous_false=0
+    maximum_uncovered_false_accept=0
     candidate_full_limit=18
     content_aspect_tolerance=0.015
     @classmethod
@@ -87,8 +97,45 @@ def current_build_hash():
         return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     except Exception:
         return ""
+def compatibility_signature():
+    return {"format_version":FORMAT_VERSION,"model_schema_version":MODEL_SCHEMA_VERSION,"feature_algorithm_version":FEATURE_ALGORITHM_VERSION,"action_algorithm_version":ACTION_ALGORITHM_VERSION,"feature_size":[FEATURE_W,FEATURE_H,FEATURE_CHANNELS],"coarse_size":[COARSE_W,COARSE_H,FEATURE_CHANNELS],"window_rule_version":WINDOW_RULE_VERSION,"capture_backend_version":CAPTURE_BACKEND_VERSION,"thresholds":VersionedThresholdConfig.snapshot()}
+def compatibility_signature_from_item(item):
+    if not isinstance(item,dict):
+        return None
+    direct=item.get("compatibility_signature")
+    if isinstance(direct,dict):
+        return direct
+    snapshot=item.get("algorithm_snapshot")
+    if not isinstance(snapshot,dict):
+        return None
+    nested=snapshot.get("compatibility_signature")
+    if isinstance(nested,dict):
+        return nested
+    legacy={key:snapshot.get(key) for key in ("format_version","feature_algorithm_version","action_algorithm_version","feature_size","coarse_size","window_rule_version","capture_backend_version","thresholds")}
+    legacy["model_schema_version"]=MODEL_SCHEMA_VERSION
+    return legacy
+def normalized_compatibility_signature(value):
+    if not isinstance(value,dict):
+        return None
+    result=dict(value)
+    result["model_schema_version"]=safe_int(result.get("model_schema_version",MODEL_SCHEMA_VERSION),MODEL_SCHEMA_VERSION)
+    thresholds=dict(result.get("thresholds")) if isinstance(result.get("thresholds"),dict) else {}
+    legacy_defaults={"required_sessions":2,"capture_min_holdout":20,"capture_min_accuracy":0.80,"capture_max_errors":0,"scene_min_holdout":10,"scene_min_accuracy":0.75,"scene_max_errors":0,"maximum_dangerous_false":0,"maximum_uncovered_false_accept":0}
+    for key,default in legacy_defaults.items():
+        thresholds.setdefault(key,default)
+    current=VersionedThresholdConfig.snapshot()
+    comparable=dict(thresholds)
+    comparable["version"]=current["version"]
+    if comparable==current:
+        thresholds=current
+    result["thresholds"]=thresholds
+    return result
 def algorithm_snapshot():
-    return {"format_version":FORMAT_VERSION,"feature_algorithm_version":FEATURE_ALGORITHM_VERSION,"action_algorithm_version":ACTION_ALGORITHM_VERSION,"feature_size":[FEATURE_W,FEATURE_H,FEATURE_CHANNELS],"coarse_size":[COARSE_W,COARSE_H,FEATURE_CHANNELS],"window_rule_version":WINDOW_RULE_VERSION,"capture_backend_version":CAPTURE_BACKEND_VERSION,"thresholds":VersionedThresholdConfig.snapshot(),"build_hash":current_build_hash()}
+    return {"compatibility_signature":compatibility_signature(),"source_build_hash":current_build_hash()}
+def evaluate_validation_thresholds(split_complete,session_count,holdout_count,accepted,coverage,overall_accuracy,error_upper_95,dangerous_false,uncovered_false_accept):
+    enough=bool(split_complete and int(session_count)>=VersionedThresholdConfig.required_sessions and int(holdout_count)>=VersionedThresholdConfig.review_min_holdout and int(accepted)>=VersionedThresholdConfig.review_min_accepted)
+    global_pass=bool(float(coverage)>=VersionedThresholdConfig.minimum_coverage and float(overall_accuracy)>=VersionedThresholdConfig.minimum_overall_accuracy and float(error_upper_95)<=VersionedThresholdConfig.maximum_error_upper_95 and int(dangerous_false)<=VersionedThresholdConfig.maximum_dangerous_false and int(uncovered_false_accept)<=VersionedThresholdConfig.maximum_uncovered_false_accept)
+    return enough,global_pass
 def own_injected_event(flags,extra_info,mask):
     return bool(int(flags)&int(mask) and int(extra_info)==INPUT_EXTRA_INFO)
 def normalized_rect(rect,container):
@@ -246,6 +293,20 @@ class ThreadLocalSQLite:
         return self
     def __exit__(self,exc_type,exc_value,exc_traceback):
         return self.current().__exit__(exc_type,exc_value,exc_traceback)
+    def close_current_thread(self):
+        key=threading.get_ident()
+        with self.lock:
+            connection=self.connections.pop(key,None)
+        if connection is None:
+            return False
+        try:
+            connection.close()
+            return True
+        except Exception:
+            return False
+    def connection_count(self):
+        with self.lock:
+            return len(self.connections)
     def close(self):
         with self.lock:
             values=list(self.connections.values())
@@ -372,7 +433,7 @@ class StrictInputIsolation:
         with self.lock:
             if not self.kind:
                 self.kind=str(kind)
-                self.stamp=float(time.time() if stamp is None else stamp)
+                self.stamp=float(time.monotonic() if stamp is None else stamp)
             if self.stop_event is not None:
                 self.stop_event.set()
     def tripped(self):
@@ -512,6 +573,25 @@ def verify_checksum(data):
     item=dict(data)
     item.pop("checksum",None)
     return hashlib.sha256(canonical_bytes(item)).hexdigest()==expected
+class LightweightLogger:
+    def __init__(self,path):
+        self.path=Path(path)
+        self.lock=threading.RLock()
+    def write(self,code,error=None,thread_name=None,mode=None,game_id=None,window_identity=None,details=None):
+        exception_type=type(error).__name__ if isinstance(error,BaseException) else ""
+        message=str(error) if error is not None else ""
+        stack=""
+        if isinstance(error,BaseException):
+            stack="".join(traceback.format_exception(type(error),error,error.__traceback__))[-6000:]
+        record={"time":time.time(),"code":str(code),"thread":str(thread_name or threading.current_thread().name),"mode":str(mode or ""),"game_id":str(game_id or ""),"window_identity":window_identity if isinstance(window_identity,dict) else {},"exception_type":exception_type,"message":message[:2000],"stack":stack,"details":details if isinstance(details,dict) else {}}
+        try:
+            self.path.parent.mkdir(parents=True,exist_ok=True)
+            line=json.dumps(record,ensure_ascii=False,separators=(",",":"))+"\n"
+            with self.lock,self.path.open("a",encoding="utf-8") as handle:
+                handle.write(line)
+            return True
+        except Exception:
+            return False
 def binomial_error_upper(errors,total,confidence=0.95):
     n=max(0,int(total))
     k=max(0,min(n,int(errors)))
@@ -1182,8 +1262,8 @@ class WindowsGraphicsCapture:
         geometry=tuple(client_rect)+tuple(window_rect)
         item=self._session(hwnd,geometry)
         frame=None
-        deadline=time.time()+0.45
-        while time.time()<deadline:
+        deadline=time.monotonic()+0.45
+        while time.monotonic()<deadline:
             candidate=ctypes.c_void_p()
             self._check(self._call(item["pool"],7,ctypes.c_long,[ctypes.POINTER(ctypes.c_void_p)],ctypes.byref(candidate)),"读取Windows Graphics Capture帧")
             if candidate.value:
@@ -2018,7 +2098,7 @@ class WinBridge:
         previous_rgb=bytes(value for pixel in previous for value in (pixel,pixel,pixel)) if previous is not None else None
         return self.feature_from_rgb(rgb,previous_rgb)
     def _features(self,rgb,key):
-        now=time.time()
+        now=time.monotonic()
         with self.frame_lock:
             history=self.previous_frames.setdefault(int(key),deque(maxlen=12))
             previous=None
@@ -2035,7 +2115,7 @@ class WinBridge:
             else:
                 self.previous_frames.pop(int(hwnd),None)
     def _health(self,hwnd,method,rgb):
-        now=time.time()
+        now=time.monotonic()
         digest=hashlib.sha256(rgb).digest()
         key=(int(hwnd),str(method),len(rgb))
         previous=self.capture_health.get(key)
@@ -2219,7 +2299,7 @@ class WinBridge:
             candidates=captured.get("validation_candidates")
             if not isinstance(candidates,list):
                 candidates=[{"method":captured.get("method"),"rgb":captured.get("rgb"),"quality":captured.get("quality",{}),"stale":captured.get("stale")}]
-            stamp=time.time()
+            stamp=time.monotonic()
             for candidate in candidates:
                 quality=candidate.get("quality",{}) if isinstance(candidate,dict) else {}
                 if not quality.get("valid"):
@@ -2446,13 +2526,15 @@ class KeyboardMonitor:
                     vk=int(data.vkCode)
                     is_escape=vk==0x1B
                     down=int(wparam) in {0x0100,0x0104}
-                    stamp=time.time()
+                    wall_time=time.time()
+                    monotonic_time=time.monotonic()
+                    stamp=monotonic_time
                     if is_escape:
                         first=down and not self.escape_down
                         self.escape_down=down
                         if first:
                             self.escape_event.set()
-                            self._put({"kind":"escape","down":True,"time":stamp,"injected":injected})
+                            self._put({"kind":"escape","down":True,"time":stamp,"wall_time":wall_time,"monotonic_time":monotonic_time,"injected":injected})
                     else:
                         with self.key_lock:
                             first=down and vk not in self.pressed_non_escape
@@ -2465,9 +2547,9 @@ class KeyboardMonitor:
                             if first:
                                 self.non_escape_count+=1
                             self.other_event.set()
-                            self._put({"kind":"other","down":True,"time":stamp,"vk":vk,"injected":injected})
+                            self._put({"kind":"other","down":True,"time":stamp,"wall_time":wall_time,"monotonic_time":monotonic_time,"vk":vk,"injected":injected})
                         else:
-                            self._put({"kind":"other","down":False,"time":stamp,"vk":vk,"injected":injected})
+                            self._put({"kind":"other","down":False,"time":stamp,"wall_time":wall_time,"monotonic_time":monotonic_time,"vk":vk,"injected":injected})
                             if not active:
                                 self.other_event.clear()
                 return self.bridge.user32.CallNextHookEx(self.hook,code,wparam,lparam)
@@ -2522,6 +2604,7 @@ class MouseMonitor:
         self.bridge=bridge
         self.events=queue.Queue(maxsize=6000)
         self.input_event=threading.Event()
+        self.state_lock=threading.RLock()
         self.held=set()
         self.thread=None
         self.thread_id=0
@@ -2531,6 +2614,8 @@ class MouseMonitor:
         self.error=None
         self.last_move=0.0
         self.last_input_time=0.0
+        self.generation=0
+        self.dropped_events=0
     def start(self):
         self.thread=threading.Thread(target=self._run,name="UniversalGameAI-MouseHook",daemon=True)
         self.thread.start()
@@ -2544,8 +2629,14 @@ class MouseMonitor:
     def _put(self,event):
         try:
             self.events.put_nowait(event)
+            return True
         except queue.Full:
-            pass
+            with self.state_lock:
+                self.dropped_events+=1
+                self.generation+=1
+                self.held.clear()
+            self.input_event.set()
+            return False
     def _run(self):
         try:
             self.thread_id=int(self.bridge.kernel32.GetCurrentThreadId())
@@ -2556,20 +2647,26 @@ class MouseMonitor:
                     injected=bool(int(data.flags)&0x00000003)
                     if own_injected_event(data.flags,data.dwExtraInfo,0x00000003):
                         return self.bridge.user32.CallNextHookEx(self.hook,code,wparam,lparam)
-                    stamp=time.time()
+                    wall_time=time.time()
+                    monotonic_time=time.monotonic()
                     kind=messages[int(wparam)]
-                    if kind!="move" or stamp-self.last_move>=0.018:
-                        if kind=="move":
-                            self.last_move=stamp
-                        event={"type":kind,"x":int(data.pt.x),"y":int(data.pt.y),"time":stamp,"injected":injected,"extra_info":int(data.dwExtraInfo)}
+                    with self.state_lock:
+                        should_emit=kind!="move" or monotonic_time-self.last_move>=0.018
+                        if should_emit and kind=="move":
+                            self.last_move=monotonic_time
+                    if should_emit:
+                        event={"type":kind,"x":int(data.pt.x),"y":int(data.pt.y),"time":monotonic_time,"wall_time":wall_time,"monotonic_time":monotonic_time,"injected":injected,"extra_info":int(data.dwExtraInfo)}
                         if kind in {"wheel","hwheel"}:
                             raw=(int(data.mouseData)>>16)&0xffff
                             event["delta"]=raw-0x10000 if raw&0x8000 else raw
-                        if kind.endswith("_down"):
-                            self.held.add(kind.split("_",1)[0])
-                        elif kind.endswith("_up"):
-                            self.held.discard(kind.split("_",1)[0])
-                        self.last_input_time=stamp
+                        with self.state_lock:
+                            if kind.endswith("_down"):
+                                self.held.add(kind.split("_",1)[0])
+                            elif kind.endswith("_up"):
+                                self.held.discard(kind.split("_",1)[0])
+                            self.last_input_time=monotonic_time
+                            self.generation+=1
+                            event["generation"]=self.generation
                         self.input_event.set()
                         self._put(event)
                 return self.bridge.user32.CallNextHookEx(self.hook,code,wparam,lparam)
@@ -2603,10 +2700,15 @@ class MouseMonitor:
         if self.events.empty():
             self.input_event.clear()
         return result
+    def snapshot(self):
+        with self.state_lock:
+            return {"held":frozenset(self.held),"last_input_time":self.last_input_time,"generation":self.generation,"dropped_events":self.dropped_events}
     def all_released(self):
-        return not self.held
+        with self.state_lock:
+            return not self.held
     def stable_for(self,seconds):
-        return not self.held and time.time()-self.last_input_time>=max(0.0,float(seconds))
+        with self.state_lock:
+            return not self.held and time.monotonic()-self.last_input_time>=max(0.0,float(seconds))
     def stop(self,timeout=1.0):
         if self.thread_id:
             try:
@@ -2714,7 +2816,8 @@ class FrameBuffer:
                         preview=preview_rgb_bytes(captured.get("preview_rgb"))
                         if preview is not None:
                             self.last_preview=(preview,safe_int(captured.get("preview_width",PREVIEW_W),PREVIEW_W),safe_int(captured.get("preview_height",PREVIEW_H),PREVIEW_H))
-                    stamp=time.time()
+                    stamp=time.monotonic()
+                    wall_time=time.time()
                     rgb=captured["rgb"]
                     gray=captured["gray"]
                     with self.lock:
@@ -2740,7 +2843,7 @@ class FrameBuffer:
                     confirmed=self.resume_confirmations<=0
                     if captured.get("capture_valid") and captured.get("backend_validated") and self.resume_confirmations>0:
                         self.resume_confirmations-=1
-                    frame={"time":stamp,"f":feature,"coarse":coarse_feature(feature),"gray":gray,"rgb":rgb,"preview_rgb":preview_rgb,"preview_width":preview_width,"preview_height":preview_height,"method":captured["method"],"quality":captured["quality"],"motion_valid":previous is not None,"rect":rect,"dpi":self.bridge.dpi_for_window(int(self.target["hwnd"])),"capture_valid":bool(captured.get("capture_valid")),"backend_validated":bool(captured.get("backend_validated")),"usable_for_learning":bool(captured.get("usable_for_learning") and confirmed),"usable_for_training":bool(captured.get("usable_for_training") and confirmed),"usable_for_teaching":bool(captured.get("usable_for_teaching") and confirmed),"stale":bool(captured.get("stale")),"stable_frame":bool(captured.get("stable_frame")),"black_frame":bool(captured.get("black_frame")),"protected_or_black":bool(captured.get("protected_or_black")),"capture_frozen":bool(captured.get("capture_frozen")),"frozen_backend":bool(captured.get("frozen_backend")),"backend_changed":bool(captured.get("backend_changed"))}
+                    frame={"time":stamp,"wall_time":wall_time,"monotonic_time":stamp,"f":feature,"coarse":coarse_feature(feature),"gray":gray,"rgb":rgb,"preview_rgb":preview_rgb,"preview_width":preview_width,"preview_height":preview_height,"method":captured["method"],"quality":captured["quality"],"motion_valid":previous is not None,"rect":rect,"dpi":self.bridge.dpi_for_window(int(self.target["hwnd"])),"capture_valid":bool(captured.get("capture_valid")),"backend_validated":bool(captured.get("backend_validated")),"usable_for_learning":bool(captured.get("usable_for_learning") and confirmed),"usable_for_training":bool(captured.get("usable_for_training") and confirmed),"usable_for_teaching":bool(captured.get("usable_for_teaching") and confirmed),"stale":bool(captured.get("stale")),"stable_frame":bool(captured.get("stable_frame")),"black_frame":bool(captured.get("black_frame")),"protected_or_black":bool(captured.get("protected_or_black")),"capture_frozen":bool(captured.get("capture_frozen")),"frozen_backend":bool(captured.get("frozen_backend")),"backend_changed":bool(captured.get("backend_changed"))}
                     with self.condition:
                         self.frames.append(frame)
                         self.sequence+=1
@@ -2760,7 +2863,7 @@ class FrameBuffer:
             except Exception:
                 pass
     def latest(self,before=None,max_age=0.6,purpose=None):
-        now=time.time()
+        now=time.monotonic()
         with self.lock:
             candidates=list(self.frames)
         if before is not None:
@@ -2779,11 +2882,11 @@ class FrameBuffer:
             for frame in reversed(self.frames):
                 if frame["time"]>float(stamp):
                     return dict(frame)
-        if time.time()-float(stamp)>max_wait_age:
+        if time.monotonic()-float(stamp)>max_wait_age:
             return None
         return None
     def snapshot(self,seconds=1.5):
-        cutoff=time.time()-max(0.1,float(seconds))
+        cutoff=time.monotonic()-max(0.1,float(seconds))
         with self.lock:
             return [dict(frame) for frame in self.frames if frame["time"]>=cutoff]
     def stop(self,wait=True,timeout=1.0):
@@ -3217,7 +3320,7 @@ class SessionSubmitter:
     def __init__(self,store,gid,session_id):
         self.store=store; self.gid=str(gid); self.session_id=str(session_id)
     def flush(self):
-        return self.store.flush_samples()
+        return self.store.sample_write_barrier()
 class ReviewDataFilter:
     def valid(self,sample):
         action=normalize_action(sample.get("a")); context=sample.get("context",{}); temporal=temporal_from_context(context); calibration=context.get("calibration",{}) if isinstance(context,dict) else {}
@@ -3477,6 +3580,7 @@ class TeachingController:
                 historical.append({"id":str(item.get("checksum",uuid.uuid4().hex)),"f":item["f"],"coarse":item.get("coarse") if isinstance(item.get("coarse"),(bytes,bytearray)) and len(item.get("coarse"))==COARSE_LEN else coarse_feature(item["f"]),"a":action,"cluster_id":"history|"+action_signature(action),"canonical_action_signature":action_signature(action),"repeat_policy":str(item.get("repeat_policy","one_shot")),"source":"sample"})
         calibration=app.ensure_capture_calibration(target,"请教")
         session_id="teach|"+uuid.uuid4().hex
+        app.store.begin_learning_session(game["id"],session_id)
         sources=[]
         for proto in prototypes:
             sources.append({"a":normalize_action(proto["a"]),"repeat_policy":str(proto.get("repeat_policy","one_shot")),"cluster_id":str(proto.get("cluster_id",""))})
@@ -3501,7 +3605,7 @@ class TeachingController:
             app.ask_counts={"saved":0,"duplicates":0,"skipped":0,"rejected":0}
             answer_queue=queue.Queue()
             app.ask_answer_queue=answer_queue
-            producer.request(deque(["<START>","<START>"],maxlen=4),time.time())
+            producer.request(deque(["<START>","<START>"],maxlen=4),time.monotonic())
             initial=None
             deadline=time.monotonic()+5.0
             while initial is None and time.monotonic()<deadline and not app.should_stop():
@@ -3510,7 +3614,7 @@ class TeachingController:
                     initial=packet
                 elif packet and packet.get("error"):
                     app.set_status("请教初始化等待画面："+str(packet["error"]))
-                    producer.request(deque(["<START>","<START>"],maxlen=4),time.time())
+                    producer.request(deque(["<START>","<START>"],maxlen=4),time.monotonic())
             if app.should_stop():
                 raise InputStopped("请教初始化已停止")
             if initial is None:
@@ -3531,7 +3635,7 @@ class TeachingController:
                     frame=command.get("frame") or {}
                     entry=command.get("entry") or {}
                     recent_actions=command.get("recent_actions") or ["<START>","<START>"]
-                    state_since=safe_float(command.get("state_since"),time.time())
+                    state_since=safe_float(command.get("state_since"),time.monotonic())
                     if kind=="skip":
                         app.ask_counts["skipped"]+=1
                         result={"saved":False,"action":None}
@@ -3565,13 +3669,13 @@ class TeachingController:
                         app.ui(lambda callback=callback,message=message:callback(None,message))
                     app.request_mode_stop("failed",message)
                     break
-        try:
-            app.store.flush_samples()
-        except Exception:
-            pass
+        status=app.lifecycle.snapshot()[3]
+        if status=="failed":
+            app.store.invalidate_learning_session(game["id"],session_id,app.lifecycle.snapshot()[4] or "teaching_failed")
+        else:
+            app.store.validate_learning_session(game["id"],session_id)
         counts=app.ask_counts if isinstance(app.ask_counts,dict) else {"saved":0,"duplicates":0,"skipped":0,"rejected":0}
         summary="请教已结束：已保存"+str(counts.get("saved",0))+"，重复未保存"+str(counts.get("duplicates",0))+"，跳过"+str(counts.get("skipped",0))+"，拒绝记录"+str(counts.get("rejected",0))+"；模型需要复习"
-        status=app.lifecycle.snapshot()[3]
         if status=="failed":
             return ModeResult("failed",app.lifecycle.snapshot()[4] or summary)
         return ModeResult(status if status in {"completed","stopped"} else "stopped",summary,{"samples":stats.get("valid",0)})
@@ -3584,6 +3688,7 @@ class DataStore:
         if int(usage.free)<MIN_FREE_DISK:
             raise RuntimeError("剩余磁盘空间不足256MB，拒绝启动以避免数据库损坏")
         self.db_path=self.base/"universal_game_ai.db"
+        self.logger=LightweightLogger(self.base/"runtime_errors.jsonl")
         self.lock=threading.RLock()
         self.pending_lock=threading.RLock()
         self.writer_condition=threading.Condition(self.pending_lock)
@@ -3595,9 +3700,13 @@ class DataStore:
         self.corrupt_backup=None
         self.invalid_rows=defaultdict(int)
         self.pending_samples=[]
+        self.writer_inflight=0
+        self.blocked_game_ids=set()
+        self.blocked_sessions=set()
         self.pending_event=threading.Event()
         self.writer_stop=threading.Event()
         self.writer_error=None
+        self.writer_before_commit=None
         self.writer_error_callback=None
         self.writer_thread=None
         self.writer_db=None
@@ -3623,12 +3732,14 @@ class DataStore:
     def set_writer_error_callback(self,callback):
         self.writer_error_callback=callback
     def _notify_writer_error(self,value):
+        if value:
+            self.logger.write("SAMPLE_WRITER_ERROR_STATE",details={"writer_error":str(value)})
         callback=self.writer_error_callback
         if callback is not None:
             try:
                 callback(value)
-            except Exception:
-                pass
+            except Exception as error:
+                self.logger.write("SAMPLE_WRITER_CALLBACK_FAILED",error)
     def _ensure_writable(self):
         if self.read_only:
             raise RuntimeError(self.read_only_reason or "数据库处于只读恢复模式")
@@ -3651,13 +3762,13 @@ class DataStore:
             if total>RECOVERY_BACKUP_LIMIT:
                 shutil.rmtree(folder,ignore_errors=True)
     def light_checkpoint(self):
-        self.flush_samples()
+        self.sample_write_barrier()
         with self.lock:
             try:
                 self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")
                 self.db.execute("PRAGMA optimize")
-            except Exception:
-                pass
+            except Exception as error:
+                self.logger.write("DATABASE_LIGHT_CHECKPOINT_FAILED",error)
     def default_game_profile(self):
         return {"goal":"模仿已学习的鼠标操作并在不确定时停止","allowed_families":["no_op","click|left","move","hover","scroll_v|1","scroll_v|-1"],"max_consecutive_failures":3,"exploration_enabled":False,"restart_action":None,"success_states":[],"failure_states":[],"success_reward":1.0,"failure_reward":-1.0,"step_penalty":-0.01,"updated":0.0}
     def load_game_profile(self,gid):
@@ -3671,8 +3782,8 @@ class DataStore:
                     value=json.loads(raw)
                     if isinstance(value,dict):
                         profile.update(value)
-        except Exception:
-            pass
+        except Exception as error:
+            self.logger.write("GAME_PROFILE_LOAD_FAILED",error,game_id=gid)
         return profile
     def save_game_profile(self,gid,profile):
         self._ensure_writable()
@@ -3700,8 +3811,8 @@ class DataStore:
         try:
             with self.lock,self.db:
                 self.db.execute("INSERT OR IGNORE INTO corrupt_rows(source_table,source_id,game_id,created,reason,payload) VALUES(?,?,?,?,?,?)",(str(table_name),safe_int(row_id,0),str(game_id),time.time(),str(reason)[:2000],str(payload)[:16000]))
-        except Exception:
-            pass
+        except Exception as error:
+            self.logger.write("CORRUPT_ROW_QUARANTINE_FAILED",error,game_id=game_id,details={"table":str(table_name),"row_id":safe_int(row_id,0)})
     @contextmanager
     def critical_transaction(self):
         self._ensure_writable()
@@ -3711,14 +3822,81 @@ class DataStore:
             try:
                 yield
                 self.db.commit()
-            except Exception:
+            except Exception as error:
                 self.db.rollback()
+                self.logger.write("DATABASE_CRITICAL_TRANSACTION_FAILED",error)
                 raise
             finally:
                 self.db.execute("PRAGMA synchronous=NORMAL")
+    def close_current_thread(self):
+        return self.db.close_current_thread() if self.db is not None else False
+    def connection_count(self):
+        return self.db.connection_count() if self.db is not None else 0
+    def log_error(self,code,error=None,mode=None,game_id=None,window_identity=None,details=None):
+        return self.logger.write(code,error,mode=mode,game_id=game_id,window_identity=window_identity,details=details)
+    def begin_learning_session(self,gid,session_id,started=None):
+        self._ensure_writable()
+        game_id=str(gid)
+        sid=str(session_id)
+        stamp=float(time.time() if started is None else started)
+        with self.pending_lock:
+            self.blocked_sessions.discard((game_id,sid))
+        with self.critical_transaction():
+            if not self.db.execute("SELECT 1 FROM games WHERE id=?",(game_id,)).fetchone():
+                raise RuntimeError("游戏不存在")
+            self.db.execute("INSERT INTO learning_sessions(game_id,session_id,status,started,finished,invalid_reason) VALUES(?,?,'staging',?,NULL,'') ON CONFLICT(game_id,session_id) DO UPDATE SET status='staging',started=excluded.started,finished=NULL,invalid_reason=''",(game_id,sid,stamp))
+        return sid
+    def learning_session_status(self,gid,session_id):
+        with self.lock:
+            row=self.db.execute("SELECT status,started,finished,invalid_reason FROM learning_sessions WHERE game_id=? AND session_id=?",(str(gid),str(session_id))).fetchone()
+        return dict(row) if row else None
+    def invalidate_learning_session(self,gid,session_id,reason="invalid",finished=None):
+        self._ensure_writable()
+        game_id=str(gid)
+        sid=str(session_id)
+        stamp=float(time.time() if finished is None else finished)
+        with self.pending_lock:
+            self.blocked_sessions.add((game_id,sid))
+        with self.critical_transaction():
+            cursor=self.db.execute("UPDATE learning_sessions SET status='invalid',finished=?,invalid_reason=? WHERE game_id=? AND session_id=?",(stamp,str(reason)[:2000],game_id,sid))
+            if int(cursor.rowcount or 0)==0:
+                self.db.execute("INSERT INTO learning_sessions(game_id,session_id,status,started,finished,invalid_reason) VALUES(?,?,'invalid',?,?,?)",(game_id,sid,stamp,stamp,str(reason)[:2000]))
+        return True
+    def validate_learning_session(self,gid,session_id,finished=None):
+        game_id=str(gid)
+        sid=str(session_id)
+        with self.pending_lock:
+            self.blocked_sessions.add((game_id,sid))
+            self.writer_condition.notify_all()
+        self.sample_write_barrier()
+        stamp=float(time.time() if finished is None else finished)
+        with self.critical_transaction():
+            row=self.db.execute("SELECT status FROM learning_sessions WHERE game_id=? AND session_id=?",(game_id,sid)).fetchone()
+            if not row:
+                raise RuntimeError("学习session不存在")
+            if str(row["status"])=="invalid":
+                raise RuntimeError("无效学习session不能提交为valid")
+            self.db.execute("UPDATE learning_sessions SET status='valid',finished=?,invalid_reason='' WHERE game_id=? AND session_id=?",(stamp,game_id,sid))
+        return True
+    def _ensure_sample_session(self,gid,session_id,created):
+        game_id=str(gid)
+        sid=str(session_id)
+        with self.lock:
+            row=self.db.execute("SELECT status FROM learning_sessions WHERE game_id=? AND session_id=?",(game_id,sid)).fetchone()
+            if row:
+                if str(row["status"])=="invalid":
+                    raise RuntimeError("无效session拒绝接收样本")
+                return str(row["status"])
+            if sid.startswith("learn|"):
+                raise RuntimeError("学习session未进入staging状态")
+            with self.db:
+                self.db.execute("INSERT INTO learning_sessions(game_id,session_id,status,started,finished,invalid_reason) VALUES(?,?,'valid',?,?,'automatic_non_learning_session')",(game_id,sid,float(created),float(created)))
+            return "valid"
     def _raise_writer_error(self):
-        if self.writer_error:
-            raise RuntimeError("样本批量写入失败："+str(self.writer_error))
+        with self.pending_lock:
+            error=self.writer_error
+        if error:
+            raise RuntimeError("样本批量写入失败："+str(error))
     def _flush_pending(self,connection):
         self._ensure_writable()
         with self.pending_lock:
@@ -3728,59 +3906,81 @@ class DataStore:
                 return 0
             batch=self.pending_samples
             self.pending_samples=[]
+            self.writer_inflight+=1
             self.pending_event.clear()
             rows=[item["row"] for item in batch]
             review_games=sorted({item["gid"] for item in batch if item.get("mark_review")})
         last_error=None
-        for attempt in range(5):
-            try:
-                with connection:
-                    connection.executemany("INSERT OR IGNORE INTO samples(game_id,created,kind,action_signature,action_family,repeat_policy,feature_algorithm_version,action_algorithm_version,feature,coarse,action,source,session_id,capture_method,context,thumbnail,weight,fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",rows)
-                    for gid in review_games:
-                        connection.execute("UPDATE games SET needs_review=1 WHERE id=?",(gid,))
-                if self.writer_error is not None:
+        success=False
+        recovered=False
+        try:
+            hook=self.writer_before_commit
+            if hook is not None:
+                hook(batch)
+            for attempt in range(5):
+                try:
+                    with connection:
+                        connection.executemany("INSERT OR IGNORE INTO samples(game_id,created,kind,action_signature,action_family,repeat_policy,feature_algorithm_version,action_algorithm_version,feature,coarse,action,source,session_id,capture_method,context,thumbnail,weight,fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",rows)
+                        for gid in review_games:
+                            connection.execute("UPDATE games SET needs_review=1 WHERE id=?",(gid,))
+                    success=True
+                    break
+                except sqlite3.OperationalError as error:
+                    last_error=error
+                    text_error=str(error).lower()
+                    if "locked" not in text_error and "busy" not in text_error:
+                        break
+                    if self.writer_stop.wait(min(1.2,0.05*(2**attempt))):
+                        break
+                except Exception as error:
+                    last_error=error
+                    break
+        finally:
+            with self.pending_lock:
+                self.writer_inflight=max(0,self.writer_inflight-1)
+                if success:
+                    recovered=self.writer_error is not None
                     self.writer_error=None
-                    self._notify_writer_error(None)
-                with self.pending_lock:
-                    self.writer_condition.notify_all()
-                return len(batch)
-            except sqlite3.OperationalError as error:
-                last_error=error
-                text_error=str(error).lower()
-                if "locked" not in text_error and "busy" not in text_error:
-                    break
-                if self.writer_stop.wait(min(1.2,0.05*(2**attempt))):
-                    break
-            except Exception as error:
-                last_error=error
-                break
-        with self.pending_lock:
-            self.pending_samples=batch+self.pending_samples
-            self.pending_event.set()
-            self.writer_condition.notify_all()
-        self.writer_error="".join(traceback.format_exception_only(type(last_error),last_error)).strip() if last_error is not None else "未知写入错误"
-        self._notify_writer_error(self.writer_error)
-        raise RuntimeError(self.writer_error)
-    def flush_samples(self):
+                else:
+                    self.pending_samples=batch+self.pending_samples
+                    self.pending_event.set()
+                    self.writer_error="".join(traceback.format_exception_only(type(last_error),last_error)).strip() if last_error is not None else "未知写入错误"
+                self.writer_condition.notify_all()
+        if success:
+            if recovered:
+                self._notify_writer_error(None)
+            return len(batch)
+        error_text=self.writer_error or "未知写入错误"
+        self.logger.write("SAMPLE_WRITER_COMMIT_FAILED",last_error,details={"batch_size":len(batch),"writer_error":error_text})
+        self._notify_writer_error(error_text)
+        raise RuntimeError(error_text)
+    def flush_samples(self,timeout=5.0):
         if self.read_only:
             with self.pending_lock:
-                if self.pending_samples:
+                if self.pending_samples or self.writer_inflight:
                     self._ensure_writable()
             return 0
+        deadline=time.monotonic()+max(0.1,float(timeout))
         with self.pending_lock:
-            if not self.pending_samples:
-                self._raise_writer_error()
-                return 0
-            initial=len(self.pending_samples)
-            self.pending_event.set()
-            deadline=time.monotonic()+5.0
-            while self.pending_samples and not self.writer_error and time.monotonic()<deadline:
-                self.writer_condition.wait(min(0.2,max(0.0,deadline-time.monotonic())))
+            initial=len(self.pending_samples)+self.writer_inflight
             if self.pending_samples:
-                self._raise_writer_error()
-                raise RuntimeError("样本写线程在5秒内未完成提交")
-            self._raise_writer_error()
-            return initial
+                self.pending_event.set()
+            while True:
+                empty=not self.pending_samples and self.writer_inflight==0
+                if empty and not self.writer_error:
+                    return initial
+                if self.writer_thread is not None and not self.writer_thread.is_alive():
+                    detail="；最后错误："+str(self.writer_error) if self.writer_error else ""
+                    raise RuntimeError("样本写线程已停止，写入屏障无法完成"+detail)
+                remaining=deadline-time.monotonic()
+                if remaining<=0:
+                    detail="，最后错误"+str(self.writer_error) if self.writer_error else ""
+                    raise RuntimeError("样本写线程在限定时间内未完成提交，待处理"+str(len(self.pending_samples))+"，提交中"+str(self.writer_inflight)+detail)
+                if self.pending_samples:
+                    self.pending_event.set()
+                self.writer_condition.wait(min(0.2,remaining))
+    def sample_write_barrier(self,timeout=5.0):
+        return self.flush_samples(timeout)
     def _writer_loop(self):
         connection=sqlite3.connect(str(self.db_path),timeout=3.0,check_same_thread=False)
         connection.row_factory=sqlite3.Row
@@ -3790,29 +3990,41 @@ class DataStore:
         connection.execute("PRAGMA busy_timeout=3000")
         self.writer_db=connection
         try:
-            while not self.writer_stop.is_set():
+            while True:
                 self.pending_event.wait(0.35)
                 with self.pending_lock:
                     empty=not self.pending_samples
-                if self.writer_stop.is_set() and empty:
+                    stopping=self.writer_stop.is_set()
+                if stopping and empty:
                     break
+                if empty:
+                    continue
                 try:
                     self._flush_pending(connection)
                 except Exception:
                     if self.writer_stop.wait(0.8):
-                        break
+                        with self.pending_lock:
+                            if not self.pending_samples:
+                                break
             with self.pending_lock:
                 pending=bool(self.pending_samples)
             if pending:
                 try:
                     self._flush_pending(connection)
-                except Exception:
-                    pass
+                except Exception as error:
+                    self.logger.write("SAMPLE_WRITER_FINAL_FLUSH_FAILED",error)
+        except Exception as error:
+            with self.pending_lock:
+                if not self.writer_error:
+                    self.writer_error=str(error)
+                self.writer_condition.notify_all()
+            self.logger.write("SAMPLE_WRITER_THREAD_FAILED",error)
+            self._notify_writer_error(self.writer_error)
         finally:
             try:
                 connection.close()
-            except Exception:
-                pass
+            except Exception as error:
+                self.logger.write("SAMPLE_WRITER_CONNECTION_CLOSE_FAILED",error)
             self.writer_db=None
             with self.pending_lock:
                 self.writer_condition.notify_all()
@@ -3826,6 +4038,8 @@ class DataStore:
         self.db.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS config_backups(id INTEGER PRIMARY KEY AUTOINCREMENT,created REAL NOT NULL,payload TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS games(id TEXT PRIMARY KEY,name TEXT NOT NULL COLLATE NOCASE UNIQUE,created REAL NOT NULL,needs_review INTEGER NOT NULL DEFAULT 0,last_review REAL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS learning_sessions(game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,session_id TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('staging','valid','invalid')),started REAL NOT NULL,finished REAL,invalid_reason TEXT NOT NULL DEFAULT '',PRIMARY KEY(game_id,session_id))")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_learning_sessions_game_status ON learning_sessions(game_id,status,started)")
         self.db.execute("CREATE TABLE IF NOT EXISTS samples(id INTEGER PRIMARY KEY AUTOINCREMENT,game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,created REAL NOT NULL,kind TEXT NOT NULL,action_signature TEXT NOT NULL,action_family TEXT NOT NULL,repeat_policy TEXT NOT NULL,feature_algorithm_version INTEGER NOT NULL,action_algorithm_version INTEGER NOT NULL,feature BLOB NOT NULL,coarse BLOB NOT NULL,action TEXT NOT NULL,source TEXT NOT NULL,session_id TEXT NOT NULL,capture_method TEXT NOT NULL,context TEXT NOT NULL,thumbnail BLOB,weight REAL NOT NULL DEFAULT 1.0,fingerprint TEXT NOT NULL,UNIQUE(game_id,fingerprint))")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_samples_game_kind_created ON samples(game_id,kind,created)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_samples_game_session ON samples(game_id,session_id)")
@@ -3897,6 +4111,11 @@ class DataStore:
                         self.db.execute("CREATE TABLE IF NOT EXISTS game_profiles(game_id TEXT PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE,updated REAL NOT NULL,payload TEXT NOT NULL,checksum TEXT NOT NULL)")
                         self.db.execute("CREATE TABLE IF NOT EXISTS corrupt_rows(id INTEGER PRIMARY KEY AUTOINCREMENT,source_table TEXT NOT NULL,source_id INTEGER NOT NULL,game_id TEXT NOT NULL,created REAL NOT NULL,reason TEXT NOT NULL,payload TEXT NOT NULL,UNIQUE(source_table,source_id))")
                         version=6
+                    elif version==6:
+                        self.db.execute("CREATE TABLE IF NOT EXISTS learning_sessions(game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,session_id TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('staging','valid','invalid')),started REAL NOT NULL,finished REAL,invalid_reason TEXT NOT NULL DEFAULT '',PRIMARY KEY(game_id,session_id))")
+                        self.db.execute("CREATE INDEX IF NOT EXISTS idx_learning_sessions_game_status ON learning_sessions(game_id,status,started)")
+                        self.db.execute("INSERT OR IGNORE INTO learning_sessions(game_id,session_id,status,started,finished,invalid_reason) SELECT game_id,session_id,'valid',MIN(created),MAX(created),'legacy_migration' FROM samples GROUP BY game_id,session_id")
+                        version=7
                     else:
                         raise RuntimeError("没有从数据库版本"+str(version)+"开始的迁移路径")
                     self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",(str(version),))
@@ -4017,6 +4236,7 @@ class DataStore:
                     else:
                         slot="complete" if complete else "partial"
                         self.db.execute("INSERT OR REPLACE INTO models(game_id,slot,saved,created,prototype_count,validation,payload,checksum) VALUES(?,?,?,?,?,?,?,?)",(gid,slot,float(model.get("saved",time.time())),float(model.get("created",time.time())),len(model["prototypes"]),validation,sqlite3.Binary(payload),checksum))
+                self.db.execute("INSERT OR IGNORE INTO learning_sessions(game_id,session_id,status,started,finished,invalid_reason) SELECT game_id,session_id,'valid',MIN(created),MAX(created),'legacy_file_migration' FROM samples GROUP BY game_id,session_id")
                 self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('legacy_migrated','1')")
                 self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('legacy_invalid_rows',?)",(str(legacy_invalid),))
                 self.db.commit()
@@ -4043,6 +4263,21 @@ class DataStore:
         games=[dict(row) for row in self.db.execute("SELECT id,name,created,needs_review,last_review FROM games ORDER BY created,id")]
         row=self.db.execute("SELECT value FROM meta WHERE key='selected_game'").fetchone()
         return {"format_version":FORMAT_VERSION,"games":games,"selected_game":row[0] if row else None}
+    def data_version_signature(self):
+        values=[]
+        for suffix in ("","-wal","-shm"):
+            path=Path(str(self.db_path)+suffix)
+            try:
+                stat=path.stat()
+                values.append((suffix,int(stat.st_mtime_ns),int(stat.st_size)))
+            except FileNotFoundError:
+                values.append((suffix,0,0))
+            except Exception as error:
+                self.logger.write("DATABASE_VERSION_STAT_FAILED",error,details={"path":str(path)})
+                values.append((suffix,-1,-1))
+        with self.pending_lock:
+            values.append(("writer",len(self.pending_samples),self.writer_inflight,str(self.writer_error or "")))
+        return tuple(values)
     def games(self):
         with self.lock:
             rows=self.db.execute("SELECT id,name,created,needs_review,last_review FROM games ORDER BY created,id").fetchall()
@@ -4067,39 +4302,64 @@ class DataStore:
         keep={item["id"] for item in cleaned}
         if selected not in keep:
             raise RuntimeError("所选游戏不存在")
+        with self.lock:
+            existing={str(row[0]) for row in self.db.execute("SELECT id FROM games")}
+        deleting=existing-keep
         with self.pending_lock:
-            removed_pending=[item for item in self.pending_samples if item.get("gid") not in keep]
-            self.pending_samples=[item for item in self.pending_samples if item.get("gid") in keep]
+            self.blocked_game_ids.update(deleting)
+            removed_pending=[item for item in self.pending_samples if item.get("gid") in deleting]
+            self.pending_samples=[item for item in self.pending_samples if item.get("gid") not in deleting]
             if not self.pending_samples:
                 self.pending_event.clear()
+                if self.writer_inflight==0 and self.writer_error:
+                    self.writer_error=None
+                    self._notify_writer_error(None)
             self.writer_condition.notify_all()
-        self.flush_samples()
-        with self.critical_transaction():
-            self.db.execute("INSERT INTO config_backups(created,payload) VALUES(?,?)",(time.time(),json.dumps(self._config_snapshot(),ensure_ascii=False,separators=(",",":"))))
-            self.db.execute("DELETE FROM config_backups WHERE id NOT IN (SELECT id FROM config_backups ORDER BY id DESC LIMIT 5)")
-            existing={row[0] for row in self.db.execute("SELECT id FROM games")}
-            for gid in existing-keep:
-                self.db.execute("DELETE FROM games WHERE id=?",(gid,))
-                self.model_cache.pop(gid,None)
-            for item in cleaned:
-                self.db.execute("INSERT INTO games(id,name,created,needs_review,last_review) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,created=excluded.created,needs_review=excluded.needs_review,last_review=excluded.last_review",(item["id"],item["name"],item["created"],item["needs_review"],item["last_review"]))
-            self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('selected_game',?)",(selected,))
-        return {"deleted_games":sorted(existing-keep),"discarded_pending_samples":len(removed_pending)}
+        try:
+            self.sample_write_barrier()
+            with self.critical_transaction():
+                self.db.execute("INSERT INTO config_backups(created,payload) VALUES(?,?)",(time.time(),json.dumps(self._config_snapshot(),ensure_ascii=False,separators=(",",":"))))
+                self.db.execute("DELETE FROM config_backups WHERE id NOT IN (SELECT id FROM config_backups ORDER BY id DESC LIMIT 5)")
+                for gid in deleting:
+                    self.db.execute("DELETE FROM games WHERE id=?",(gid,))
+                    self.model_cache.pop(gid,None)
+                for item in cleaned:
+                    self.db.execute("INSERT INTO games(id,name,created,needs_review,last_review) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,created=excluded.created,needs_review=excluded.needs_review,last_review=excluded.last_review",(item["id"],item["name"],item["created"],item["needs_review"],item["last_review"]))
+                self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('selected_game',?)",(selected,))
+            return {"deleted_games":sorted(deleting),"discarded_pending_samples":len(removed_pending)}
+        finally:
+            with self.pending_lock:
+                self.blocked_game_ids.difference_update(deleting)
+                self.writer_condition.notify_all()
     def delete_game(self,gid):
         game_id=str(gid)
-        with self.lock:
+        with self.pending_lock:
+            self.blocked_game_ids.add(game_id)
+            before=len(self.pending_samples)
             self.pending_samples=[item for item in self.pending_samples if item.get("gid")!=game_id]
-        self.flush_samples()
-        with self.critical_transaction():
-            row=self.db.execute("SELECT 1 FROM games WHERE id=?",(game_id,)).fetchone()
-            if not row:
-                return False
-            self.db.execute("DELETE FROM games WHERE id=?",(game_id,))
-            selected=self.db.execute("SELECT value FROM meta WHERE key='selected_game'").fetchone()
-            if selected and str(selected[0])==game_id:
-                self.db.execute("DELETE FROM meta WHERE key='selected_game'")
-        self.model_cache.pop(game_id,None)
-        return True
+            removed=before-len(self.pending_samples)
+            if not self.pending_samples:
+                self.pending_event.clear()
+                if self.writer_inflight==0 and self.writer_error:
+                    self.writer_error=None
+                    self._notify_writer_error(None)
+            self.writer_condition.notify_all()
+        try:
+            self.sample_write_barrier()
+            with self.critical_transaction():
+                row=self.db.execute("SELECT 1 FROM games WHERE id=?",(game_id,)).fetchone()
+                if not row:
+                    return False
+                self.db.execute("DELETE FROM games WHERE id=?",(game_id,))
+                selected=self.db.execute("SELECT value FROM meta WHERE key='selected_game'").fetchone()
+                if selected and str(selected[0])==game_id:
+                    self.db.execute("DELETE FROM meta WHERE key='selected_game'")
+            self.model_cache.pop(game_id,None)
+            return True
+        finally:
+            with self.pending_lock:
+                self.blocked_game_ids.discard(game_id)
+                self.writer_condition.notify_all()
     def update_game(self,gid,**changes):
         allowed={"name","created","needs_review","last_review"}
         fields=[]
@@ -4120,6 +4380,7 @@ class DataStore:
     def _near_duplicate(self,gid,feature,signature,threshold,context=None):
         with self.lock:
             rows=self.db.execute("SELECT feature,coarse,feature_algorithm_version,context FROM samples WHERE game_id=? AND action_signature=? ORDER BY created DESC,id DESC LIMIT 36",(gid,signature)).fetchall()
+        with self.pending_lock:
             pending=[item for item in self.pending_samples if item["gid"]==gid and item["signature"]==signature][-36:]
         query=feature_bytes(feature)
         query_coarse=coarse_feature(query)
@@ -4128,8 +4389,8 @@ class DataStore:
             try:
                 if temporal_distance(query_context,item["context"])<=0.08 and coarse_distance(query_coarse,item["coarse"])<=max(2.0,float(threshold)*2.5) and feature_distance(query,item["feature"])<=float(threshold):
                     return True
-            except Exception:
-                pass
+            except Exception as error:
+                self.logger.write("PENDING_DUPLICATE_COMPARE_FAILED",error,game_id=gid)
         for row in rows:
             try:
                 candidate=upgrade_feature(bounded_decompress(row["feature"],FEATURE_LEN*2),row["feature_algorithm_version"])
@@ -4163,53 +4424,73 @@ class DataStore:
         fingerprint=self._sample_fingerprint(fbytes,clean,context)
         kind=clean["kind"]
         created_value=float(time.time() if created is None else created)
-        need_compact=False
+        self._ensure_sample_session(gid,session_id,created_value)
+        with self.pending_lock:
+            if str(gid) in self.blocked_game_ids or (str(gid),session_id) in self.blocked_sessions:
+                raise RuntimeError("游戏或session正在作废，拒绝接收样本")
+            pending_duplicate=any(item["gid"]==gid and item["fingerprint"]==fingerprint for item in self.pending_samples)
+            pending_noops=sum(1 for item in self.pending_samples if item["gid"]==gid and item["kind"]=="no_op")
+            pending_actions=sum(1 for item in self.pending_samples if item["gid"]==gid and item["kind"]!="no_op")
+            pending_count=sum(1 for item in self.pending_samples if item["gid"]==gid)
         with self.lock:
             if not self.db.execute("SELECT 1 FROM games WHERE id=?",(gid,)).fetchone():
                 raise RuntimeError("游戏不存在")
-            if any(item["gid"]==gid and item["fingerprint"]==fingerprint for item in self.pending_samples) or self.db.execute("SELECT 1 FROM samples WHERE game_id=? AND fingerprint=?",(gid,fingerprint)).fetchone():
+            persisted_duplicate=bool(self.db.execute("SELECT 1 FROM samples WHERE game_id=? AND fingerprint=?",(gid,fingerprint)).fetchone())
+            count_row=self.db.execute("SELECT COUNT(*) AS total,SUM(CASE WHEN kind='no_op' THEN 1 ELSE 0 END) AS noops,SUM(CASE WHEN kind!='no_op' THEN 1 ELSE 0 END) AS actions FROM samples WHERE game_id=?",(gid,)).fetchone()
+        if pending_duplicate or persisted_duplicate:
+            return False
+        if enforce_quota and kind=="no_op" and int(count_row["noops"] or 0)+pending_noops>=max(1,(int(count_row["actions"] or 0)+pending_actions)//3):
+            return False
+        if enforce_quota and self._near_duplicate(gid,fbytes,signature,duplicate_threshold,context):
+            return False
+        row=(gid,created_value,kind,signature,action_family_key(clean),repeat_policy,FEATURE_ALGORITHM_VERSION,ACTION_ALGORITHM_VERSION,sqlite3.Binary(zlib.compress(fbytes,6)),sqlite3.Binary(coarse),json.dumps(clean,ensure_ascii=False,separators=(",",":")),str(source),session_id,capture_method,json.dumps(context,ensure_ascii=False,separators=(",",":")),sqlite3.Binary(zlib.compress(gray_bytes(thumbnail),6)) if gray_valid(thumbnail) else None,float(max(0.1,min(10.0,weight))),fingerprint)
+        with self.pending_lock:
+            if str(gid) in self.blocked_game_ids or (str(gid),session_id) in self.blocked_sessions:
+                raise RuntimeError("游戏或session正在作废，拒绝接收样本")
+            if any(item["gid"]==gid and item["fingerprint"]==fingerprint for item in self.pending_samples):
                 return False
-            if enforce_quota and kind=="no_op":
-                row=self.db.execute("SELECT SUM(CASE WHEN kind='no_op' THEN 1 ELSE 0 END) AS noops,SUM(CASE WHEN kind!='no_op' THEN 1 ELSE 0 END) AS actions FROM samples WHERE game_id=?",(gid,)).fetchone()
-                pending_noops=sum(1 for item in self.pending_samples if item["gid"]==gid and item["kind"]=="no_op")
-                pending_actions=sum(1 for item in self.pending_samples if item["gid"]==gid and item["kind"]!="no_op")
-                if int(row["noops"] or 0)+pending_noops>=max(1,(int(row["actions"] or 0)+pending_actions)//3):
-                    return False
-            if enforce_quota and self._near_duplicate(gid,fbytes,signature,duplicate_threshold,context):
-                return False
-            row=(gid,created_value,kind,signature,action_family_key(clean),repeat_policy,FEATURE_ALGORITHM_VERSION,ACTION_ALGORITHM_VERSION,sqlite3.Binary(zlib.compress(fbytes,6)),sqlite3.Binary(coarse),json.dumps(clean,ensure_ascii=False,separators=(",",":")),str(source),session_id,capture_method,json.dumps(context,ensure_ascii=False,separators=(",",":")),sqlite3.Binary(zlib.compress(gray_bytes(thumbnail),6)) if gray_valid(thumbnail) else None,float(max(0.1,min(10.0,weight))),fingerprint)
             self.pending_samples.append({"row":row,"gid":gid,"signature":signature,"coarse":coarse,"feature":fbytes,"context":context,"kind":kind,"fingerprint":fingerprint,"session_id":session_id,"created":created_value,"mark_review":bool(mark_review)})
             if len(self.pending_samples)>=12:
                 self.pending_event.set()
-            count=int(self.db.execute("SELECT COUNT(*) FROM samples WHERE game_id=?",(gid,)).fetchone()[0])+sum(1 for item in self.pending_samples if item["gid"]==gid)
-            need_compact=count>MAX_SAMPLES+16
-        if need_compact:
-            self.flush_samples()
+            count=int(count_row["total"] or 0)+pending_count+1
+            self.writer_condition.notify_all()
+        if count>MAX_SAMPLES+16:
+            self.sample_write_barrier()
             self.compact_samples(gid,MAX_SAMPLES)
         return True
-    def discard_session(self,gid,session_id):
-        with self.lock:
+    def discard_session(self,gid,session_id,reason="discarded"):
+        game_id=str(gid)
+        sid=str(session_id)
+        self.invalidate_learning_session(game_id,sid,reason)
+        self.sample_write_barrier()
+        with self.pending_lock:
             before=len(self.pending_samples)
-            self.pending_samples=[item for item in self.pending_samples if not (item["gid"]==gid and item["session_id"]==str(session_id))]
+            self.pending_samples=[item for item in self.pending_samples if not (item["gid"]==game_id and item["session_id"]==sid)]
             pending_removed=before-len(self.pending_samples)
-            with self.db:
-                cursor=self.db.execute("DELETE FROM samples WHERE game_id=? AND session_id=?",(gid,str(session_id)))
-                removed=pending_removed+max(0,int(cursor.rowcount or 0))
-                if removed:
-                    self.db.execute("UPDATE games SET needs_review=1 WHERE id=?",(gid,))
-        self.model_cache.pop(gid,None)
+            self.writer_condition.notify_all()
+        with self.critical_transaction():
+            cursor=self.db.execute("DELETE FROM samples WHERE game_id=? AND session_id=?",(game_id,sid))
+            removed=pending_removed+max(0,int(cursor.rowcount or 0))
+            if removed:
+                self.db.execute("UPDATE games SET needs_review=1 WHERE id=?",(game_id,))
+        self.model_cache.pop(game_id,None)
         return removed
     def discard_session_window(self,gid,session_id,start_time,end_time):
-        with self.lock:
+        game_id=str(gid)
+        sid=str(session_id)
+        self.invalidate_learning_session(game_id,sid,"discarded_window")
+        self.sample_write_barrier()
+        with self.pending_lock:
             before=len(self.pending_samples)
-            self.pending_samples=[item for item in self.pending_samples if not (item["gid"]==gid and item["session_id"]==str(session_id) and float(start_time)<=item["created"]<=float(end_time))]
+            self.pending_samples=[item for item in self.pending_samples if not (item["gid"]==game_id and item["session_id"]==sid and float(start_time)<=item["created"]<=float(end_time))]
             pending_removed=before-len(self.pending_samples)
-            with self.db:
-                cursor=self.db.execute("DELETE FROM samples WHERE game_id=? AND session_id=? AND created BETWEEN ? AND ?",(gid,str(session_id),float(start_time),float(end_time)))
-                removed=pending_removed+max(0,int(cursor.rowcount or 0))
-                if removed:
-                    self.db.execute("UPDATE games SET needs_review=1 WHERE id=?",(gid,))
-        self.model_cache.pop(gid,None)
+            self.writer_condition.notify_all()
+        with self.critical_transaction():
+            cursor=self.db.execute("DELETE FROM samples WHERE game_id=? AND session_id=? AND created BETWEEN ? AND ?",(game_id,sid,float(start_time),float(end_time)))
+            removed=pending_removed+max(0,int(cursor.rowcount or 0))
+            if removed:
+                self.db.execute("UPDATE games SET needs_review=1 WHERE id=?",(game_id,))
+        self.model_cache.pop(game_id,None)
         return removed
     def append_sample(self,gid,feature,action,source,context=None,thumbnail=None,weight=1.0):
         return self._insert_sample(gid,feature,action,source,context or {},thumbnail,weight,True,True)
@@ -4227,9 +4508,9 @@ class DataStore:
             self.db.execute("INSERT INTO rejections(game_id,created,feature_algorithm_version,feature,coarse,thumbnail,candidates,source,session_id,capture_method) VALUES(?,?,?,?,?,?,?,?,?,?)",(gid,time.time(),FEATURE_ALGORITHM_VERSION,sqlite3.Binary(zlib.compress(feature_bytes(feature),6)),sqlite3.Binary(coarse_feature(feature)),sqlite3.Binary(zlib.compress(gray_bytes(thumbnail),6)) if gray_valid(thumbnail) else None,json.dumps(candidate_data,ensure_ascii=False,separators=(",",":")),str(source),str(context.get("session_id") or "unspecified"),str(context.get("capture_method") or "unknown")))
             self.db.execute("UPDATE games SET needs_review=1 WHERE id=?",(gid,))
     def load_samples(self,gid,limit=MAX_SAMPLES):
-        self.flush_samples()
+        self.sample_write_barrier()
         with self.lock:
-            rows=self.db.execute("SELECT id,created,feature_algorithm_version,action_algorithm_version,feature,coarse,action,source,session_id,capture_method,context,thumbnail,weight,fingerprint,repeat_policy FROM samples WHERE game_id=? ORDER BY created DESC,id DESC LIMIT ?",(gid,int(limit))).fetchall()
+            rows=self.db.execute("SELECT s.id,s.created,s.feature_algorithm_version,s.action_algorithm_version,s.feature,s.coarse,s.action,s.source,s.session_id,s.capture_method,s.context,s.thumbnail,s.weight,s.fingerprint,s.repeat_policy FROM samples s JOIN learning_sessions ls ON ls.game_id=s.game_id AND ls.session_id=s.session_id WHERE s.game_id=? AND ls.status='valid' ORDER BY s.created DESC,s.id DESC LIMIT ?",(gid,int(limit))).fetchall()
         result=[]
         invalid=0
         for row in reversed(rows):
@@ -4272,14 +4553,15 @@ class DataStore:
         self.invalid_rows["rejections:"+str(gid)]=max(self.invalid_rows.get("rejections:"+str(gid),0),invalid)
         return result
     def sample_stats(self,gid):
-        self.flush_samples()
+        self.sample_write_barrier()
         with self.lock:
-            row=self.db.execute("SELECT COUNT(*) AS total,SUM(CASE WHEN feature_algorithm_version IN (3,?) THEN 1 ELSE 0 END) AS valid,COALESCE(SUM(length(feature)+length(coarse)+length(action)+length(context)+COALESCE(length(thumbnail),0)),0) AS bytes FROM samples WHERE game_id=?",(FEATURE_ALGORITHM_VERSION,gid)).fetchone()
-        total=safe_int(row["total"] or 0,0,0)
-        sql_valid=safe_int(row["valid"] or 0,0,0,total)
+            total_row=self.db.execute("SELECT COUNT(*) AS total,COALESCE(SUM(length(feature)+length(coarse)+length(action)+length(context)+COALESCE(length(thumbnail),0)),0) AS bytes FROM samples WHERE game_id=?",(gid,)).fetchone()
+            valid_row=self.db.execute("SELECT COUNT(*) AS valid FROM samples s JOIN learning_sessions ls ON ls.game_id=s.game_id AND ls.session_id=s.session_id WHERE s.game_id=? AND ls.status='valid' AND s.feature_algorithm_version IN (3,?)",(gid,FEATURE_ALGORITHM_VERSION)).fetchone()
+        total=safe_int(total_row["total"] or 0,0,0)
+        sql_valid=safe_int(valid_row["valid"] or 0,0,0,total)
         observed=safe_int(self.invalid_rows.get(str(gid),0),0,0,total)
         valid=max(0,min(sql_valid,total-observed))
-        return {"valid":valid,"invalid":total-valid,"total":total,"bytes":safe_int(row["bytes"] or 0,0,0)}
+        return {"valid":valid,"invalid":total-valid,"total":total,"bytes":safe_int(total_row["bytes"] or 0,0,0)}
     def _select_diverse(self,rows,count):
         if count<=0:
             return []
@@ -4294,7 +4576,7 @@ class DataStore:
             ordered.remove(best)
         return selected
     def compact_samples(self,gid,keep=MAX_SAMPLES):
-        self.flush_samples()
+        self.sample_write_barrier()
         keep=max(1,safe_int(keep,MAX_SAMPLES,1,MAX_SAMPLES))
         with self.lock:
             rows=self.db.execute("SELECT id,kind,action_signature,action_family,capture_method,coarse,weight,created FROM samples WHERE game_id=?",(gid,)).fetchall()
@@ -4398,9 +4680,10 @@ class DataStore:
             raise RuntimeError("样本压缩未满足硬上限")
         return {"kept":final_count,"removed":len(rows)-final_count,"invalid":invalid_row_count}
     def clear_game_data(self,gid):
-        self.flush_samples()
+        self.sample_write_barrier()
         with self.lock,self.db:
             self.db.execute("DELETE FROM samples WHERE game_id=?",(gid,))
+            self.db.execute("DELETE FROM learning_sessions WHERE game_id=?",(gid,))
             self.db.execute("DELETE FROM models WHERE game_id=?",(gid,))
             self.db.execute("DELETE FROM model_backups WHERE game_id=?",(gid,))
             self.db.execute("DELETE FROM rejections WHERE game_id=?",(gid,))
@@ -4421,7 +4704,8 @@ class DataStore:
                 row=self.db.execute("SELECT value FROM meta WHERE key='last_window_descriptor'").fetchone()
             value=json.loads(row[0]) if row else None
             return value if isinstance(value,dict) else None
-        except Exception:
+        except Exception as error:
+            self.logger.write("WINDOW_DESCRIPTOR_LOAD_FAILED",error)
             return None
     def _calibration_identity_key(self,target):
         if not isinstance(target,dict):
@@ -4464,7 +4748,8 @@ class DataStore:
                 result["dynamic_passed"]=False
                 result["cache_loaded"]=True
                 return result
-            except Exception:
+            except Exception as error:
+                self.logger.write("CAPTURE_CALIBRATION_LOAD_FAILED",error,window_identity=target,details={"identity_key":identity_key,"backend":str(row["backend"])})
                 continue
         return None
     def _pack_model(self,model):
@@ -4492,6 +4777,8 @@ class DataStore:
         try:
             if not isinstance(item,dict) or str(item.get("game_id",gid))!=gid:
                 return None
+            if normalized_compatibility_signature(compatibility_signature_from_item(item))!=compatibility_signature():
+                return None
             if int(item.get("format_version",0))!=FORMAT_VERSION or int(item.get("action_algorithm_version",0))!=ACTION_ALGORITHM_VERSION:
                 return None
             upgraded=[]
@@ -4508,13 +4795,13 @@ class DataStore:
                 entry["temporal"]=temporal_from_context(entry.get("temporal",{}))
                 upgraded.append(entry)
             result=dict(item)
-            result.update({"format_version":FORMAT_VERSION,"feature_width":FEATURE_W,"feature_height":FEATURE_H,"feature_algorithm_version":FEATURE_ALGORITHM_VERSION,"action_algorithm_version":ACTION_ALGORITHM_VERSION,"game_id":gid,"complete":bool(complete),"prototypes":upgraded})
+            result.update({"format_version":FORMAT_VERSION,"model_schema_version":MODEL_SCHEMA_VERSION,"feature_width":FEATURE_W,"feature_height":FEATURE_H,"feature_algorithm_version":FEATURE_ALGORITHM_VERSION,"action_algorithm_version":ACTION_ALGORITHM_VERSION,"game_id":gid,"complete":bool(complete),"compatibility_signature":compatibility_signature(),"source_build_hash":str(item.get("source_build_hash") or item.get("algorithm_snapshot",{}).get("build_hash") or item.get("algorithm_snapshot",{}).get("source_build_hash") or ""),"algorithm_snapshot":algorithm_snapshot(),"prototypes":upgraded})
             return result
         except Exception:
             return None
     def _model_valid(self,item,gid,complete=True):
         try:
-            if not isinstance(item,dict) or item.get("format_version")!=FORMAT_VERSION or item.get("feature_width")!=FEATURE_W or item.get("feature_height")!=FEATURE_H or item.get("feature_algorithm_version")!=FEATURE_ALGORITHM_VERSION or item.get("action_algorithm_version")!=ACTION_ALGORITHM_VERSION or item.get("game_id")!=gid or bool(item.get("complete"))!=bool(complete) or item.get("algorithm_snapshot")!=algorithm_snapshot():
+            if not isinstance(item,dict) or item.get("format_version")!=FORMAT_VERSION or item.get("feature_width")!=FEATURE_W or item.get("feature_height")!=FEATURE_H or item.get("feature_algorithm_version")!=FEATURE_ALGORITHM_VERSION or item.get("action_algorithm_version")!=ACTION_ALGORITHM_VERSION or item.get("game_id")!=gid or bool(item.get("complete"))!=bool(complete) or normalized_compatibility_signature(compatibility_signature_from_item(item))!=compatibility_signature():
                 return False
             binding=item.get("model_binding")
             if not isinstance(binding,dict) or binding.get("window_rule_version")!=WINDOW_RULE_VERSION or binding.get("capture_backend_version")!=CAPTURE_BACKEND_VERSION or not binding.get("process_paths") or not binding.get("window_classes") or not binding.get("content_rect_norms") or not finite_number(binding.get("content_aspect_min")) or not finite_number(binding.get("content_aspect_max")) or float(binding.get("content_aspect_min",0))<=0 or float(binding.get("content_aspect_max",0))<=0 or safe_int(binding.get("dpi_min",0),0)<=0 or safe_int(binding.get("dpi_max",0),0)<=0 or not binding.get("capture_methods"):
@@ -4546,7 +4833,7 @@ class DataStore:
             return False
     def save_model(self,gid,model,complete=True):
         item=dict(model)
-        item.update({"format_version":FORMAT_VERSION,"feature_width":FEATURE_W,"feature_height":FEATURE_H,"feature_algorithm_version":FEATURE_ALGORITHM_VERSION,"action_algorithm_version":ACTION_ALGORITHM_VERSION,"game_id":gid,"complete":bool(complete),"algorithm_snapshot":algorithm_snapshot(),"saved":time.time()})
+        item.update({"format_version":FORMAT_VERSION,"model_schema_version":MODEL_SCHEMA_VERSION,"feature_width":FEATURE_W,"feature_height":FEATURE_H,"feature_algorithm_version":FEATURE_ALGORITHM_VERSION,"action_algorithm_version":ACTION_ALGORITHM_VERSION,"game_id":gid,"complete":bool(complete),"compatibility_signature":compatibility_signature(),"source_build_hash":current_build_hash(),"algorithm_snapshot":algorithm_snapshot(),"saved":time.time()})
         clean_prototypes=[]
         for proto in item.get("prototypes",[]):
             entry=dict(proto)
@@ -4668,12 +4955,16 @@ class DataStore:
                 return True
         raise RuntimeError("没有通过完整版本、游戏ID、特征尺寸、算法版本和原型schema校验的模型备份")
     def integrity_check(self):
-        self.flush_samples()
+        self.sample_write_barrier()
         with self.lock:
             row=self.db.execute("PRAGMA quick_check").fetchone()
         return bool(row and str(row[0]).lower()=="ok")
     def emergency_checkpoint(self,reason="forced_exit"):
-        record={"created":time.time(),"reason":str(reason),"pending_samples":len(self.pending_samples),"writer_error":self.writer_error,"read_only":self.read_only}
+        with self.pending_lock:
+            pending_count=len(self.pending_samples)
+            inflight=self.writer_inflight
+            writer_error=self.writer_error
+        record={"created":time.time(),"reason":str(reason),"pending_samples":pending_count,"writer_inflight":inflight,"writer_error":writer_error,"read_only":self.read_only}
         try:
             path=self.base/"recovery.log"
             with path.open("a",encoding="utf-8") as handle:
@@ -4693,9 +4984,10 @@ class DataStore:
         self.closing=True
         if not self.read_only:
             try:
-                self.flush_samples()
-            except Exception:
-                pass
+                self.sample_write_barrier(max(0.5,float(timeout)))
+            except Exception as error:
+                self.logger.write("DATABASE_CLOSE_BARRIER_FAILED",error)
+                return False
         self.writer_stop.set()
         self.pending_event.set()
         thread=self.writer_thread
@@ -4707,12 +4999,12 @@ class DataStore:
         try:
             if not self.read_only:
                 self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
-            pass
+        except Exception as error:
+            self.logger.write("DATABASE_FINAL_CHECKPOINT_FAILED",error)
         try:
             self.db.close()
-        except Exception:
-            pass
+        except Exception as error:
+            self.logger.write("DATABASE_CONNECTION_CLOSE_FAILED",error)
         self.closed=True
         return True
 class App:
@@ -4752,7 +5044,13 @@ class App:
         self.error_recent={}
         self.result_modal=None
         self.result_modal_widget=None
-        self.ui_queue=queue.Queue()
+        self.ui_queue=queue.Queue(maxsize=512)
+        self.ui_lock=threading.RLock()
+        self.ui_latest={}
+        self.ui_scheduled=set()
+        self.background_lock=threading.RLock()
+        self.background_generations=defaultdict(int)
+        self.refresh_signature=None
         self.closing=False
         self.shutdown_started=False
         self.shutdown_deadline=None
@@ -4795,7 +5093,7 @@ class App:
             else:
                 self.status.set("样本写入线程已恢复")
             self._apply_storage_controls()
-        self.ui(apply)
+        self.ui(apply,"writer_status")
     def _apply_storage_controls(self):
         blocked=bool(self.storage_fault or self.store.read_only)
         for name in ("学习","复习","请教"):
@@ -4862,20 +5160,58 @@ class App:
         ttk.Label(bottom,text="ESC或“停止”结束").pack(side="right")
     def tk_exception(self,exc_type,exc_value,exc_traceback):
         self.show_error("".join(traceback.format_exception(exc_type,exc_value,exc_traceback)))
-    def ui(self,callback):
+    def ui(self,callback,key=None):
         if self.shutdown_started:
             return
         if threading.current_thread() is threading.main_thread():
             try:
                 callback()
-            except Exception:
+            except Exception as error:
+                self.store.log_error("UI_CALLBACK_FAILED",error,mode=self.mode)
                 if not self.closing:
                     self.show_error(traceback.format_exc())
             return
+        if key is None:
+            try:
+                self.ui_queue.put_nowait(("call",callback))
+            except queue.Full:
+                self.store.log_error("UI_QUEUE_FULL",details={"kind":"call"})
+            return
+        token=str(key)
+        with self.ui_lock:
+            self.ui_latest[token]=callback
+            if token in self.ui_scheduled:
+                return
+            self.ui_scheduled.add(token)
         try:
-            self.ui_queue.put_nowait(("call",callback))
+            self.ui_queue.put_nowait(("latest",token))
         except queue.Full:
-            pass
+            with self.ui_lock:
+                self.ui_scheduled.discard(token)
+            self.store.log_error("UI_QUEUE_FULL",details={"kind":"latest","key":token})
+    def run_background(self,key,task,apply=None,on_error=None):
+        token=str(key)
+        with self.background_lock:
+            self.background_generations[token]+=1
+            generation=self.background_generations[token]
+        def worker():
+            try:
+                result=task()
+                def finish():
+                    with self.background_lock:
+                        current=self.background_generations.get(token,0)
+                    if generation==current and not self.shutdown_started and apply is not None:
+                        apply(result)
+                self.ui(finish,"background:"+token)
+            except Exception as error:
+                self.store.log_error("BACKGROUND_TASK_FAILED",error,mode=self.mode,details={"task":token,"generation":generation})
+                if on_error is not None:
+                    self.ui(lambda error=error:on_error(error),"background_error:"+token)
+            finally:
+                self.store.close_current_thread()
+        thread=threading.Thread(target=worker,name="UniversalGameAI-Background-"+token,daemon=True)
+        thread.start()
+        return generation
     def process_ui_queue(self):
         try:
             for _ in range(200):
@@ -4883,17 +5219,25 @@ class App:
                     kind,payload=self.ui_queue.get_nowait()
                 except queue.Empty:
                     break
-                if kind=="call" and not self.shutdown_started:
+                callback=None
+                if kind=="call":
+                    callback=payload
+                elif kind=="latest":
+                    with self.ui_lock:
+                        callback=self.ui_latest.pop(payload,None)
+                        self.ui_scheduled.discard(payload)
+                if callback is not None and not self.shutdown_started:
                     try:
-                        payload()
-                    except Exception:
+                        callback()
+                    except Exception as error:
+                        self.store.log_error("UI_QUEUE_CALLBACK_FAILED",error,mode=self.mode)
                         self.show_error(traceback.format_exc())
         finally:
             if not self.shutdown_started:
                 try:
                     self.root.after(25,self.process_ui_queue)
-                except Exception:
-                    pass
+                except Exception as error:
+                    self.store.log_error("UI_QUEUE_RESCHEDULE_FAILED",error,mode=self.mode)
     def _begin_mode_stopping(self,result,error=None):
         if self.shutdown_started or self.closing and self.mode_state==MODE_IDLE:
             return
@@ -5032,19 +5376,19 @@ class App:
             except Exception:
                 pass
     def set_status(self,text):
-        self.ui(lambda:self.status.set(str(text)))
+        self.ui(lambda:self.status.set(str(text)),"status")
     def set_confidence(self,text):
-        self.ui(lambda:self.confidence_text.set(str(text)))
+        self.ui(lambda:self.confidence_text.set(str(text)),"confidence")
     def set_input_status(self,text):
         value=str(text)
         if not value.startswith("自动输入："):
             value="自动输入："+value
-        self.ui(lambda:self.input_text.set(value))
+        self.ui(lambda:self.input_text.set(value),"input_status")
     def lock_input(self,reason="已锁定"):
         self.api.block_input()
         self.set_input_status(reason)
     def set_progress(self,value):
-        self.ui(lambda:self.progress_value.set(max(0.0,min(100.0,float(value)))))
+        self.ui(lambda:self.progress_value.set(max(0.0,min(100.0,float(value)))),"progress")
     def _show_result_modal(self,title,text):
         if self.result_modal is not None:
             try:
@@ -5118,7 +5462,7 @@ class App:
             return
         message=str(text).strip() or "未知错误"
         digest=hashlib.sha256(message.encode("utf-8","replace")).hexdigest()
-        now=time.time()
+        now=time.monotonic()
         self.error_recent={key:value for key,value in self.error_recent.items() if now-value<6.0}
         if digest in self.error_recent:
             return
@@ -5186,69 +5530,98 @@ class App:
         ttk.Button(buttons,text="取消",command=win.destroy).pack(side="left",padx=6)
         win.wait_window()
         return result["value"]
-    def _refresh_all(self):
-        self.game_text.set(self.selected_game["name"] if self.selected_game else "未选择")
-        if self.selected_window:
-            self.window_text.set(self.selected_window.get("title","未命名窗口"))
-            try:
-                content=self.api.validate_target(self.selected_window,False)
-                client=self.api.client_rect(self.selected_window["hwnd"])
-                dpi=self.api.dpi_for_window(self.selected_window["hwnd"])
-                path=str(self.selected_window.get("process_path","-"))
-                rule=self.selected_window.get("title_rule",{"mode":"none"})
-                self.window_detail.set("PID："+str(self.selected_window["pid"])+"  TID："+str(self.selected_window.get("window_thread_id","-"))+"  类名："+self.selected_window["class"]+"  客户区："+str(client[2])+"×"+str(client[3])+"  游戏区域："+str(content[2])+"×"+str(content[3])+"  DPI："+str(dpi)+"  标题规则："+str(rule.get("mode","none"))+"  路径："+path)
-                self.capture_text.set(self.api.capture_status(self.selected_window["hwnd"]))
-            except Exception as error:
-                self.window_detail.set("PID："+str(self.selected_window.get("pid","-"))+"  类名："+str(self.selected_window.get("class","-"))+"  "+str(error))
-                self.capture_text.set("采集方式：等待目标窗口恢复")
-        else:
-            self.window_text.set("未选择")
-            self.window_detail.set("PID：-  类名：-  客户区：-  游戏区域：-")
-            self.capture_text.set("采集方式：未检测")
-        self.refresh_data_stats()
-    def refresh_data_stats(self):
-        if not self.selected_game:
-            self.sample_text.set("样本：有效0  废弃0  数据0 KB")
-            self.model_text.set("模型：无  需要复习：否")
-            return
-        gid=self.selected_game["id"]
+    def _window_state_signature(self,window):
+        if not isinstance(window,dict):
+            return None
+        hwnd=safe_int(window.get("hwnd",0),0)
+        if not hwnd:
+            return (0,False,False,None,None)
         try:
-            stats=self.store.sample_stats(gid)
-            self.sample_text.set("样本：有效"+str(stats["valid"])+"  废弃"+str(stats["invalid"])+"  数据"+str(round(stats["bytes"]/1024,1))+" KB")
-            metadata=self.store.model_metadata(gid)
-            needs=bool(next((game.get("needs_review") for game in self.store.games() if game["id"]==gid),False))
-            if metadata:
-                created=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(metadata.get("created",0)))
-                validation=metadata.get("validation",{})
-                holdout=int(validation.get("holdout",0) or 0)
-                accepted=int(validation.get("accepted",0) or 0)
-                coverage=float(validation.get("coverage",0.0) or 0.0)
-                reject_rate=float(validation.get("reject_rate",1.0) or 0.0)
-                overall=float(validation.get("overall_accuracy",0.0) or 0.0)
-                accepted_error=validation.get("accepted_error_rate")
-                status=str(validation.get("status","insufficient"))
-                if accepted_error is None:
-                    error_text="接受样本错误率无法计算（验证不足）"
-                else:
-                    error_text="接受样本错误率"+str(round(float(accepted_error)*100,2))+"%（"+("通过" if status=="passed" else "未通过")+"）"
-                detail="留出"+str(holdout)+" 接受"+str(accepted)+" 覆盖"+str(round(coverage*100,1))+"% 总体正确"+str(round(overall*100,1))+"% 拒识"+str(round(reject_rate*100,1))+"%"
-                model_kind="完整模型" if metadata.get("slot")=="complete" else "未验收临时模型（旧完整模型如存在则保留）"
-                self.model_text.set(model_kind+"："+str(metadata.get("prototype_count",0))+"个原型  最近复习："+created+"  "+error_text+"  "+detail+"  需要复习："+("是" if needs else "否"))
-            else:
-                self.model_text.set("模型：无  需要复习："+("是" if needs else "否"))
+            exists=bool(self.api.user32.IsWindow(hwnd))
+            minimized=bool(self.api.user32.IsIconic(hwnd)) if exists else False
+            foreground=int(self.api.user32.GetForegroundWindow() or 0)==hwnd if exists else False
+            client=self.api.client_rect(hwnd) if exists and not minimized else None
+            dpi=self.api.dpi_for_window(hwnd) if exists else 0
+            return (hwnd,exists,minimized,foreground,tuple(client) if client else None,dpi)
         except Exception as error:
-            self.sample_text.set("数据统计失败")
-            self.model_text.set(str(error))
+            return (hwnd,False,False,False,None,0,type(error).__name__,str(error))
+    def _collect_refresh_snapshot(self,game,window,force):
+        signature=(self.store.data_version_signature(),self._window_state_signature(window),str(game.get("id","")) if isinstance(game,dict) else "")
+        if not force and signature==self.refresh_signature:
+            return {"unchanged":True,"signature":signature}
+        result={"unchanged":False,"signature":signature,"game_text":game.get("name","未选择") if isinstance(game,dict) else "未选择","window_text":"未选择","window_detail":"PID：-  类名：-  客户区：-  游戏区域：-","capture_text":"采集方式：未检测","sample_text":"样本：有效0  废弃0  数据0 KB","model_text":"模型：无  需要复习：否"}
+        if isinstance(window,dict):
+            result["window_text"]=window.get("title","未命名窗口")
+            try:
+                content=self.api.validate_target(window,False)
+                client=self.api.client_rect(window["hwnd"])
+                dpi=self.api.dpi_for_window(window["hwnd"])
+                path=str(window.get("process_path","-"))
+                rule=window.get("title_rule",{"mode":"none"})
+                result["window_detail"]="PID："+str(window["pid"])+"  TID："+str(window.get("window_thread_id","-"))+"  类名："+window["class"]+"  客户区："+str(client[2])+"×"+str(client[3])+"  游戏区域："+str(content[2])+"×"+str(content[3])+"  DPI："+str(dpi)+"  标题规则："+str(rule.get("mode","none"))+"  路径："+path
+                result["capture_text"]=self.api.capture_status(window["hwnd"])
+            except Exception as error:
+                result["window_detail"]="PID："+str(window.get("pid","-"))+"  类名："+str(window.get("class","-"))+"  "+str(error)
+                result["capture_text"]="采集方式：等待目标窗口恢复"
+        if isinstance(game,dict):
+            gid=str(game["id"])
+            try:
+                stats=self.store.sample_stats(gid)
+                result["sample_text"]="样本：有效"+str(stats["valid"])+"  废弃"+str(stats["invalid"])+"  数据"+str(round(stats["bytes"]/1024,1))+" KB"
+                metadata=self.store.model_metadata(gid)
+                needs=bool(next((item.get("needs_review") for item in self.store.games() if item["id"]==gid),False))
+                if metadata:
+                    created=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(metadata.get("created",0)))
+                    validation=metadata.get("validation",{})
+                    holdout=int(validation.get("holdout",0) or 0)
+                    accepted=int(validation.get("accepted",0) or 0)
+                    coverage=float(validation.get("coverage",0.0) or 0.0)
+                    reject_rate=float(validation.get("reject_rate",1.0-coverage) if validation.get("reject_rate") is not None else 1.0-coverage)
+                    overall=float(validation.get("overall_accuracy",0.0) or 0.0)
+                    accepted_error=validation.get("accepted_error_rate")
+                    status=str(validation.get("status","insufficient"))
+                    error_text="接受样本错误率无法计算（验证不足）" if accepted_error is None else "接受样本错误率"+str(round(float(accepted_error)*100,2))+"%（"+("通过" if status=="passed" else "未通过")+"）"
+                    detail="留出"+str(holdout)+" 接受"+str(accepted)+" 覆盖"+str(round(coverage*100,1))+"% 总体正确"+str(round(overall*100,1))+"% 拒识"+str(round(reject_rate*100,1))+"%"
+                    model_kind="完整模型" if metadata.get("slot")=="complete" else "未验收临时模型（旧完整模型如存在则保留）"
+                    result["model_text"]=model_kind+"："+str(metadata.get("prototype_count",0))+"个原型  最近复习："+created+"  "+error_text+"  "+detail+"  需要复习："+("是" if needs else "否")
+                else:
+                    result["model_text"]="模型：无  需要复习："+("是" if needs else "否")
+            except Exception as error:
+                result["sample_text"]="数据统计失败"
+                result["model_text"]=str(error)
+                self.store.log_error("CONTROL_PANEL_STATS_FAILED",error,game_id=gid)
+        return result
+    def _apply_refresh_snapshot(self,result):
+        if not isinstance(result,dict) or result.get("unchanged"):
+            return
+        self.refresh_signature=result.get("signature")
+        self.game_text.set(result["game_text"])
+        self.window_text.set(result["window_text"])
+        self.window_detail.set(result["window_detail"])
+        self.capture_text.set(result["capture_text"])
+        self.sample_text.set(result["sample_text"])
+        self.model_text.set(result["model_text"])
+    def refresh_all_async(self,force=False):
+        game=dict(self.selected_game) if isinstance(self.selected_game,dict) else None
+        window=dict(self.selected_window) if isinstance(self.selected_window,dict) else None
+        if force:
+            self.sample_text.set("样本：正在读取")
+            self.model_text.set("模型：正在读取")
+        self.run_background("control_panel_refresh",lambda:self._collect_refresh_snapshot(game,window,bool(force)),self._apply_refresh_snapshot)
+    def _refresh_all(self):
+        self.refresh_all_async(True)
+    def refresh_data_stats(self):
+        self.refresh_all_async(True)
     def periodic_refresh(self):
         try:
             if not self.mode and not self.closing:
-                self._refresh_all()
+                self.refresh_all_async(False)
         finally:
             if not self.shutdown_started:
                 try:
                     self.root.after(1200,self.periodic_refresh)
-                except Exception:
-                    pass
+                except Exception as error:
+                    self.store.log_error("PERIODIC_REFRESH_RESCHEDULE_FAILED",error)
     def open_game_dialog(self):
         if self.mode:
             self.show_error("请先停止当前模式")
@@ -5350,6 +5723,7 @@ class App:
                 pass
             win.destroy()
         def cancel():
+            state["closed"]=True
             try:
                 win.grab_release()
             except Exception:
@@ -5416,13 +5790,9 @@ class App:
             rule_label.set(reverse.get(str(existing.get("mode","none")),"不检查"))
             rule_value.set(str(existing.get("value","")))
             status.set("进程路径："+str(item.get("process_path","读取失败")))
-        def refresh():
-            nonlocal windows
-            try:
-                raw=self.api.enum_windows()
-            except Exception as error:
-                self.show_error(str(error))
-                return
+        widgets={"refresh":None}
+        def load_windows():
+            raw=self.api.enum_windows()
             hydrated=[]
             for item in raw:
                 candidate=dict(item)
@@ -5430,8 +5800,14 @@ class App:
                     candidate=self.api.target_identity(candidate)
                 except Exception as error:
                     candidate["identity_error"]=str(error)
+                    self.store.log_error("WINDOW_IDENTITY_READ_FAILED",error,window_identity={key:candidate.get(key) for key in ("hwnd","pid","class","title")})
                 hydrated.append(candidate)
-            windows=hydrated
+            return hydrated
+        def apply_windows(hydrated):
+            nonlocal windows
+            if state["closed"] or not win.winfo_exists():
+                return
+            windows=list(hydrated)
             box.delete(0,"end")
             selected_index=None
             scored=[window_descriptor_score(self.window_recommendation,item) for item in windows]
@@ -5450,6 +5826,25 @@ class App:
                 box.selection_set(selected_index)
                 box.see(selected_index)
                 update_rule()
+            status.set("已读取"+str(len(windows))+"个可见窗口")
+            if widgets["refresh"] is not None:
+                widgets["refresh"].configure(state="normal")
+        def refresh_error(error):
+            if state["closed"] or not win.winfo_exists():
+                return
+            status.set("窗口读取失败："+str(error))
+            if widgets["refresh"] is not None:
+                widgets["refresh"].configure(state="normal")
+            self.show_error(str(error))
+        def refresh():
+            if state["closed"]:
+                return
+            status.set("正在后台读取窗口和进程完整身份…")
+            box.delete(0,"end")
+            box.insert("end","正在读取…")
+            if widgets["refresh"] is not None:
+                widgets["refresh"].configure(state="disabled")
+            self.run_background("window_dialog_enumeration",load_windows,apply_windows,refresh_error)
         def confirm():
             selection=box.curselection()
             if not selection:
@@ -5512,7 +5907,8 @@ class App:
             win.destroy()
         tools=ttk.Frame(frame)
         tools.pack(fill="x",pady=(8,0))
-        ttk.Button(tools,text="刷新",command=refresh).pack(side="left")
+        widgets["refresh"]=ttk.Button(tools,text="刷新",command=refresh)
+        widgets["refresh"].pack(side="left")
         ttk.Button(tools,text="确认",command=confirm).pack(side="right",padx=(6,0))
         ttk.Button(tools,text="取消",command=cancel).pack(side="right")
         box.bind("<<ListboxSelect>>",update_rule)
@@ -5528,12 +5924,6 @@ class App:
         temporary["content_rect_norm"]=[0.0,0.0,1.0,1.0]
         temporary["content_aspect"]=client[2]/max(1,client[3])
         preview=bytes(PREVIEW_W*PREVIEW_H*3)
-        preview_error=""
-        try:
-            captured=self.api.capture_gray(temporary,False,True,True)
-            preview=preview_rgb_bytes(captured.get("preview_rgb")) or preview
-        except Exception as error:
-            preview_error=str(error)
         win=tk.Toplevel(parent or self.root)
         win.title("确认游戏渲染区域")
         win.geometry("760x560")
@@ -5541,7 +5931,8 @@ class App:
         frame=ttk.Frame(win,padding=14)
         frame.pack(fill="both",expand=True)
         ttk.Label(frame,text="框选真正的游戏渲染区域",font=("Microsoft YaHei UI",13,"bold")).pack(anchor="w")
-        ttk.Label(frame,text="学习、预览、坐标归一化、点击校验和截图全部使用此区域；区域外工具栏永远不允许自动点击。"+("  预览告警："+preview_error if preview_error else ""),wraplength=720).pack(anchor="w",pady=(4,8))
+        preview_status=tk.StringVar(value="学习、预览、坐标归一化、点击校验和截图全部使用此区域；区域外工具栏永远不允许自动点击。正在后台读取预览…")
+        ttk.Label(frame,textvariable=preview_status,wraplength=720).pack(anchor="w",pady=(4,8))
         canvas_w=640
         canvas_h=360
         canvas=tk.Canvas(frame,width=canvas_w,height=canvas_h,bg="black",highlightthickness=1,highlightbackground="#777777")
@@ -5549,8 +5940,8 @@ class App:
         ppm=b"P6\n"+str(PREVIEW_W).encode("ascii")+b" "+str(PREVIEW_H).encode("ascii")+b"\n255\n"+preview
         image=tk.PhotoImage(data=base64.b64encode(ppm).decode("ascii"),format="PPM")
         scaled=image.zoom(2,2)
-        canvas.create_image(0,0,image=scaled,anchor="nw")
-        state={"norm":list(auto["norm"]),"start":None,"rect_id":None,"result":None,"image":(image,scaled)}
+        image_id=canvas.create_image(0,0,image=scaled,anchor="nw")
+        state={"norm":list(auto["norm"]),"start":None,"rect_id":None,"result":None,"image":(image,scaled),"closed":False}
         info=tk.StringVar()
         ttk.Label(frame,textvariable=info).pack(anchor="w",pady=(6,0))
         def redraw():
@@ -5580,12 +5971,32 @@ class App:
         def set_full():
             state["norm"]=[0.0,0.0,1.0,1.0]
             redraw()
+        def load_preview():
+            captured=self.api.capture_gray(temporary,False,True,True)
+            rgb=preview_rgb_bytes(captured.get("preview_rgb"))
+            if rgb is None:
+                raise CaptureUnavailable("预览截图尺寸无效")
+            return rgb
+        def apply_preview(rgb):
+            if state["closed"] or not win.winfo_exists():
+                return
+            ppm_value=b"P6\n"+str(PREVIEW_W).encode("ascii")+b" "+str(PREVIEW_H).encode("ascii")+b"\n255\n"+rgb
+            loaded=tk.PhotoImage(data=base64.b64encode(ppm_value).decode("ascii"),format="PPM")
+            loaded_scaled=loaded.zoom(2,2)
+            canvas.itemconfigure(image_id,image=loaded_scaled)
+            state["image"]=(loaded,loaded_scaled)
+            preview_status.set("学习、预览、坐标归一化、点击校验和截图全部使用此区域；区域外工具栏永远不允许自动点击。预览读取完成。")
+        def preview_failed(error):
+            if state["closed"] or not win.winfo_exists():
+                return
+            preview_status.set("学习、预览、坐标归一化、点击校验和截图全部使用此区域；区域外工具栏永远不允许自动点击。预览告警："+str(error))
         def confirm():
             rect=apply_normalized_rect(client,state["norm"])
             if rect[2]<FEATURE_W or rect[3]<FEATURE_H:
                 self.show_error("游戏区域过小")
                 return
             state["result"]={"content_rect_norm":[round(value,8) for value in state["norm"]],"content_aspect":round(rect[2]/max(1,rect[3]),8),"content_source":"manual" if state["norm"]!=auto["norm"] else auto["source"],"content_child_class":auto.get("child_class",""),"window_rule_version":WINDOW_RULE_VERSION}
+            state["closed"]=True
             try:
                 win.grab_release()
             except Exception:
@@ -5608,6 +6019,7 @@ class App:
         ttk.Button(tools,text="取消",command=cancel).pack(side="right")
         win.protocol("WM_DELETE_WINDOW",cancel)
         redraw()
+        self.run_background("content_region_preview",load_preview,apply_preview,preview_failed)
         win.wait_visibility()
         win.grab_set()
         win.focus_force()
@@ -5709,13 +6121,17 @@ class App:
             requested=self.lifecycle.snapshot()[3]
             status=requested if requested in {"failed","stopped"} else "stopped"
             result=ModeResult(status,name+("失败" if status=="failed" else "已停止"),{"reason":str(stopped_error)})
-        except Exception:
+        except Exception as worker_error:
             error=traceback.format_exc()
+            game_id=str(self.selected_game.get("id","")) if isinstance(self.selected_game,dict) else ""
+            window_identity={key:self.selected_window.get(key) for key in ("hwnd","pid","class","process_path","process_created") if isinstance(self.selected_window,dict) and key in self.selected_window}
+            self.store.log_error("MODE_WORKER_FAILED",worker_error,mode=name,game_id=game_id,window_identity=window_identity)
             result=ModeResult("failed",name+"失败")
         finally:
             self.api.block_input()
             self.set_input_status("已锁定")
-        self.ui(lambda:self._begin_mode_stopping(result,error))
+            self.store.close_current_thread()
+        self.ui(lambda:self._begin_mode_stopping(result,error),"mode_result")
     def request_mode_stop(self,status="stopped",reason=""):
         if self.mode_state==MODE_IDLE:
             return False
@@ -5775,7 +6191,7 @@ class App:
         calibration=self.api.calibration_for(self.selected_window.get("hwnd") if self.selected_window else 0)
         target=self.selected_window or {}
         content=self.api.validate_target(target,False) if target else (0,0,1,1)
-        result={"previous_action":last_signature or "","seconds_since_previous":round(max(0.0,min(60.0,time.time()-last_time)) if last_time else 60.0,3),"previous_action_changed_frame":bool(last_changed),"motion_channel_valid":bool(motion_valid),"session_id":str(session_id or "unspecified"),"capture_method":str(capture_method or "unknown"),"repeat_policy":repeat_policy if repeat_policy in REPEAT_POLICIES else "one_shot","duplicate_threshold":float(calibration.get("duplicate",3.0)),"calibration":dict(calibration),"process_path":os.path.normcase(str(target.get("process_path",""))),"window_class":str(target.get("class","")),"content_rect_norm":[round(safe_float(value,0.0),6) for value in target.get("content_rect_norm",[0,0,1,1])[:4]],"content_aspect":content[2]/max(1,content[3]),"window_rule_version":WINDOW_RULE_VERSION,"capture_backend_version":CAPTURE_BACKEND_VERSION}
+        result={"previous_action":last_signature or "","seconds_since_previous":round(max(0.0,min(60.0,time.monotonic()-last_time)) if last_time else 60.0,3),"previous_action_changed_frame":bool(last_changed),"motion_channel_valid":bool(motion_valid),"session_id":str(session_id or "unspecified"),"capture_method":str(capture_method or "unknown"),"repeat_policy":repeat_policy if repeat_policy in REPEAT_POLICIES else "one_shot","duplicate_threshold":float(calibration.get("duplicate",3.0)),"calibration":dict(calibration),"process_path":os.path.normcase(str(target.get("process_path",""))),"window_class":str(target.get("class","")),"content_rect_norm":[round(safe_float(value,0.0),6) for value in target.get("content_rect_norm",[0,0,1,1])[:4]],"content_aspect":content[2]/max(1,content[3]),"window_rule_version":WINDOW_RULE_VERSION,"capture_backend_version":CAPTURE_BACKEND_VERSION}
         if isinstance(temporal,dict):
             result.update(temporal)
         return result
@@ -5794,7 +6210,7 @@ class App:
         actions=list(recent_actions)[-4:]
         while len(actions)<2:
             actions.insert(0,"<START>")
-        return {"recent_frame_count":len(frames),"recent_frame_deltas":deltas,"recent_actions":actions,"state_duration":round(max(0.0,min(60.0,time.time()-float(state_since))),3),"cursor":cursor_point,"window_size":[int(rect[2]),int(rect[3])] if len(rect)==4 else None,"dpi":int(frame.get("dpi",0)),"capture_method":str(frame.get("method","unknown"))}
+        return {"recent_frame_count":len(frames),"recent_frame_deltas":deltas,"recent_actions":actions,"state_duration":round(max(0.0,min(60.0,time.monotonic()-float(state_since))),3),"cursor":cursor_point,"window_size":[int(rect[2]),int(rect[3])] if len(rect)==4 else None,"dpi":int(frame.get("dpi",0)),"capture_method":str(frame.get("method","unknown"))}
     def start_learning(self):
         self.start_worker("学习",self.learning_controller.run,True)
     def learning_worker(self):
@@ -5804,12 +6220,15 @@ class App:
         target=self.require_window(False)
         hwnd=target["hwnd"]
         session_id="learn|"+uuid.uuid4().hex
+        self.store.begin_learning_session(game["id"],session_id)
         calibration=self.ensure_capture_calibration(target,"学习")
         if not self.api.request_foreground(hwnd):
             self.set_status("无法自动切换到目标窗口，学习将等待目标窗口成为前台")
         self.wait_escape_release()
         keyboard_state={"generation":0,"last_time":0.0}
         strict_violation=False
+        invalid_marked=False
+        invalid_reason=""
         isolation=StrictInputIsolation(self.stop_event)
         learned=0
         discarded=0
@@ -5822,11 +6241,12 @@ class App:
         last_action_time=0.0
         last_action_feature=None
         last_action_changed=True
-        state_since=time.time()
+        state_since=time.monotonic()
         with ModeSession(self,target) as session:
             frame_buffer=session.start_frames(20.0,2.0,0.1,"learning")
             keyboard=session.start_keyboard()
             monitor=session.start_mouse()
+            mouse_drop_baseline=monitor.snapshot()["dropped_events"]
             self.lifecycle.mark_running()
             self.mode_state=MODE_RUNNING
             active={}
@@ -5839,13 +6259,17 @@ class App:
             hover_point=None
             last_update=0.0
             def drain_keyboard_events():
-                nonlocal keyboard_count,strict_violation
+                nonlocal keyboard_count,strict_violation,invalid_marked,invalid_reason
                 events=[event for event in keyboard.drain() if event.get("kind")=="other" and event.get("down")]
                 if events:
                     strict_violation=True
+                    invalid_reason="non_escape_keyboard_input"
                     keyboard_count+=len(events)
                     keyboard_state["generation"]=safe_int(keyboard_state["generation"],0)+1
-                    keyboard_state["last_time"]=safe_float(events[0].get("time"),time.time())
+                    keyboard_state["last_time"]=safe_float(events[0].get("time"),time.monotonic())
+                    if not invalid_marked:
+                        self.store.invalidate_learning_session(game["id"],session_id,"non_escape_keyboard_input")
+                        invalid_marked=True
                     isolation.signal("keyboard",keyboard_state["last_time"])
                     self.request_mode_stop("stopped","学习检测到非ESC键盘输入，整段session无效")
                     self.mode_state=MODE_STOPPING
@@ -5889,11 +6313,11 @@ class App:
                     signature=action_signature(action)
                     recent_actions.append(signature)
                     last_action_signature=signature
-                    last_action_time=time.time()
+                    last_action_time=time.monotonic()
                     changed=True if last_action_feature is None else visual_distance(last_action_feature,frame["f"])>float(calibration.get("significant_change",60.0))
                     last_action_changed=changed
                     if changed:
-                        state_since=time.time()
+                        state_since=time.monotonic()
                     last_action_feature=frame["f"]
                 else:
                     duplicates+=1
@@ -5907,7 +6331,27 @@ class App:
                             save_click(button,item)
                         pending_click.pop(button,None)
             while not self.should_stop():
-                now=time.time()
+                now=time.monotonic()
+                mouse_snapshot=monitor.snapshot()
+                if mouse_snapshot["dropped_events"]>mouse_drop_baseline:
+                    strict_violation=True
+                    invalid_reason="mouse_event_queue_overflow"
+                    if not invalid_marked:
+                        self.store.invalidate_learning_session(game["id"],session_id,invalid_reason)
+                        invalid_marked=True
+                    isolation.signal("mouse_queue_overflow",now)
+                    self.request_mode_stop("stopped","鼠标事件队列溢出，整段session无效")
+                    self.mode_state=MODE_STOPPING
+                    self.api.block_input()
+                    self.api.release_all_buttons()
+                    active.clear()
+                    pending_click.clear()
+                    motion=None
+                    last_cursor=None
+                    hover_point=None
+                    hover_start=0.0
+                    self.set_status("鼠标事件队列溢出，学习立即停止且整段session将被标记无效")
+                    break
                 keyboard_events=drain_keyboard_events()
                 if keyboard_events:
                     active.clear()
@@ -6088,14 +6532,18 @@ class App:
                 time.sleep(0.012)
         self.learning_controller.submit(self.store,game["id"],session_id)
         if strict_violation:
-            removed=self.store.discard_session(game["id"],session_id)
+            reason=invalid_reason or "input_safety_violation"
+            removed=self.store.discard_session(game["id"],session_id,reason)
             keyboard_discarded=max(keyboard_discarded,removed)
+            if reason=="mouse_event_queue_overflow":
+                return ModeResult("stopped","学习因鼠标事件队列溢出而严格停止；整段session已作废并删除"+str(removed)+"个样本",{"invalid_session":session_id,"dropped_mouse_events":monitor.snapshot()["dropped_events"]-mouse_drop_baseline})
             return ModeResult("stopped","学习因检测到非ESC键盘输入而严格停止；整段session已作废并删除"+str(removed)+"个样本",{"invalid_session":session_id,"keyboard_events":keyboard_count})
+        self.store.validate_learning_session(game["id"],session_id)
         summary="学习已停止：有效"+str(learned)+"，重复或配额抑制"+str(duplicates)+"，越界废弃"+str(discarded)+"，无效画面"+str(invalid_frames)
         return ModeResult("stopped" if self.stop_event and self.stop_event.is_set() else "completed",summary)
     def _run_review_process(self):
         game=self.require_game()
-        self.store.flush_samples()
+        self.store.sample_write_barrier()
         samples,stats=self.store.load_samples(game["id"])
         rejections=self.store.load_rejections(game["id"],500)
         worker=ReviewProcessWorker({"game":game,"samples":samples,"stats":stats,"rejections":rejections,"profile":self.store.load_game_profile(game["id"]),"cache_capacity":50000})
@@ -6832,7 +7280,7 @@ class App:
             row["coverage"]=row["accepted"]/row["total"] if row["total"] else 0.0
             row["accepted_error_rate"]=row["errors"]/row["accepted"] if row["accepted"] else None
             row["error_upper_95"]=binomial_error_upper(row["errors"],row["accepted"],0.95)
-            row["passed"]=bool(row["total"]>=20 and row["errors"]==0 and row["accuracy"]>=0.80)
+            row["passed"]=bool(row["total"]>=VersionedThresholdConfig.capture_min_holdout and row["errors"]<=VersionedThresholdConfig.capture_max_errors and row["accuracy"]>=VersionedThresholdConfig.capture_min_accuracy)
             method_rules_pass=method_rules_pass and row["passed"]
             per_method[method]=row
         per_scene={}
@@ -6842,7 +7290,7 @@ class App:
             row["accuracy"]=row["correct"]/row["total"] if row["total"] else 0.0
             row["coverage"]=row["accepted"]/row["total"] if row["total"] else 0.0
             row["error_upper_95"]=binomial_error_upper(row["errors"],row["accepted"],0.95)
-            row["passed"]=bool(row["total"]>=10 and row["errors"]==0 and row["accuracy"]>=0.75)
+            row["passed"]=bool(row["total"]>=VersionedThresholdConfig.scene_min_holdout and row["errors"]<=VersionedThresholdConfig.scene_max_errors and row["accuracy"]>=VersionedThresholdConfig.scene_min_accuracy)
             scene_rules_pass=scene_rules_pass and row["passed"]
             per_scene[scene]=row
         for proto in prototypes:
@@ -6852,12 +7300,12 @@ class App:
             proto["cooldown"]=runtime["cooldown"]
             proto["dangerous"]=runtime["dangerous"]
         authorized_prototypes=sum(1 for proto in prototypes if proto.get("authorized"))
-        enough=bool(split_info.get("complete")) and int(split_info.get("session_count",0))>=2 and holdout_count>=150 and covered_holdout>=50 and bool(train_methods)
-        global_pass=overall_accuracy>=0.80 and error_upper_95<0.02 and dangerous_false==0 and uncovered_false_accept==0
+        enough,global_pass=evaluate_validation_thresholds(split_info.get("complete"),split_info.get("session_count",0),holdout_count,accepted,coverage,overall_accuracy,error_upper_95,dangerous_false,uncovered_false_accept)
+        enough=bool(enough and train_methods)
         action_rules_pass=authorized_prototypes>0
         passed=bool(enough and global_pass and action_rules_pass and method_rules_pass and scene_rules_pass and prototypes)
         validation_status="passed" if passed else "insufficient" if not enough or not action_rules_pass or not method_rules_pass else "failed"
-        validation={"status":validation_status,"split":str(split_info.get("mode","unknown")),"split_complete":bool(split_info.get("complete")),"split_reason":str(split_info.get("reason","")),"strata":int(split_info.get("strata",0)),"session_count":int(split_info.get("session_count",0)),"holdout_sessions":sorted(holdout_sessions),"minimum_holdout":VersionedThresholdConfig.review_min_holdout,"minimum_accepted":VersionedThresholdConfig.review_min_accepted,"minimum_ordinary_action_holdout":VersionedThresholdConfig.ordinary_min_positive,"minimum_ordinary_sessions":VersionedThresholdConfig.ordinary_min_sessions,"minimum_dangerous_positive":VersionedThresholdConfig.dangerous_min_positive,"minimum_dangerous_negative":VersionedThresholdConfig.dangerous_min_negative,"minimum_dangerous_sessions":VersionedThresholdConfig.dangerous_min_sessions,"minimum_coverage":VersionedThresholdConfig.minimum_coverage,"maximum_error_upper_95":VersionedThresholdConfig.maximum_error_upper_95,"minimum_overall_accuracy":VersionedThresholdConfig.minimum_overall_accuracy,"maximum_dangerous_false":0,"holdout":holdout_count,"accepted":accepted,"errors":errors,"correct":correct,"coverage":coverage,"accepted_error_rate":accepted_error_rate,"error_upper_95":error_upper_95,"overall_accuracy":overall_accuracy,"dangerous_false":dangerous_false,"dangerous_false_rate":dangerous_false_rate,"uncovered_actions":uncovered_actions,"uncovered_rejected":uncovered_rejected,"uncovered_false_accept":uncovered_false_accept,"covered_holdout":covered_holdout,"authorized_prototypes":authorized_prototypes,"decorrelated_removed":decorrelated_removed,"per_action":per_action,"per_capture_method":per_method,"per_scene":per_scene,"visual_group_intersection":list(split_info.get("visual_group_intersection",[])),"ambiguous_prototypes":sum(1 for proto in prototypes if proto.get("ambiguous")),"training_checksums":train_checksums,"holdout_checksums":holdout_checksums,"checksum_intersection":[]}
+        validation={"status":validation_status,"split":str(split_info.get("mode","unknown")),"split_complete":bool(split_info.get("complete")),"split_reason":str(split_info.get("reason","")),"strata":int(split_info.get("strata",0)),"session_count":int(split_info.get("session_count",0)),"holdout_sessions":sorted(holdout_sessions),"required_sessions":VersionedThresholdConfig.required_sessions,"minimum_holdout":VersionedThresholdConfig.review_min_holdout,"minimum_accepted":VersionedThresholdConfig.review_min_accepted,"minimum_ordinary_action_holdout":VersionedThresholdConfig.ordinary_min_positive,"minimum_ordinary_sessions":VersionedThresholdConfig.ordinary_min_sessions,"minimum_dangerous_positive":VersionedThresholdConfig.dangerous_min_positive,"minimum_dangerous_negative":VersionedThresholdConfig.dangerous_min_negative,"minimum_dangerous_sessions":VersionedThresholdConfig.dangerous_min_sessions,"minimum_coverage":VersionedThresholdConfig.minimum_coverage,"maximum_error_upper_95":VersionedThresholdConfig.maximum_error_upper_95,"minimum_overall_accuracy":VersionedThresholdConfig.minimum_overall_accuracy,"maximum_dangerous_false":VersionedThresholdConfig.maximum_dangerous_false,"maximum_uncovered_false_accept":VersionedThresholdConfig.maximum_uncovered_false_accept,"capture_min_holdout":VersionedThresholdConfig.capture_min_holdout,"capture_min_accuracy":VersionedThresholdConfig.capture_min_accuracy,"capture_max_errors":VersionedThresholdConfig.capture_max_errors,"scene_min_holdout":VersionedThresholdConfig.scene_min_holdout,"scene_min_accuracy":VersionedThresholdConfig.scene_min_accuracy,"scene_max_errors":VersionedThresholdConfig.scene_max_errors,"holdout":holdout_count,"accepted":accepted,"errors":errors,"correct":correct,"coverage":coverage,"reject_rate":1.0-coverage,"accepted_error_rate":accepted_error_rate,"error_upper_95":error_upper_95,"overall_accuracy":overall_accuracy,"dangerous_false":dangerous_false,"dangerous_false_rate":dangerous_false_rate,"uncovered_actions":uncovered_actions,"uncovered_rejected":uncovered_rejected,"uncovered_false_accept":uncovered_false_accept,"covered_holdout":covered_holdout,"authorized_prototypes":authorized_prototypes,"decorrelated_removed":decorrelated_removed,"per_action":per_action,"per_capture_method":per_method,"per_scene":per_scene,"visual_group_intersection":list(split_info.get("visual_group_intersection",[])),"ambiguous_prototypes":sum(1 for proto in prototypes if proto.get("ambiguous")),"training_checksums":train_checksums,"holdout_checksums":holdout_checksums,"checksum_intersection":[]}
         sequence_counts=defaultdict(Counter)
         for session in sorted({self.review_controller.session_of(item) for item in train}):
             ordered_session=sorted((item for item in train if self.review_controller.session_of(item)==session),key=lambda item:float(item.get("created",0.0)))
@@ -7089,7 +7537,7 @@ class App:
         no_change_count=0
         previous_feature=None
         previous_frame_stamp=0.0
-        state_since=time.time()
+        state_since=time.monotonic()
         action_hits=defaultdict(deque)
         with ModeSession(self,target) as session:
             frame_buffer=session.start_frames(max(8.0,float(calibration.get("fps",15.0))),2.5,0.1,"training")
@@ -7130,11 +7578,11 @@ class App:
                     keyboard_count+=len(key_events)
                     mouse_count+=len(mouse_events)
                     if key_events or keyboard_interrupt.is_set():
-                        isolation.signal("keyboard",key_events[0].get("time") if key_events else time.time())
+                        isolation.signal("keyboard",key_events[0].get("time") if key_events else time.monotonic())
                         reason="检测到非ESC键盘输入，训练立即停止"
                         self.set_input_status("因键盘输入锁定")
                     else:
-                        isolation.signal("mouse",mouse_events[0].get("time") if mouse_events else time.time())
+                        isolation.signal("mouse",mouse_events[0].get("time") if mouse_events else time.monotonic())
                         reason="检测到物理或其他程序注入的鼠标输入，训练立即停止"
                         self.set_input_status("因人工鼠标输入锁定")
                     self.request_mode_stop("stopped",reason)
@@ -7202,14 +7650,14 @@ class App:
                     continue
                 if captured["time"]!=previous_frame_stamp:
                     if previous_feature is not None and visual_distance(previous_feature,feature)>float(calibration.get("significant_change",60.0)):
-                        state_since=time.time()
+                        state_since=time.monotonic()
                     previous_feature=feature
                     previous_frame_stamp=captured["time"]
                 significant=last_action_feature is not None and visual_distance(last_action_feature,feature)>float(calibration.get("significant_change",60.0))
                 if significant:
                     state_unlocked=True
                     no_change_count=0
-                    state_since=time.time()
+                    state_since=time.monotonic()
                 temporal=self.build_temporal_context(frame_buffer,captured,recent_actions,state_since)
                 if not temporal_from_context({**temporal,"previous_action_changed_frame":significant}).get("complete"):
                     self.set_status("等待至少3帧短时序上下文")
@@ -7265,10 +7713,10 @@ class App:
                     time.sleep(0.1)
                     continue
                 minimum_gap=max(self.action_cooldown(action) if repeat_policy=="one_shot" else 0.0,1.0/max_rate if repeat_policy in {"rate_limited","repeatable"} else 0.0)
-                if time.time()-last_action_time<minimum_gap:
+                if time.monotonic()-last_action_time<minimum_gap:
                     time.sleep(0.03)
                     continue
-                now=time.time()
+                now=time.monotonic()
                 hits=action_hits[cluster_id]
                 while hits and now-hits[0]>1.0:
                     hits.popleft()
@@ -7306,7 +7754,7 @@ class App:
                 except InputStopped:
                     if mouse_interrupt.is_set() or keyboard_interrupt.is_set() or not keyboard.all_released():
                         kind="mouse" if mouse_interrupt.is_set() else "keyboard"
-                        isolation.signal(kind,time.time())
+                        isolation.signal(kind,time.monotonic())
                         reason="检测到物理或其他程序注入的鼠标输入，训练立即停止" if kind=="mouse" else "检测到非ESC键盘输入，训练立即停止"
                         self.request_mode_stop("stopped",reason)
                         self.mode_state=MODE_STOPPING
@@ -7324,7 +7772,7 @@ class App:
                     self.api.block_input()
                     if not mouse_interrupt.is_set() and not keyboard_interrupt.is_set() and keyboard.all_released():
                         self.set_input_status("已锁定")
-                action_end=time.time()
+                action_end=time.monotonic()
                 actions+=1
                 hits.append(action_end)
                 recent_actions.append(canonical)
@@ -7351,7 +7799,7 @@ class App:
                 if changed:
                     no_change_count=0
                     state_unlocked=True
-                    state_since=time.time()
+                    state_since=time.monotonic()
                 else:
                     no_change_count+=1
                     if repeat_policy in {"one_shot","hold_until_change"} and no_change_count>=2:
@@ -7421,7 +7869,7 @@ class App:
             choice_frame=ttk.Frame(frame)
             choice_frame.pack(fill="both",expand=True,pady=(10,0))
             answer_buttons=[]
-            state={"frame":None,"choices":[],"candidates":[],"image":None,"locked":False,"recent_actions":deque(["<START>","<START>"],maxlen=4),"state_since":time.time(),"waiting":False}
+            state={"frame":None,"choices":[],"candidates":[],"image":None,"locked":False,"recent_actions":deque(["<START>","<START>"],maxlen=4),"state_since":time.monotonic(),"waiting":False}
             def schedule(delay,callback):
                 if self.ask_window is None:
                     return
@@ -7477,7 +7925,7 @@ class App:
                     warnings.append("后端未验收")
                 if not question_frame.get("capture_valid"):
                     warnings.append("画面无效")
-                stamp=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(float(question_frame.get("time",time.time()))))
+                stamp=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(float(question_frame.get("wall_time",time.time()))))
                 preview_info.set("采集时间："+stamp+"  后端："+str(question_frame.get("method","未知"))+"  最新帧："+("是" if is_latest else "否")+"  质量告警："+("、".join(warnings) if warnings else "无"))
             def apply_packet(packet):
                 if self.ask_window is None:
@@ -7521,7 +7969,7 @@ class App:
                     return
                 if result and result.get("saved") and result.get("action"):
                     state["recent_actions"].append(action_signature(result["action"]))
-                    state["state_since"]=time.time()
+                    state["state_since"]=time.monotonic()
                 counts=self.ask_counts or {}
                 self.status.set("请教中：已保存"+str(counts.get("saved",0))+"，重复未保存"+str(counts.get("duplicates",0))+"，跳过"+str(counts.get("skipped",0))+"，拒绝记录"+str(counts.get("rejected",0))+"；模型需要复习")
                 schedule(100,request_question)
@@ -7702,9 +8150,18 @@ class App:
         ttk.Label(frame,text="当前游戏数据维护",font=("Microsoft YaHei UI",13,"bold")).pack(anchor="w",pady=(0,10))
         ttk.Label(frame,textvariable=text,wraplength=510).pack(anchor="w",fill="x")
         def refresh():
-            stats=self.store.sample_stats(game["id"])
-            model=self.store.load_model(game["id"])
-            text.set("游戏："+game["name"]+"\n有效样本："+str(stats["valid"])+"\n异常行："+str(stats["invalid"])+"\n数据大小："+str(round(stats["bytes"]/1024,1))+" KB\n模型原型："+str(len(model.get("prototypes",[])) if model else 0))
+            text.set("正在后台读取样本统计和模型状态…")
+            def load():
+                stats=self.store.sample_stats(game["id"])
+                model=self.store.load_model(game["id"])
+                return "游戏："+game["name"]+"\n有效样本："+str(stats["valid"])+"\n异常行："+str(stats["invalid"])+"\n数据大小："+str(round(stats["bytes"]/1024,1))+" KB\n模型原型："+str(len(model.get("prototypes",[])) if model else 0)
+            def apply(value):
+                if win.winfo_exists():
+                    text.set(value)
+            def failed(error):
+                if win.winfo_exists():
+                    text.set("数据读取失败："+str(error))
+            self.run_background("data_dialog_refresh",load,apply,failed)
         def compact():
             result=self.store.compact_samples(game["id"])
             message="数据整理完成：按动作种类、按钮、规范动作与视觉多样性保留"+str(result["kept"])+"，移除"+str(result["removed"])
@@ -8003,7 +8460,7 @@ def run_self_test(path=None):
     stop=threading.Event()
     isolation=StrictInputIsolation(stop)
     before=isolation.can_automate()
-    isolation.signal("keyboard",time.time())
+    isolation.signal("keyboard",time.monotonic())
     check("人工输入后自动化锁定",before and stop.is_set() and not isolation.can_automate())
     fake_bridge=object.__new__(WinBridge)
     fake_bridge.input_lock=threading.RLock()
@@ -8184,6 +8641,7 @@ def run_self_test(path=None):
             valid_feature=bytes([1])*FEATURE_LEN
             valid_action=json.dumps(sample_action_a,ensure_ascii=False,separators=(",",":"))
             with store.lock,store.db:
+                store.db.execute("INSERT INTO learning_sessions(game_id,session_id,status,started,finished,invalid_reason) VALUES('g1','s1','valid',1.0,2.0,'self_test')")
                 store.db.execute("INSERT INTO samples(game_id,created,kind,action_signature,action_family,repeat_policy,feature_algorithm_version,action_algorithm_version,feature,coarse,action,source,session_id,capture_method,context,thumbnail,weight,fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",("g1",1.0,"click",action_signature(sample_action_a),action_family_key(sample_action_a),"one_shot",FEATURE_ALGORITHM_VERSION,ACTION_ALGORITHM_VERSION,sqlite3.Binary(zlib.compress(valid_feature)),sqlite3.Binary(coarse_feature(valid_feature)),valid_action,"learn","s1","wgc","{}",None,1.0,"valid"))
                 store.db.execute("INSERT INTO samples(game_id,created,kind,action_signature,action_family,repeat_policy,feature_algorithm_version,action_algorithm_version,feature,coarse,action,source,session_id,capture_method,context,thumbnail,weight,fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",("g1",2.0,"click",action_signature(sample_action_a),action_family_key(sample_action_a),"one_shot",FEATURE_ALGORITHM_VERSION,ACTION_ALGORITHM_VERSION,sqlite3.Binary(b"bad"),sqlite3.Binary(coarse_feature(valid_feature)),valid_action,"learn","s1","wgc","{}",None,1.0,"corrupt"))
                 store.db.execute("INSERT INTO models VALUES(?,?,?,?,?,?,?,?)",("g1","complete",1.0,1.0,1,"{}",sqlite3.Binary(b"x"),"x"))
@@ -8228,17 +8686,350 @@ def run_self_test(path=None):
         finally:
             store.close(2.0)
     check("数据库迁移保持样本和游戏名称",game_name=="迁移游戏" and sample_count==1 and int(version)==DATABASE_SCHEMA_VERSION)
+    with tempfile.TemporaryDirectory() as folder:
+        store=DataStore(folder)
+        barrier_release=threading.Event()
+        try:
+            g1={"id":"g1","name":"屏障游戏一","created":1.0,"needs_review":False,"last_review":None}
+            g2={"id":"g2","name":"屏障游戏二","created":2.0,"needs_review":False,"last_review":None}
+            store.replace_games([g1,g2],"g1")
+            action=normalize_action({"kind":"click","button":"left","path":[[0.31,0.41]],"duration":0.08})
+            def context_for(sid):
+                return {"session_id":sid,"capture_method":"wgc","repeat_policy":"one_shot","duplicate_threshold":0.1}
+            entered=threading.Event()
+            barrier_release.clear()
+            store.writer_before_commit=lambda batch:(entered.set(),barrier_release.wait(3.0))
+            sid="learn|barrier"
+            store.begin_learning_session("g1",sid)
+            store.append_sample("g1",bytes([11])*FEATURE_LEN,action,"learn",context_for(sid),None,1.0)
+            store.pending_event.set()
+            writer_taken=entered.wait(3.0)
+            with store.pending_lock:
+                inflight_visible=not store.pending_samples and store.writer_inflight==1
+            barrier_done=threading.Event()
+            barrier_errors=[]
+            def wait_barrier():
+                try:
+                    store.sample_write_barrier(4.0)
+                except Exception as error:
+                    barrier_errors.append(str(error))
+                finally:
+                    store.close_current_thread()
+                    barrier_done.set()
+            barrier_thread=threading.Thread(target=wait_barrier,name="SelfTestBarrier")
+            barrier_thread.start()
+            time.sleep(0.08)
+            barrier_waited=not barrier_done.is_set()
+            barrier_release.set()
+            barrier_thread.join(4.0)
+            store.writer_before_commit=None
+            store.validate_learning_session("g1",sid)
+            committed=len(store.load_samples("g1")[0])==1
+            discard_entered=threading.Event()
+            barrier_release.clear()
+            store.writer_before_commit=lambda batch:(discard_entered.set(),barrier_release.wait(3.0))
+            discard_sid="learn|discard"
+            store.begin_learning_session("g1",discard_sid)
+            store.append_sample("g1",bytes([23])*FEATURE_LEN,action,"learn",context_for(discard_sid),None,1.0)
+            store.pending_event.set()
+            discard_taken=discard_entered.wait(3.0)
+            discard_done=threading.Event()
+            discard_result=[]
+            def discard_worker():
+                try:
+                    discard_result.append(store.discard_session("g1",discard_sid,"self_test_discard"))
+                finally:
+                    store.close_current_thread()
+                    discard_done.set()
+            discard_thread=threading.Thread(target=discard_worker,name="SelfTestDiscard")
+            discard_thread.start()
+            time.sleep(0.08)
+            discard_waited=not discard_done.is_set()
+            barrier_release.set()
+            discard_thread.join(4.0)
+            store.writer_before_commit=None
+            discard_clean=store.db.execute("SELECT COUNT(*) FROM samples WHERE game_id='g1' AND session_id=?",(discard_sid,)).fetchone()[0]==0 and store.learning_session_status("g1",discard_sid)["status"]=="invalid"
+            delete_entered=threading.Event()
+            barrier_release.clear()
+            store.writer_before_commit=lambda batch:(delete_entered.set(),barrier_release.wait(3.0))
+            delete_sid="learn|delete"
+            store.begin_learning_session("g2",delete_sid)
+            store.append_sample("g2",bytes([37])*FEATURE_LEN,action,"learn",context_for(delete_sid),None,1.0)
+            store.pending_event.set()
+            delete_taken=delete_entered.wait(3.0)
+            delete_done=threading.Event()
+            delete_result=[]
+            def delete_worker():
+                try:
+                    delete_result.append(store.delete_game("g2"))
+                finally:
+                    store.close_current_thread()
+                    delete_done.set()
+            delete_thread=threading.Thread(target=delete_worker,name="SelfTestDelete")
+            delete_thread.start()
+            time.sleep(0.08)
+            delete_waited=not delete_done.is_set()
+            barrier_release.set()
+            delete_thread.join(4.0)
+            store.writer_before_commit=None
+            delete_clean=delete_result==[True] and not store.db.execute("SELECT 1 FROM games WHERE id='g2'").fetchone()
+            recovery_sid="learn|recovery"
+            store.begin_learning_session("g1",recovery_sid)
+            failed_once=threading.Event()
+            def fail_once(batch):
+                store.writer_before_commit=None
+                failed_once.set()
+                raise sqlite3.IntegrityError("self_test_writer_failure")
+            store.writer_before_commit=fail_once
+            store.append_sample("g1",bytes([49])*FEATURE_LEN,action,"learn",context_for(recovery_sid),None,1.0)
+            store.pending_event.set()
+            failure_seen=failed_once.wait(3.0)
+            recovery_deadline=time.monotonic()+5.0
+            recovered=False
+            while time.monotonic()<recovery_deadline:
+                with store.pending_lock:
+                    recovered=not store.pending_samples and store.writer_inflight==0 and store.writer_error is None
+                if recovered:
+                    break
+                time.sleep(0.05)
+            if recovered:
+                store.validate_learning_session("g1",recovery_sid)
+            writer_race_ok=writer_taken and inflight_visible and barrier_waited and barrier_done.is_set() and not barrier_errors and committed and discard_taken and discard_waited and discard_done.is_set() and bool(discard_result) and discard_clean and delete_taken and delete_waited and delete_done.is_set() and delete_clean and failure_seen and recovered
+        finally:
+            barrier_release.set()
+            store.writer_before_commit=None
+            store.close(5.0)
+    check("写入屏障覆盖提交中删除作废与错误恢复",writer_race_ok)
+    with tempfile.TemporaryDirectory() as folder:
+        store=DataStore(folder)
+        try:
+            game={"id":"g1","name":"崩溃恢复游戏","created":1.0,"needs_review":False,"last_review":None}
+            store.replace_games([game],"g1")
+            sid="learn|staging_crash"
+            store.begin_learning_session("g1",sid)
+            store.append_sample("g1",bytes([61])*FEATURE_LEN,sample_action_a,"learn",{"session_id":sid,"capture_method":"wgc","repeat_policy":"one_shot"},None,1.0)
+            store.sample_write_barrier(4.0)
+        finally:
+            store.close(4.0)
+        reopened=DataStore(folder)
+        try:
+            visible_samples,_=reopened.load_samples("g1")
+            raw_count=reopened.db.execute("SELECT COUNT(*) FROM samples WHERE game_id='g1' AND session_id=?",(sid,)).fetchone()[0]
+            staging_status=reopened.learning_session_status("g1",sid)
+            staging_hidden=not visible_samples and raw_count==1 and staging_status and staging_status["status"]=="staging"
+        finally:
+            reopened.close(4.0)
+    check("staging学习session崩溃后永不进入复习",staging_hidden)
+    with tempfile.TemporaryDirectory() as folder:
+        store=DataStore(folder)
+        try:
+            game={"id":"g1","name":"模型兼容游戏","created":1.0,"needs_review":False,"last_review":None}
+            store.replace_games([game],"g1")
+            temporal={"recent_frame_count":3,"recent_frame_deltas":[1.0,2.0],"recent_actions":["<START>","click|left"],"previous_action_changed_frame":True,"state_duration":0.1,"cursor":[0.5,0.5],"window_size":[640,360],"dpi":96,"capture_method":"wgc"}
+            binding={"process_paths":["c:\\game.exe"],"window_classes":["GameWnd"],"content_rect_norms":[[0.0,0.0,1.0,1.0]],"content_aspect_min":16/9,"content_aspect_max":16/9,"dpi_min":96,"dpi_max":96,"capture_methods":["wgc"],"window_rule_version":WINDOW_RULE_VERSION,"capture_backend_version":CAPTURE_BACKEND_VERSION}
+            model={"format_version":FORMAT_VERSION,"model_schema_version":MODEL_SCHEMA_VERSION,"feature_width":FEATURE_W,"feature_height":FEATURE_H,"feature_algorithm_version":FEATURE_ALGORITHM_VERSION,"action_algorithm_version":ACTION_ALGORITHM_VERSION,"game_id":"g1","complete":True,"compatibility_signature":compatibility_signature(),"source_build_hash":"0"*64,"algorithm_snapshot":{"compatibility_signature":compatibility_signature(),"source_build_hash":"0"*64},"model_binding":binding,"sequence_model":{},"safety_profile_checksum":"a"*64,"capture_backends":["wgc"],"validation":{},"prototypes":[{"id":"p1","cluster_id":"c1","canonical_action_signature":action_signature(sample_action_a),"f":bytes([71])*FEATURE_LEN,"coarse":coarse_feature(bytes([71])*FEATURE_LEN),"a":sample_action_a,"threshold":1.0,"support":1,"temporal":temporal,"temporal_threshold":1.0,"nearest_conflicting_distance":None,"nearest_rejected_distance":None,"minimum_second_candidate_gap":0.1,"repeat_policy":"one_shot","max_rate":1.0,"authorized":True}]}
+            ui_only_changed=dict(model)
+            ui_only_changed["source_build_hash"]="f"*64
+            ui_only_changed["algorithm_snapshot"]={"compatibility_signature":compatibility_signature(),"source_build_hash":"f"*64}
+            feature_changed=dict(model)
+            changed_signature=dict(compatibility_signature())
+            changed_signature["feature_algorithm_version"]=FEATURE_ALGORITHM_VERSION+1
+            feature_changed["compatibility_signature"]=changed_signature
+            compatibility_ok=store._model_valid(model,"g1",True) and store._model_valid(ui_only_changed,"g1",True) and not store._model_valid(feature_changed,"g1",True)
+        finally:
+            store.close(4.0)
+    check("UI构建变化兼容且特征版本变化拒绝模型",compatibility_ok)
+    threshold_original={key:getattr(VersionedThresholdConfig,key) for key in ("review_min_accepted","minimum_coverage","review_min_holdout","required_sessions")}
+    try:
+        enough_base,global_base=evaluate_validation_thresholds(True,VersionedThresholdConfig.required_sessions,VersionedThresholdConfig.review_min_holdout,VersionedThresholdConfig.review_min_accepted,VersionedThresholdConfig.minimum_coverage,VersionedThresholdConfig.minimum_overall_accuracy,VersionedThresholdConfig.maximum_error_upper_95,0,0)
+        VersionedThresholdConfig.review_min_accepted=threshold_original["review_min_accepted"]+1
+        enough_changed,_=evaluate_validation_thresholds(True,threshold_original["required_sessions"],threshold_original["review_min_holdout"],threshold_original["review_min_accepted"],VersionedThresholdConfig.minimum_coverage,VersionedThresholdConfig.minimum_overall_accuracy,VersionedThresholdConfig.maximum_error_upper_95,0,0)
+        VersionedThresholdConfig.review_min_accepted=threshold_original["review_min_accepted"]
+        VersionedThresholdConfig.minimum_coverage=min(1.0,threshold_original["minimum_coverage"]+0.01)
+        _,global_changed=evaluate_validation_thresholds(True,threshold_original["required_sessions"],threshold_original["review_min_holdout"],threshold_original["review_min_accepted"],threshold_original["minimum_coverage"],VersionedThresholdConfig.minimum_overall_accuracy,VersionedThresholdConfig.maximum_error_upper_95,0,0)
+        threshold_sync=enough_base and global_base and not enough_changed and not global_changed and abs((1.0-0.83)-0.17)<1e-12
+    finally:
+        for key,value in threshold_original.items():
+            setattr(VersionedThresholdConfig,key,value)
+    check("版本化验收阈值与拒识率同步",threshold_sync)
+    with tempfile.TemporaryDirectory() as folder:
+        store=DataStore(folder)
+        try:
+            game={"id":"g1","name":"百轮循环游戏","created":1.0,"needs_review":False,"last_review":None}
+            store.replace_games([game],"g1")
+            baseline_threads=len([thread for thread in threading.enumerate() if thread.name.startswith("UniversalGameAI-")])
+            baseline_children=len(multiprocessing.active_children())
+            for index in range(100):
+                sid="learn|cycle|"+str(index)
+                store.begin_learning_session("g1",sid)
+                feature=bytes([(index*17)%251])*FEATURE_LEN
+                action=normalize_action({"kind":"click","button":"left","path":[[(index%20+1)/21.0,((index*7)%20+1)/21.0]],"duration":0.08})
+                store.append_sample("g1",feature,action,"learn",{"session_id":sid,"capture_method":"wgc","repeat_policy":"one_shot","recent_frame_count":3,"recent_frame_deltas":[float(index%5),float((index+1)%5)],"recent_actions":["<START>",action_signature(action)],"previous_action_changed_frame":True,"state_duration":0.1,"cursor":[0.5,0.5],"window_size":[640,360],"dpi":96},None,1.0)
+                store.sample_write_barrier(4.0)
+                store.validate_learning_session("g1",sid)
+            initial_connections=store.connection_count()
+            workers=[]
+            def connection_probe():
+                try:
+                    store.sample_stats("g1")
+                finally:
+                    store.close_current_thread()
+            for index in range(24):
+                thread=threading.Thread(target=connection_probe,name="SelfTestConnection"+str(index))
+                workers.append(thread)
+                thread.start()
+            for thread in workers:
+                thread.join(5.0)
+            lifecycle_stable=store.sample_stats("g1")["valid"]>0 and store.connection_count()<=initial_connections and len([thread for thread in threading.enumerate() if thread.name.startswith("UniversalGameAI-")])==baseline_threads and len(multiprocessing.active_children())==baseline_children and all(not thread.is_alive() for thread in workers)
+        finally:
+            store.close(5.0)
+    check("百轮session与短线程SQLite连接长期稳定",lifecycle_stable)
     payload=add_checksum({"version":FORMAT_VERSION,"items":[1,2,3]})
     check("模型checksum行为",verify_checksum(payload) and not verify_checksum({**payload,"version":FORMAT_VERSION+1}))
-    check("模型不可变快照包含构建与算法",len(str(algorithm_snapshot().get("build_hash","")))==64 and algorithm_snapshot().get("thresholds")==VersionedThresholdConfig.snapshot())
+    snapshot=algorithm_snapshot()
+    check("模型兼容签名与源码审计哈希分离",len(str(snapshot.get("source_build_hash","")))==64 and snapshot.get("compatibility_signature")==compatibility_signature() and "source_build_hash" not in compatibility_signature())
     check("freeze_support可调用",callable(multiprocessing.freeze_support))
     result={"status":"passed" if not failures else "failed","checks":checks,"failures":failures}
     sys.stdout.write(json.dumps(result,ensure_ascii=False,sort_keys=True,separators=(",",":"))+"\n")
     return 0 if not failures else 1
+def run_windows_smoke_test():
+    report={"status":"failed","checks":{},"details":{},"manual_required":[]}
+    def record(name,value,detail=None):
+        report["checks"][str(name)]=bool(value)
+        if detail is not None:
+            report["details"][str(name)]=detail
+    if os.name!="nt":
+        report["status"]="unsupported"
+        report["details"]["platform"]="真实Windows 11冒烟测试只能在Windows 11目标机运行"
+        sys.stdout.write(json.dumps(report,ensure_ascii=False,sort_keys=True,separators=(",",":"))+"\n")
+        return 2
+    bridge=None
+    root=None
+    app=None
+    original_local=os.environ.get("LOCALAPPDATA")
+    try:
+        version=sys.getwindowsversion()
+        record("Windows 11系统",int(version.major)==10 and int(version.build)>=22000,{"major":int(version.major),"build":int(version.build)})
+        with tempfile.TemporaryDirectory() as folder:
+            os.environ["LOCALAPPDATA"]=folder
+            enable_dpi_awareness()
+            root=tk.Tk()
+            root.withdraw()
+            app=App(root)
+            root.update_idletasks()
+            record("Tk控制面板启动",bool(app.controls and app.root.winfo_exists()),{"control_count":len(app.controls)})
+            bridge=app.api
+            windows=bridge.enum_windows()
+            record("窗口枚举",bool(windows),{"count":len(windows)})
+            hydrated=[]
+            dpi_values=set()
+            for item in windows:
+                try:
+                    identity=bridge.target_identity(item)
+                    hydrated.append(identity)
+                    dpi_values.add(int(identity.get("dpi",0)))
+                except Exception as error:
+                    app.store.log_error("WINDOWS_SMOKE_IDENTITY_FAILED",error,window_identity=item)
+            record("窗口完整身份读取",bool(hydrated),{"count":len(hydrated)})
+            record("DPI观测",bool(dpi_values),{"observed":sorted(dpi_values),"required":[96,120,144]})
+            exact=None
+            for argument in sys.argv:
+                if argument.startswith("--smoke-hwnd="):
+                    exact=safe_int(argument.split("=",1)[1],0)
+            selected=next((item for item in hydrated if exact and int(item.get("hwnd",0))==exact),None)
+            if selected is None:
+                selected=next((item for item in hydrated if any(token in (str(item.get("title",""))+" "+str(item.get("class",""))+" "+str(item.get("process_path",""))).casefold() for token in ("雷电","ldplayer","dnplayer"))),None)
+            record("雷电模拟器窗口识别",selected is not None,{"selected":selected or {},"hint":"可使用--smoke-hwnd=窗口句柄指定其他目标窗口"})
+            if selected is not None:
+                selected["content_rect_norm"]=[0.0,0.0,1.0,1.0]
+                selected["title_rule"]={"mode":"none","value":""}
+                selected=bridge.target_identity(selected)
+                methods=[]
+                capture_error=""
+                try:
+                    captured=bridge.capture_gray(selected,False,True,False)
+                    methods=sorted({str(item.get("method","")) for item in captured.get("validation_candidates",[]) if item.get("method")})
+                except Exception as error:
+                    capture_error=str(error)
+                    app.store.log_error("WINDOWS_SMOKE_CAPTURE_FAILED",error,window_identity=selected)
+                required_methods=["Windows Graphics Capture","PrintWindow客户区","窗口DC","前台桌面裁剪"]
+                record("四采集后端冒烟",all(name in methods for name in required_methods),{"successful":methods,"required":required_methods,"error":capture_error})
+                rect_before=tuple(bridge.client_rect(int(selected["hwnd"])))
+                observe_seconds=0.0
+                for argument in sys.argv:
+                    if argument.startswith("--smoke-observe-seconds="):
+                        observe_seconds=safe_float(argument.split("=",1)[1],0.0,0.0,300.0)
+                observations={"moved":False,"resized":False,"minimized":False,"restored":False,"restarted":False}
+                was_minimized=False
+                deadline=time.monotonic()+observe_seconds
+                while time.monotonic()<deadline:
+                    hwnd=int(selected.get("hwnd",0))
+                    if bridge.valid(hwnd):
+                        minimized=bool(bridge.user32.IsIconic(wintypes.HWND(hwnd)))
+                        observations["minimized"]|=minimized
+                        observations["restored"]|=was_minimized and not minimized
+                        was_minimized=minimized
+                        if not minimized:
+                            try:
+                                rect_now=tuple(bridge.client_rect(hwnd))
+                                observations["moved"]|=rect_now[:2]!=rect_before[:2]
+                                observations["resized"]|=rect_now[2:]!=rect_before[2:]
+                            except Exception:
+                                pass
+                    else:
+                        replacement=None
+                        for item in bridge.enum_windows():
+                            try:
+                                identity=bridge.target_identity(item)
+                            except Exception:
+                                continue
+                            if str(identity.get("process_path",""))==str(selected.get("process_path","")) and str(identity.get("class",""))==str(selected.get("class","")):
+                                replacement=identity
+                                break
+                        if replacement is not None:
+                            observations["restarted"]=True
+                            selected=replacement
+                    time.sleep(0.1)
+                record("真实窗口移动缩放最小化重启观察",observe_seconds>0 and all(observations.values()),{"observe_seconds":observe_seconds,"observed":observations})
+            report["manual_required"]=["在100%、125%、150%缩放环境分别运行一次并确认DPI观测包含96、120、144","使用--smoke-observe-seconds=30期间移动、缩放、最小化、恢复并重启目标窗口","在STARTING、RUNNING、STOPPING阶段分别按ESC并确认停止延迟","使用真实外部鼠标注入与非ESC键盘输入确认立即停机且学习session变为invalid"]
+            app.api.block_input()
+            app.api.release_all_buttons()
+            app.store.close(5.0)
+            app.api.close()
+            root.destroy()
+            app=None
+            bridge=None
+            root=None
+        automated=[value for key,value in report["checks"].items() if key!="真实窗口移动缩放最小化重启观察"]
+        report["status"]="passed" if automated and all(automated) else "needs_attention"
+    except Exception as error:
+        report["details"]["fatal"]="".join(traceback.format_exception(type(error),error,error.__traceback__))
+    finally:
+        if app is not None:
+            try:
+                app.api.block_input()
+                app.api.release_all_buttons()
+                app.store.close(5.0)
+                app.api.close()
+            except Exception:
+                pass
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+        if original_local is None:
+            os.environ.pop("LOCALAPPDATA",None)
+        else:
+            os.environ["LOCALAPPDATA"]=original_local
+    sys.stdout.write(json.dumps(report,ensure_ascii=False,sort_keys=True,separators=(",",":"))+"\n")
+    return 0 if report["status"]=="passed" else 1
 def main():
     multiprocessing.freeze_support()
     if "--self-test" in sys.argv:
         raise SystemExit(run_self_test())
+    if "--windows-smoke-test" in sys.argv:
+        raise SystemExit(run_windows_smoke_test())
     enable_dpi_awareness()
     holder={"app":None}
     install_global_hooks(holder)
