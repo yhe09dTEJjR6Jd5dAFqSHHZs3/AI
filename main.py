@@ -20,9 +20,11 @@ from tkinter import ttk
 import ctypes
 from ctypes import wintypes
 APP_NAME="UniversalGameAI"
-FORMAT_VERSION=4
+FORMAT_VERSION=5
 FEATURE_W=64
 FEATURE_H=36
+PREVIEW_W=320
+PREVIEW_H=180
 FEATURE_CHANNELS=5
 PIXELS=FEATURE_W*FEATURE_H
 FEATURE_LEN=PIXELS*FEATURE_CHANNELS
@@ -30,7 +32,7 @@ COARSE_W=16
 COARSE_H=9
 COARSE_LEN=COARSE_W*COARSE_H*FEATURE_CHANNELS
 FEATURE_ALGORITHM_VERSION=4
-ACTION_ALGORITHM_VERSION=5
+ACTION_ALGORITHM_VERSION=6
 DATABASE_SCHEMA_VERSION=3
 MAX_SAMPLES=1500
 MAX_PROTOTYPES=320
@@ -57,6 +59,12 @@ class INPUT(ctypes.Structure):
     _fields_=[("type",wintypes.DWORD),("u",INPUTUNION)]
 class MSLLHOOKSTRUCT(ctypes.Structure):
     _fields_=[("pt",POINT),("mouseData",wintypes.DWORD),("flags",wintypes.DWORD),("time",wintypes.DWORD),("dwExtraInfo",ULONG_PTR)]
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_=[("vkCode",wintypes.DWORD),("scanCode",wintypes.DWORD),("flags",wintypes.DWORD),("time",wintypes.DWORD),("dwExtraInfo",ULONG_PTR)]
+class SID_AND_ATTRIBUTES(ctypes.Structure):
+    _fields_=[("Sid",ctypes.c_void_p),("Attributes",wintypes.DWORD)]
+class TOKEN_MANDATORY_LABEL(ctypes.Structure):
+    _fields_=[("Label",SID_AND_ATTRIBUTES)]
 class GUID(ctypes.Structure):
     _fields_=[("Data1",ctypes.c_uint32),("Data2",ctypes.c_uint16),("Data3",ctypes.c_uint16),("Data4",ctypes.c_ubyte*8)]
 class SIZEINT32(ctypes.Structure):
@@ -74,6 +82,8 @@ def guid(value):
 class TargetUnavailable(RuntimeError):
     pass
 class CaptureUnavailable(RuntimeError):
+    pass
+class InputStopped(RuntimeError):
     pass
 def finite_number(value):
     try:
@@ -388,6 +398,65 @@ def upgrade_gray_image(gray,width=None,height=None):
         return bytes(result)
     except Exception:
         return None
+def preview_rgb_valid(rgb):
+    return isinstance(rgb,(bytes,bytearray,list,tuple)) and len(rgb)==PREVIEW_W*PREVIEW_H*3
+def preview_rgb_bytes(rgb):
+    if not preview_rgb_valid(rgb):
+        return None
+    if isinstance(rgb,bytes):
+        return rgb
+    return bytes(int(max(0,min(255,round(float(value))))) for value in rgb)
+def resize_rgb(rgb,src_w,src_h,out_w,out_h):
+    source=bytes(rgb)
+    if len(source)!=int(src_w)*int(src_h)*3 or min(int(src_w),int(src_h),int(out_w),int(out_h))<1:
+        raise CaptureUnavailable("RGB画面尺寸无效")
+    result=bytearray(int(out_w)*int(out_h)*3)
+    for oy in range(int(out_h)):
+        sy=min(int(src_h)-1,(2*oy+1)*int(src_h)//(2*int(out_h)))
+        for ox in range(int(out_w)):
+            sx=min(int(src_w)-1,(2*ox+1)*int(src_w)//(2*int(out_w)))
+            source_index=(sy*int(src_w)+sx)*3
+            target_index=(oy*int(out_w)+ox)*3
+            result[target_index:target_index+3]=source[source_index:source_index+3]
+    return bytes(result)
+def temporal_from_context(context):
+    source=context if isinstance(context,dict) else {}
+    deltas=[]
+    for value in source.get("recent_frame_deltas",[])[:4]:
+        if finite_number(value):
+            deltas.append(max(0.0,min(5000.0,float(value))))
+    actions=[str(value) for value in source.get("recent_actions",[])[:4] if str(value)]
+    cursor=source.get("cursor")
+    if not isinstance(cursor,(list,tuple)) or len(cursor)<2 or not finite_number(cursor[0]) or not finite_number(cursor[1]):
+        cursor=None
+    else:
+        cursor=[max(0.0,min(1.0,float(cursor[0]))),max(0.0,min(1.0,float(cursor[1])))]
+    size=source.get("window_size")
+    if not isinstance(size,(list,tuple)) or len(size)<2 or not finite_number(size[0]) or not finite_number(size[1]):
+        size=None
+    else:
+        size=[max(1,int(size[0])),max(1,int(size[1]))]
+    return {"recent_frame_count":int(source.get("recent_frame_count",0)),"recent_frame_deltas":deltas,"recent_actions":actions,"previous_action_changed_frame":bool(source.get("previous_action_changed_frame",True)),"state_duration":max(0.0,min(60.0,float(source.get("state_duration",0.0)))) if finite_number(source.get("state_duration",0.0)) else 0.0,"cursor":cursor,"window_size":size,"dpi":int(source.get("dpi",0)) if finite_number(source.get("dpi",0)) else 0,"capture_method":str(source.get("capture_method","unknown")),"complete":bool(int(source.get("recent_frame_count",0))>=3 and len(deltas)>=2 and len(actions)>=2 and cursor is not None and size is not None)}
+def temporal_distance(first,second):
+    a=temporal_from_context(first)
+    b=temporal_from_context(second)
+    if not a.get("complete") or not b.get("complete"):
+        return 1.0
+    length=max(len(a["recent_frame_deltas"]),len(b["recent_frame_deltas"]),1)
+    da=list(a["recent_frame_deltas"])+[0.0]*length
+    db=list(b["recent_frame_deltas"])+[0.0]*length
+    frame_gap=sum(min(1.0,abs(da[index]-db[index])/300.0) for index in range(length))/length
+    actions_a=a["recent_actions"][-4:]
+    actions_b=b["recent_actions"][-4:]
+    action_length=max(len(actions_a),len(actions_b),1)
+    action_gap=sum(1.0 for index in range(1,action_length+1) if (actions_a[-index] if index<=len(actions_a) else "")!=(actions_b[-index] if index<=len(actions_b) else ""))/action_length
+    cursor_gap=math.hypot(a["cursor"][0]-b["cursor"][0],a["cursor"][1]-b["cursor"][1])/math.sqrt(2.0)
+    duration_gap=min(1.0,abs(a["state_duration"]-b["state_duration"])/5.0)
+    change_gap=0.0 if a["previous_action_changed_frame"]==b["previous_action_changed_frame"] else 1.0
+    size_gap=0.0 if a["window_size"]==b["window_size"] else 1.0
+    dpi_gap=min(1.0,abs(a["dpi"]-b["dpi"])/96.0)
+    backend_gap=0.0 if a["capture_method"]==b["capture_method"] else 1.0
+    return 0.25*frame_gap+0.25*action_gap+0.12*cursor_gap+0.10*duration_gap+0.08*change_gap+0.07*size_gap+0.05*dpi_gap+0.08*backend_gap
 class WindowsGraphicsCapture:
     def __init__(self,bridge):
         self.bridge=bridge
@@ -551,28 +620,16 @@ class WindowsGraphicsCapture:
             return item
     def _sample_bgra(self,raw,row_pitch,width,height,crop):
         left,top,crop_w,crop_h=crop
-        result=bytearray(PIXELS*3)
-        for oy in range(FEATURE_H):
-            sy0=top+oy*crop_h//FEATURE_H
-            sy1=max(sy0+1,top+(oy+1)*crop_h//FEATURE_H)
-            ystep=max(1,(sy1-sy0)//4)
-            for ox in range(FEATURE_W):
-                sx0=left+ox*crop_w//FEATURE_W
-                sx1=max(sx0+1,left+(ox+1)*crop_w//FEATURE_W)
-                xstep=max(1,(sx1-sx0)//4)
-                rs=gs=bs=count=0
-                for sy in range(sy0,min(height,sy1),ystep):
-                    row=sy*row_pitch
-                    for sx in range(sx0,min(width,sx1),xstep):
-                        index=row+sx*4
-                        bs+=raw[index]
-                        gs+=raw[index+1]
-                        rs+=raw[index+2]
-                        count+=1
-                position=(oy*FEATURE_W+ox)*3
-                result[position]=round(rs/max(1,count))
-                result[position+1]=round(gs/max(1,count))
-                result[position+2]=round(bs/max(1,count))
+        result=bytearray(PREVIEW_W*PREVIEW_H*3)
+        for oy in range(PREVIEW_H):
+            sy=min(height-1,top+(2*oy+1)*crop_h//(2*PREVIEW_H))
+            for ox in range(PREVIEW_W):
+                sx=min(width-1,left+(2*ox+1)*crop_w//(2*PREVIEW_W))
+                index=sy*row_pitch+sx*4
+                position=(oy*PREVIEW_W+ox)*3
+                result[position]=raw[index+2]
+                result[position+1]=raw[index+1]
+                result[position+2]=raw[index]
         return bytes(result)
     def capture(self,hwnd,client_rect):
         window_rect=self.bridge.window_rect(hwnd)
@@ -656,14 +713,20 @@ class WinBridge:
         self.user32=ctypes.WinDLL("user32",use_last_error=True)
         self.gdi32=ctypes.WinDLL("gdi32",use_last_error=True)
         self.kernel32=ctypes.WinDLL("kernel32",use_last_error=True)
+        self.advapi32=ctypes.WinDLL("advapi32",use_last_error=True)
         self._bind()
+        self._bind_extra()
         self.previous_frames={}
         self.frame_lock=threading.RLock()
         self.held=set()
         self.input_lock=threading.RLock()
+        self.input_blocked=True
+        self.input_stop_event=None
         self.capture_health={}
         self.capture_reports={}
         self.calibrations={}
+        self.capture_task_lock=threading.RLock()
+        self.capture_tasks={}
         self.wgc=WindowsGraphicsCapture(self)
     def _bind(self):
         self.WNDENUMPROC=ctypes.WINFUNCTYPE(wintypes.BOOL,wintypes.HWND,wintypes.LPARAM)
@@ -743,6 +806,133 @@ class WinBridge:
         self.gdi32.SetStretchBltMode.restype=ctypes.c_int
         self.gdi32.StretchBlt.argtypes=[wintypes.HDC,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_int,wintypes.HDC,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_int,wintypes.DWORD]
         self.gdi32.StretchBlt.restype=wintypes.BOOL
+    def _bind_extra(self):
+        self.user32.WindowFromPoint.argtypes=[POINT]
+        self.user32.WindowFromPoint.restype=wintypes.HWND
+        self.user32.GetAncestor.argtypes=[wintypes.HWND,wintypes.UINT]
+        self.user32.GetAncestor.restype=wintypes.HWND
+        self.user32.GetClipCursor.argtypes=[ctypes.POINTER(RECT)]
+        self.user32.GetClipCursor.restype=wintypes.BOOL
+        self.user32.ClipCursor.argtypes=[ctypes.POINTER(RECT)]
+        self.user32.ClipCursor.restype=wintypes.BOOL
+        self.kernel32.OpenProcess.argtypes=[wintypes.DWORD,wintypes.BOOL,wintypes.DWORD]
+        self.kernel32.OpenProcess.restype=wintypes.HANDLE
+        self.kernel32.GetCurrentProcess.argtypes=[]
+        self.kernel32.GetCurrentProcess.restype=wintypes.HANDLE
+        self.kernel32.CloseHandle.argtypes=[wintypes.HANDLE]
+        self.kernel32.CloseHandle.restype=wintypes.BOOL
+        self.advapi32.OpenProcessToken.argtypes=[wintypes.HANDLE,wintypes.DWORD,ctypes.POINTER(wintypes.HANDLE)]
+        self.advapi32.OpenProcessToken.restype=wintypes.BOOL
+        self.advapi32.GetTokenInformation.argtypes=[wintypes.HANDLE,ctypes.c_int,ctypes.c_void_p,wintypes.DWORD,ctypes.POINTER(wintypes.DWORD)]
+        self.advapi32.GetTokenInformation.restype=wintypes.BOOL
+        self.advapi32.GetSidSubAuthorityCount.argtypes=[ctypes.c_void_p]
+        self.advapi32.GetSidSubAuthorityCount.restype=ctypes.POINTER(ctypes.c_ubyte)
+        self.advapi32.GetSidSubAuthority.argtypes=[ctypes.c_void_p,wintypes.DWORD]
+        self.advapi32.GetSidSubAuthority.restype=ctypes.POINTER(wintypes.DWORD)
+    def _token_integrity(self,process_handle):
+        token=wintypes.HANDLE()
+        if not self.advapi32.OpenProcessToken(process_handle,0x0008,ctypes.byref(token)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            needed=wintypes.DWORD()
+            self.advapi32.GetTokenInformation(token,25,None,0,ctypes.byref(needed))
+            if needed.value<ctypes.sizeof(TOKEN_MANDATORY_LABEL):
+                raise RuntimeError("无法读取进程完整性级别")
+            buffer=ctypes.create_string_buffer(needed.value)
+            if not self.advapi32.GetTokenInformation(token,25,buffer,needed.value,ctypes.byref(needed)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            label=ctypes.cast(buffer,ctypes.POINTER(TOKEN_MANDATORY_LABEL)).contents
+            count=int(self.advapi32.GetSidSubAuthorityCount(label.Label.Sid).contents.value)
+            if count<1:
+                raise RuntimeError("进程完整性SID无效")
+            return int(self.advapi32.GetSidSubAuthority(label.Label.Sid,count-1).contents.value)
+        finally:
+            self.kernel32.CloseHandle(token)
+    def integrity_for_pid(self,pid):
+        handle=self.kernel32.OpenProcess(0x1000,False,int(pid))
+        if not handle:
+            raise TargetUnavailable("无法读取目标进程权限，拒绝自动输入")
+        try:
+            return self._token_integrity(handle)
+        finally:
+            self.kernel32.CloseHandle(handle)
+    def current_integrity(self):
+        return self._token_integrity(self.kernel32.GetCurrentProcess())
+    def validate_uipi(self,target):
+        target_level=self.integrity_for_pid(int(target.get("pid",0)))
+        current_level=self.current_integrity()
+        if target_level>current_level:
+            raise TargetUnavailable("目标程序完整性级别高于本程序；请以相同权限运行，否则拒绝训练")
+        expected=target.get("integrity")
+        if expected is not None and int(expected)!=target_level:
+            raise TargetUnavailable("目标程序完整性级别已变化，拒绝自动输入")
+        return target_level
+    def allow_input(self,stop_event=None):
+        with self.input_lock:
+            self.input_stop_event=stop_event
+            self.input_blocked=False
+    def block_input(self):
+        self.input_blocked=True
+        self.release_all_buttons()
+    def input_allowed(self):
+        return not self.input_blocked and not (self.input_stop_event and self.input_stop_event.is_set())
+    def validate_action_point(self,target,x,y,expected_rect=(),expected_dpi=0):
+        rect=self.validate_target(target,True)
+        dpi=self.dpi_for_window(int(target["hwnd"]))
+        if len(expected_rect)==4 and (max(abs(int(rect[index])-int(expected_rect[index])) for index in range(4))>2 or expected_dpi and abs(int(dpi)-int(expected_dpi))>1):
+            raise TargetUnavailable("窗口客户区几何或DPI已变化，放弃当前动作并重新识别")
+        if not (rect[0]<=int(x)<rect[0]+rect[2] and rect[1]<=int(y)<rect[1]+rect[3]):
+            raise TargetUnavailable("动作坐标超出客户区")
+        hit=int(self.user32.WindowFromPoint(POINT(int(x),int(y))) or 0)
+        target_root=int(self.user32.GetAncestor(wintypes.HWND(int(target["hwnd"])),2) or int(target["hwnd"]))
+        hit_root=int(self.user32.GetAncestor(wintypes.HWND(hit),2) or hit)
+        if not hit or hit_root!=target_root:
+            raise TargetUnavailable("点击点被其他顶层窗口覆盖，拒绝自动输入")
+        self.validate_uipi(target)
+        return rect
+    def clip_to_client(self,rect):
+        previous=RECT()
+        if not self.user32.GetClipCursor(ctypes.byref(previous)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        current=RECT(int(rect[0]),int(rect[1]),int(rect[0]+rect[2]),int(rect[1]+rect[3]))
+        if not self.user32.ClipCursor(ctypes.byref(current)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return previous
+    def restore_clip(self,previous):
+        try:
+            self.user32.ClipCursor(ctypes.byref(previous) if previous is not None else None)
+        except Exception:
+            pass
+    def _isolated_capture(self,key,callback,timeout=0.35):
+        with self.capture_task_lock:
+            existing=self.capture_tasks.get(key)
+            if existing and existing["thread"].is_alive():
+                raise CaptureUnavailable(str(key[1])+"采集线程疑似挂起，已隔离且不再等待")
+            output=queue.Queue(maxsize=1)
+            holder={}
+            def run():
+                try:
+                    output.put((True,callback()),block=False)
+                except BaseException as error:
+                    try:
+                        output.put((False,error),block=False)
+                    except Exception:
+                        pass
+                finally:
+                    with self.capture_task_lock:
+                        if self.capture_tasks.get(key) is holder:
+                            self.capture_tasks.pop(key,None)
+            thread=threading.Thread(target=run,name="UniversalGameAI-Capture-"+str(key[1]),daemon=True)
+            holder.update({"thread":thread,"output":output,"started":time.time()})
+            self.capture_tasks[key]=holder
+            thread.start()
+        try:
+            ok,value=output.get(timeout=max(0.05,float(timeout)))
+        except queue.Empty:
+            raise CaptureUnavailable(str(key[1])+"采集超时，后端已隔离；不会把超时结果用于学习或训练")
+        if ok:
+            return value
+        raise value
     def valid(self,hwnd):
         return bool(hwnd and self.user32.IsWindow(wintypes.HWND(hwnd)))
     def class_name(self,hwnd):
@@ -868,29 +1058,17 @@ class WinBridge:
             raise ctypes.WinError(ctypes.get_last_error())
         old=self.gdi32.SelectObject(memory,bitmap)
         return memory,bitmap,old,bits
-    def _rgb_from_raw(self,raw,width,height,out_w=FEATURE_W,out_h=FEATURE_H):
+    def _rgb_from_raw(self,raw,width,height,out_w=PREVIEW_W,out_h=PREVIEW_H):
         result=bytearray(out_w*out_h*3)
         for oy in range(out_h):
-            sy0=oy*height//out_h
-            sy1=max(sy0+1,(oy+1)*height//out_h)
-            ystep=max(1,(sy1-sy0)//4)
+            sy=min(height-1,(2*oy+1)*height//(2*out_h))
             for ox in range(out_w):
-                sx0=ox*width//out_w
-                sx1=max(sx0+1,(ox+1)*width//out_w)
-                xstep=max(1,(sx1-sx0)//4)
-                rs=gs=bs=count=0
-                for sy in range(sy0,min(height,sy1),ystep):
-                    row=sy*width*4
-                    for sx in range(sx0,min(width,sx1),xstep):
-                        index=row+sx*4
-                        bs+=raw[index]
-                        gs+=raw[index+1]
-                        rs+=raw[index+2]
-                        count+=1
+                sx=min(width-1,(2*ox+1)*width//(2*out_w))
+                index=(sy*width+sx)*4
                 position=(oy*out_w+ox)*3
-                result[position]=round(rs/max(1,count))
-                result[position+1]=round(gs/max(1,count))
-                result[position+2]=round(bs/max(1,count))
+                result[position]=raw[index+2]
+                result[position+1]=raw[index+1]
+                result[position+2]=raw[index]
         return bytes(result)
     def _capture_print(self,hwnd,width,height):
         reference=self.user32.GetDC(wintypes.HWND(0))
@@ -918,12 +1096,12 @@ class WinBridge:
             raise ctypes.WinError(ctypes.get_last_error())
         memory=bitmap=old=bits=None
         try:
-            memory,bitmap,old,bits=self._make_dib(source,FEATURE_W,FEATURE_H)
+            memory,bitmap,old,bits=self._make_dib(source,PREVIEW_W,PREVIEW_H)
             self.gdi32.SetStretchBltMode(memory,4)
-            if not self.gdi32.StretchBlt(memory,0,0,FEATURE_W,FEATURE_H,source,sx,sy,width,height,0x00CC0020):
+            if not self.gdi32.StretchBlt(memory,0,0,PREVIEW_W,PREVIEW_H,source,sx,sy,width,height,0x00CC0020):
                 raise CaptureUnavailable("窗口DC采集失败")
-            raw=ctypes.string_at(bits.value,FEATURE_W*FEATURE_H*4)
-            return self._rgb_from_raw(raw,FEATURE_W,FEATURE_H)
+            raw=ctypes.string_at(bits.value,PREVIEW_W*PREVIEW_H*4)
+            return self._rgb_from_raw(raw,PREVIEW_W,PREVIEW_H,PREVIEW_W,PREVIEW_H)
         finally:
             if memory and old:
                 self.gdi32.SelectObject(memory,old)
@@ -938,16 +1116,17 @@ class WinBridge:
             return None
         return bytes((source[index]*77+source[index+1]*150+source[index+2]*29)>>8 for index in range(0,len(source),3))
     def _quality(self,rgb):
-        gray=self._rgb_to_gray(rgb)
-        if gray is None or not gray:
-            return {"mean":0.0,"std":0.0,"spread":0,"black":True,"solid":True,"low_information":True,"valid":False}
+        source=preview_rgb_bytes(rgb)
+        if source is None:
+            return {"mean":0.0,"std":0.0,"spread":0,"black":True,"solid":True,"low_information":True,"valid":False,"protected_or_black":True}
+        gray=[(source[index]*77+source[index+1]*150+source[index+2]*29)>>8 for index in range(0,len(source),3)]
         mean=sum(gray)/len(gray)
         variance=sum((value-mean)*(value-mean) for value in gray)/len(gray)
         std=math.sqrt(variance)
         spread=max(gray)-min(gray)
         black=max(gray)<10 or mean<2.5
         solid=std<0.9 or spread<3
-        return {"mean":mean,"std":std,"spread":spread,"black":black,"solid":solid,"low_information":bool(black or solid),"valid":True}
+        return {"mean":mean,"std":std,"spread":spread,"black":black,"solid":solid,"low_information":bool(black or solid),"valid":True,"protected_or_black":bool(black)}
     def feature_from_rgb(self,rgb,previous_rgb=None):
         source=rgb_bytes(rgb)
         if source is None:
@@ -1012,42 +1191,58 @@ class WinBridge:
         stale=now-unchanged_since>4.0
         self.capture_health[key]={"digest":digest,"unchanged_since":unchanged_since,"last":now,"stale":stale}
         return stale
-    def capture_gray(self,target,require_foreground_for_desktop=True):
+    def capture_gray(self,target,require_foreground_for_desktop=True,validation_mode=False):
         rect=self.validate_target(target,False)
         hwnd=int(target["hwnd"])
         x,y,width,height=rect
+        if width<FEATURE_W or height<FEATURE_H:
+            raise CaptureUnavailable("客户区尺寸异常，拒绝采集")
         attempts=[]
         candidates=[]
-        backends=[("Windows Graphics Capture",lambda:self.wgc.capture(hwnd,rect)),("PrintWindow客户区",lambda:self._capture_print(hwnd,width,height)),("窗口DC",lambda:self._capture_dc(hwnd,0,0,width,height))]
+        calibration=self.calibrations.get(hwnd,{})
+        validated_method=str(calibration.get("validated_backend",""))
+        backends=[("Windows Graphics Capture",lambda:self.wgc.capture(hwnd,rect),False),("PrintWindow客户区",lambda:self._capture_print(hwnd,width,height),True),("窗口DC",lambda:self._capture_dc(hwnd,0,0,width,height),True)]
         if not require_foreground_for_desktop or self.foreground_hwnd()==hwnd:
-            backends.append(("前台桌面裁剪",lambda:self._capture_dc(0,x,y,width,height)))
+            backends.append(("前台桌面裁剪",lambda:self._capture_dc(0,x,y,width,height),True))
         else:
             attempts.append("前台桌面裁剪被跳过：目标窗口不在前台")
-        for priority,(name,callback) in enumerate(backends):
+        if validated_method:
+            backends.sort(key=lambda item:0 if item[0]==validated_method else 1)
+        for priority,(name,callback,isolate) in enumerate(backends):
             try:
-                rgb=rgb_bytes(callback())
-                if rgb is None:
+                preview=preview_rgb_bytes(self._isolated_capture((hwnd,name),callback,0.35) if isolate else callback())
+                if preview is None:
                     raise CaptureUnavailable("返回画面尺寸无效")
-                quality=self._quality(rgb)
-                stale=self._health(hwnd,name,rgb)
-                quality["stale_suspected"]=stale
-                candidate={"rgb":rgb,"gray":self._rgb_to_gray(rgb),"method":name,"quality":quality,"priority":priority,"stale":stale}
+                model_rgb=resize_rgb(preview,PREVIEW_W,PREVIEW_H,FEATURE_W,FEATURE_H)
+                quality=self._quality(preview)
+                stale=self._health(hwnd,name,preview)
+                validation_identity=bool(calibration.get("dynamic_passed") and int(calibration.get("validated_pid",-1))==self.pid(hwnd) and str(calibration.get("validated_class",""))==self.class_name(hwnd) and int(calibration.get("validated_dpi",0))==self.dpi_for_window(hwnd) and list(calibration.get("validated_rect",[0,0,0,0]))[2:4]==[int(width),int(height)])
+                backend_validated=bool(validation_mode or validated_method and name==validated_method and validation_identity)
+                backend_changed=bool(validated_method and (name!=validated_method or not validation_identity))
+                capture_valid=bool(quality["valid"] and not quality["low_information"] and not stale)
+                usable=bool(capture_valid and backend_validated and not backend_changed)
+                candidate={"rgb":model_rgb,"gray":self._rgb_to_gray(model_rgb),"preview_rgb":preview,"preview_width":PREVIEW_W,"preview_height":PREVIEW_H,"method":name,"quality":quality,"priority":priority,"stale":stale,"capture_valid":capture_valid,"backend_validated":backend_validated,"usable_for_learning":usable,"usable_for_training":usable,"usable_for_teaching":usable,"protected_or_black":bool(quality.get("protected_or_black")),"backend_changed":backend_changed}
                 candidates.append(candidate)
-                if quality["valid"] and not quality["low_information"] and not stale:
-                    self.capture_reports[hwnd]="当前采集："+name+"；兼容性检测正常"
+                if usable or validation_mode and capture_valid:
+                    self.capture_reports[hwnd]="当前采集："+name+"；画面有效；后端"+("已验收" if backend_validated else "待验收")
                     return candidate
                 reason=[]
                 if quality["low_information"]:
-                    reason.append("低信息量画面")
+                    reason.append("黑屏或纯色")
                 if stale:
-                    reason.append("疑似长时间未更新")
-                attempts.append(name+"："+"、".join(reason or ["可用"]))
+                    reason.append("长时间重复")
+                if backend_changed:
+                    reason.append("后端突然变化")
+                if not backend_validated:
+                    reason.append("后端未验收")
+                attempts.append(name+"："+"、".join(reason or ["不可用于自动输入"]))
             except Exception as error:
                 attempts.append(name+"失败："+str(error))
         if candidates:
-            chosen=min(candidates,key=lambda item:(item["stale"],item["priority"]))
-            state="合法低信息量画面" if chosen["quality"]["low_information"] else "疑似静止画面"
-            self.capture_reports[hwnd]="当前采集："+chosen["method"]+"；"+state+"；已完成多后端兼容性检测"
+            chosen=min(candidates,key=lambda item:(not item["capture_valid"],item["backend_changed"],item["priority"]))
+            chosen=dict(chosen)
+            chosen.update({"usable_for_learning":False,"usable_for_training":False,"usable_for_teaching":False})
+            self.capture_reports[hwnd]="采集画面仅可预览，已拒绝学习/训练/请教："+"；".join(attempts)
             return chosen
         self.capture_reports[hwnd]="采集失败："+"；".join(attempts)
         raise CaptureUnavailable("无法采集目标窗口："+"；".join(attempts))
@@ -1059,58 +1254,91 @@ class WinBridge:
         item["dpi"]=self.dpi_for_window(int(target["hwnd"]))
         return item
     def capture_status(self,hwnd):
-        return self.capture_reports.get(int(hwnd),"尚未执行采集兼容性检测；优先Windows Graphics Capture，失败后自动降级")
+        return self.capture_reports.get(int(hwnd),"尚未完成动态采集验收；未验收后端只能预览，不能学习或训练")
     def calibration_for(self,target):
         hwnd=int(target.get("hwnd",0)) if isinstance(target,dict) else int(target or 0)
-        return dict(self.calibrations.get(hwnd,{"noise":4.0,"visual_cluster":420.0,"significant_change":60.0,"post_action_change":45.0,"freeze_change":1.5,"freeze_frames":30,"confirm_frames":2,"duplicate":3.0,"fps":10.0,"input_delay":0.24}))
-    def calibrate(self,target,duration=1.2):
+        return dict(self.calibrations.get(hwnd,{"noise":4.0,"visual_cluster":420.0,"significant_change":60.0,"post_action_change":45.0,"freeze_change":1.5,"freeze_frames":30,"confirm_frames":3,"duplicate":3.0,"fps":10.0,"input_delay":0.24,"validated_backend":"","dynamic_passed":False}))
+    def calibrate(self,target,duration=1.8,stop_event=None,progress=None):
         hwnd=int(target["hwnd"])
-        deadline=time.time()+max(0.6,min(2.5,float(duration)))
+        self.validate_target(target,False)
+        integrity=self.validate_uipi(target)
+        with self.frame_lock:
+            for key in [key for key in self.capture_health if key[0]==hwnd]:
+                self.capture_health.pop(key,None)
+        deadline=time.monotonic()+max(1.2,min(3.0,float(duration)))
         features=[]
-        methods=Counter()
+        methods=[]
         stamps=[]
         previous_rgb=None
-        while time.time()<deadline:
-            captured=self.capture_gray(target,True)
+        while time.monotonic()<deadline:
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("窗口校准已取消")
+            self.validate_target(target,False)
+            captured=self.capture_gray(target,True,True)
+            if not captured.get("capture_valid"):
+                raise CaptureUnavailable("动态校准遇到无效画面")
             feature=self.feature_from_rgb(captured["rgb"],previous_rgb)
             previous_rgb=captured["rgb"]
             features.append(feature)
-            methods[captured["method"]]+=1
+            methods.append(captured["method"])
             stamps.append(time.time())
+            if progress:
+                progress(min(1.0,1.0-max(0.0,deadline-time.monotonic())/max(0.1,float(duration))))
             time.sleep(0.06)
-        changes=[visual_distance(a,b) for a,b in zip(features,features[1:]) if feature_valid(a) and feature_valid(b)]
-        noise=max(0.5,quantile(changes,0.9)) if changes else 4.0
+        if len(features)<8:
+            raise CaptureUnavailable("动态校准有效帧不足")
+        if len(set(methods))!=1:
+            raise CaptureUnavailable("校准期间采集后端发生变化，拒绝确认窗口")
+        changes=[visual_distance(a,b) for a,b in zip(features,features[1:])]
+        unique=len({hashlib.sha256(bytes(feature[:PIXELS])).digest() for feature in features})
+        if unique<2 or not changes or max(changes)<1.0:
+            raise CaptureUnavailable("未检测到采集画面动态变化；请让目标窗口画面发生变化后重新确认")
+        noise=max(0.5,quantile(changes,0.5))
         fps=(len(stamps)-1)/max(0.01,stamps[-1]-stamps[0]) if len(stamps)>1 else 8.0
-        result={"noise":noise,"visual_cluster":max(80.0,min(1400.0,noise*9.0+120.0)),"significant_change":max(18.0,min(260.0,noise*4.5+18.0)),"post_action_change":max(14.0,min(220.0,noise*3.2+14.0)),"freeze_change":max(0.4,noise*0.22),"freeze_frames":max(18,min(80,round(fps*3.0))),"confirm_frames":2 if fps>=12 else 3,"duplicate":max(1.0,min(18.0,noise*0.65)),"fps":fps,"input_delay":max(0.16,min(0.55,3.0/max(5.0,fps))),"method":methods.most_common(1)[0][0] if methods else "未知"}
+        rect=self.validate_target(target,False)
+        dpi=self.dpi_for_window(hwnd)
+        method=methods[0]
+        result={"noise":noise,"visual_cluster":max(80.0,min(1400.0,noise*9.0+120.0)),"significant_change":max(18.0,min(260.0,noise*4.5+18.0)),"post_action_change":max(14.0,min(220.0,noise*3.2+14.0)),"freeze_change":max(0.4,noise*0.22),"freeze_frames":max(18,min(80,round(fps*3.0))),"confirm_frames":3 if fps>=12 else 4,"duplicate":max(1.0,min(18.0,noise*0.65)),"fps":fps,"input_delay":max(0.16,min(0.55,3.0/max(5.0,fps))),"method":method,"validated_backend":method,"dynamic_passed":True,"validated_at":time.time(),"validated_rect":list(rect),"validated_dpi":dpi,"validated_pid":int(target["pid"]),"validated_class":str(target["class"]),"integrity":integrity}
         self.calibrations[hwnd]=result
-        self.capture_reports[hwnd]=self.capture_status(hwnd)+"；校准帧率"+str(round(fps,1))+"fps，静态噪声"+str(round(noise,2))
+        self.capture_reports[hwnd]="当前采集："+method+"；动态检测通过；帧率"+str(round(fps,1))+"fps；后端已验收"
         return dict(result)
-    def _send(self,flags,data=0,dx=0,dy=0):
+    def _send(self,flags,data=0,dx=0,dy=0,require_allowed=False):
+        if require_allowed and not self.input_allowed():
+            raise InputStopped("停止标志已设置，拒绝新的鼠标输入")
         item=INPUT()
         item.type=0
         item.mi=MOUSEINPUT(int(dx),int(dy),ctypes.c_ulong(int(data)&0xffffffff).value,int(flags),0,0)
+        if require_allowed and not self.input_allowed():
+            raise InputStopped("停止标志已设置，拒绝新的鼠标输入")
         if self.user32.SendInput(1,ctypes.byref(item),ctypes.sizeof(INPUT))!=1:
             raise ctypes.WinError(ctypes.get_last_error())
     def move_cursor(self,x,y):
+        if not self.input_allowed():
+            raise InputStopped("停止标志已设置，拒绝鼠标移动")
         left=self.user32.GetSystemMetrics(76)
         top=self.user32.GetSystemMetrics(77)
         width=self.user32.GetSystemMetrics(78)
         height=self.user32.GetSystemMetrics(79)
         nx=round((int(x)-left)*65535/max(1,width-1))
         ny=round((int(y)-top)*65535/max(1,height-1))
-        self._send(0x0001|0x8000|0x4000,0,nx,ny)
+        self._send(0x0001|0x8000|0x4000,0,nx,ny,True)
     def button(self,button,down):
         flags={"left":(0x0002,0x0004),"right":(0x0008,0x0010),"middle":(0x0020,0x0040)}
         if button not in flags:
             raise RuntimeError("不支持的鼠标按钮")
         with self.input_lock:
-            self._send(flags[button][0 if down else 1])
+            if down and not self.input_allowed():
+                raise InputStopped("停止标志已设置，拒绝新的鼠标按下事件")
+            self._send(flags[button][0 if down else 1],require_allowed=bool(down))
             if down:
                 self.held.add(button)
             else:
                 self.held.discard(button)
     def wheel(self,delta,horizontal=False):
-        self._send(0x01000 if horizontal else 0x0800,int(delta))
+        with self.input_lock:
+            if not self.input_allowed():
+                raise InputStopped("停止标志已设置，拒绝滚轮事件")
+            self._send(0x01000 if horizontal else 0x0800,int(delta),require_allowed=True)
     def release_all_buttons(self):
         with self.input_lock:
             for button in list(self.held):
@@ -1125,6 +1353,99 @@ class WinBridge:
                     self._send(flag)
                 except Exception:
                     pass
+class KeyboardMonitor:
+    def __init__(self,bridge,on_escape=None,on_other=None):
+        self.bridge=bridge
+        self.on_escape=on_escape
+        self.on_other=on_other
+        self.events=deque(maxlen=2000)
+        self.lock=threading.RLock()
+        self.held=set()
+        self.thread=None
+        self.thread_id=0
+        self.hook=None
+        self.callback=None
+        self.ready=threading.Event()
+        self.error=None
+        self.non_escape_count=0
+    def start(self):
+        self.thread=threading.Thread(target=self._run,name="UniversalGameAI-KeyboardHook",daemon=True)
+        self.thread.start()
+        if not self.ready.wait(2.0):
+            raise RuntimeError("键盘监听器启动超时")
+        if self.error:
+            raise RuntimeError(self.error)
+        if not self.hook:
+            raise RuntimeError("无法安装键盘监听器")
+        return self
+    def _run(self):
+        try:
+            self.thread_id=int(self.bridge.kernel32.GetCurrentThreadId())
+            def callback(code,wparam,lparam):
+                if code>=0 and int(wparam) in {0x0100,0x0101,0x0104,0x0105}:
+                    data=ctypes.cast(lparam,ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    vk=int(data.vkCode)
+                    down=int(wparam) in {0x0100,0x0104}
+                    now=time.time()
+                    event={"vk":vk,"down":down,"time":now,"injected":bool(int(data.flags)&0x12)}
+                    first_down=False
+                    with self.lock:
+                        if down:
+                            first_down=vk not in self.held
+                            self.held.add(vk)
+                        else:
+                            self.held.discard(vk)
+                        self.events.append(event)
+                        if first_down and vk!=0x1B:
+                            self.non_escape_count+=1
+                    if first_down and vk==0x1B and self.on_escape:
+                        try:
+                            self.on_escape(event)
+                        except Exception:
+                            pass
+                    elif first_down and vk!=0x1B and self.on_other:
+                        try:
+                            self.on_other(event)
+                        except Exception:
+                            pass
+                return self.bridge.user32.CallNextHookEx(self.hook,code,wparam,lparam)
+            self.callback=self.bridge.HOOKPROC(callback)
+            module=self.bridge.kernel32.GetModuleHandleW(None)
+            self.hook=self.bridge.user32.SetWindowsHookExW(13,self.callback,module,0)
+            if not self.hook:
+                raise ctypes.WinError(ctypes.get_last_error())
+            self.ready.set()
+            message=MSG()
+            while self.bridge.user32.GetMessageW(ctypes.byref(message),None,0,0)>0:
+                self.bridge.user32.TranslateMessage(ctypes.byref(message))
+                self.bridge.user32.DispatchMessageW(ctypes.byref(message))
+        except Exception:
+            self.error=traceback.format_exc()
+            self.ready.set()
+        finally:
+            if self.hook:
+                try:
+                    self.bridge.user32.UnhookWindowsHookEx(self.hook)
+                except Exception:
+                    pass
+                self.hook=None
+    def drain(self):
+        with self.lock:
+            result=list(self.events)
+            self.events.clear()
+        return result
+    def all_released(self):
+        with self.lock:
+            return not any(vk!=0x1B for vk in self.held)
+    def stop(self,timeout=1.0):
+        if self.thread_id:
+            try:
+                self.bridge.user32.PostThreadMessageW(self.thread_id,0x0012,0,0)
+            except Exception:
+                pass
+        if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread():
+            self.thread.join(max(0.0,float(timeout)))
+        return not bool(self.thread and self.thread.is_alive())
 class MouseMonitor:
     def __init__(self,bridge):
         self.bridge=bridge
@@ -1138,9 +1459,10 @@ class MouseMonitor:
         self.error=None
         self.last_move=0.0
     def start(self):
-        self.thread=threading.Thread(target=self._run)
+        self.thread=threading.Thread(target=self._run,name="UniversalGameAI-MouseHook",daemon=True)
         self.thread.start()
-        self.ready.wait(2.0)
+        if not self.ready.wait(2.0):
+            raise RuntimeError("鼠标监听器启动超时")
         if self.error:
             raise RuntimeError(self.error)
         if not self.hook:
@@ -1155,6 +1477,8 @@ class MouseMonitor:
             def callback(code,wparam,lparam):
                 if code>=0 and int(wparam) in messages:
                     data=ctypes.cast(lparam,ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                    if int(data.flags)&0x00000003:
+                        return self.bridge.user32.CallNextHookEx(self.hook,code,wparam,lparam)
                     now=time.time()
                     kind=messages[int(wparam)]
                     if kind!="move" or now-self.last_move>=0.018:
@@ -1191,14 +1515,15 @@ class MouseMonitor:
             result=list(self.events)
             self.events.clear()
         return result
-    def stop(self):
+    def stop(self,timeout=1.0):
         if self.thread_id:
             try:
                 self.bridge.user32.PostThreadMessageW(self.thread_id,0x0012,0,0)
             except Exception:
                 pass
         if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread():
-            self.thread.join()
+            self.thread.join(max(0.0,float(timeout)))
+        return not bool(self.thread and self.thread.is_alive())
 class FrameBuffer:
     def __init__(self,bridge,target,hz=20.0,seconds=2.0,motion_interval=0.1):
         self.bridge=bridge
@@ -1214,12 +1539,12 @@ class FrameBuffer:
     def start(self):
         self.bridge.reset_frame_history(self.target.get("hwnd"))
         self.stop_event.clear()
-        self.thread=threading.Thread(target=self._run)
+        self.thread=threading.Thread(target=self._run,name="UniversalGameAI-FrameBuffer",daemon=True)
         self.thread.start()
         return self
     def _run(self):
         thread_id=threading.get_ident()
-        next_time=time.time()
+        next_time=time.monotonic()
         try:
             while not self.stop_event.is_set():
                 try:
@@ -1235,21 +1560,21 @@ class FrameBuffer:
                                 break
                     feature=self.bridge.feature_from_rgb(rgb,previous)
                     rect=self.bridge.validate_target(self.target,False)
-                    frame={"time":stamp,"f":feature,"coarse":coarse_feature(feature),"gray":gray,"rgb":rgb,"method":captured["method"],"quality":captured["quality"],"motion_valid":previous is not None,"rect":rect,"dpi":self.bridge.dpi_for_window(int(self.target["hwnd"]))}
+                    frame={"time":stamp,"f":feature,"coarse":coarse_feature(feature),"gray":gray,"rgb":rgb,"preview_rgb":captured.get("preview_rgb"),"preview_width":captured.get("preview_width",PREVIEW_W),"preview_height":captured.get("preview_height",PREVIEW_H),"method":captured["method"],"quality":captured["quality"],"motion_valid":previous is not None,"rect":rect,"dpi":self.bridge.dpi_for_window(int(self.target["hwnd"])),"capture_valid":bool(captured.get("capture_valid")),"backend_validated":bool(captured.get("backend_validated")),"usable_for_learning":bool(captured.get("usable_for_learning")),"usable_for_training":bool(captured.get("usable_for_training")),"usable_for_teaching":bool(captured.get("usable_for_teaching")),"stale":bool(captured.get("stale")),"protected_or_black":bool(captured.get("protected_or_black")),"backend_changed":bool(captured.get("backend_changed"))}
                     with self.lock:
                         self.frames.append(frame)
-                    self.last_error=""
+                    self.last_error="" if frame["capture_valid"] else "画面无效或后端未验收"
                     self.ready.set()
                 except Exception as error:
                     self.last_error=str(error)
-                next_time=max(next_time+self.interval,time.time())
-                self.stop_event.wait(max(0.001,next_time-time.time()))
+                next_time=max(next_time+self.interval,time.monotonic())
+                self.stop_event.wait(max(0.001,next_time-time.monotonic()))
         finally:
             try:
                 self.bridge.wgc.release_thread(thread_id)
             except Exception:
                 pass
-    def latest(self,before=None,max_age=0.6):
+    def latest(self,before=None,max_age=0.6,purpose=None):
         now=time.time()
         with self.lock:
             candidates=list(self.frames)
@@ -1260,6 +1585,8 @@ class FrameBuffer:
         frame=candidates[-1]
         reference=float(before) if before is not None else now
         if reference-frame["time"]>max_age:
+            return None
+        if purpose and not frame.get("usable_for_"+str(purpose)):
             return None
         return dict(frame)
     def latest_after(self,stamp,max_wait_age=0.8):
@@ -1274,12 +1601,72 @@ class FrameBuffer:
         cutoff=time.time()-max(0.1,float(seconds))
         with self.lock:
             return [dict(frame) for frame in self.frames if frame["time"]>=cutoff]
-    def stop(self,wait=True):
+    def stop(self,wait=True,timeout=1.0):
         self.stop_event.set()
         if wait and self.thread and self.thread.is_alive() and self.thread is not threading.current_thread():
-            self.thread.join()
+            self.thread.join(max(0.0,float(timeout)))
+        return not bool(self.thread and self.thread.is_alive())
+    def wait_for_usable(self,purpose,timeout=3.0,external_stop=None):
+        deadline=time.monotonic()+max(0.1,float(timeout))
+        while time.monotonic()<deadline:
+            if self.bridge.key_down(0x1B):
+                if external_stop is not None:
+                    external_stop.set()
+                self.bridge.block_input()
+                raise InputStopped("初始化期间收到ESC停止请求")
+            if external_stop is not None and external_stop.is_set():
+                raise InputStopped("初始化期间收到停止请求")
+            frame=self.latest(None,1.0,purpose)
+            if frame is not None:
+                return frame
+            if not self.thread or not self.thread.is_alive():
+                raise CaptureUnavailable(self.last_error or "画面线程已停止")
+            self.ready.wait(0.05)
+        raise CaptureUnavailable("未在限定时间内获得可用于"+str(purpose)+"的已验收画面："+(self.last_error or "未知原因"))
     def alive(self):
         return bool(self.thread and self.thread.is_alive())
+class ModeSession:
+    def __init__(self,app,target):
+        self.app=app
+        self.target=dict(target)
+        self.resources=[]
+        self.frame_buffer=None
+        self.mouse_monitor=None
+        self.keyboard_monitor=None
+    def start_frames(self,hz,seconds,motion_interval,purpose):
+        buffer=FrameBuffer(self.app.api,self.target,hz,seconds,motion_interval)
+        self.resources.append(("frame",buffer))
+        buffer.start()
+        buffer.wait_for_usable(purpose,3.0,self.app.stop_event)
+        self.frame_buffer=buffer
+        return buffer
+    def start_keyboard(self,on_other=None):
+        monitor=KeyboardMonitor(self.app.api,self.app._keyboard_escape,on_other)
+        self.resources.append(("keyboard",monitor))
+        monitor.start()
+        self.keyboard_monitor=monitor
+        return monitor
+    def start_mouse(self):
+        monitor=MouseMonitor(self.app.api)
+        self.resources.append(("mouse",monitor))
+        monitor.start()
+        self.mouse_monitor=monitor
+        return monitor
+    def close(self):
+        deadline=time.monotonic()+1.5
+        for kind,resource in reversed(self.resources):
+            remaining=max(0.0,deadline-time.monotonic())
+            try:
+                resource.stop(min(1.0,remaining)) if kind!="frame" else resource.stop(True,min(1.0,remaining))
+            except Exception:
+                pass
+        self.resources.clear()
+        self.app.api.block_input()
+    def __enter__(self):
+        return self
+    def __exit__(self,exc_type,exc_value,exc_traceback):
+        self.close()
+        return False
 class DataStore:
     def __init__(self):
         local=os.environ.get("LOCALAPPDATA")
@@ -1289,7 +1676,7 @@ class DataStore:
         self.lock=threading.RLock()
         self.model_cache={}
         self.closed=False
-        self.db=sqlite3.connect(str(self.db_path),timeout=20.0,check_same_thread=False)
+        self.db=sqlite3.connect(str(self.db_path),timeout=1.0,check_same_thread=False)
         self.db.row_factory=sqlite3.Row
         with self.db:
             self.db.execute("PRAGMA foreign_keys=ON")
@@ -1537,17 +1924,23 @@ class DataStore:
         values.append(gid)
         with self.lock,self.db:
             self.db.execute("UPDATE games SET "+",".join(fields)+" WHERE id=?",values)
-    def _sample_fingerprint(self,feature,action):
-        return hashlib.sha256(feature_bytes(feature)+b"\0"+canonical_bytes(normalize_action(action))).hexdigest()
-    def _near_duplicate(self,gid,feature,signature,threshold):
+    def _sample_fingerprint(self,feature,action,context=None):
+        temporal=temporal_from_context(context or {})
+        identity={"action":normalize_action(action),"temporal":temporal}
+        return hashlib.sha256(feature_bytes(feature)+b"\0"+canonical_bytes(identity)).hexdigest()
+    def _near_duplicate(self,gid,feature,signature,threshold,context=None):
         with self.lock:
-            rows=self.db.execute("SELECT feature,feature_algorithm_version FROM samples WHERE game_id=? AND action_signature=? ORDER BY created DESC,id DESC LIMIT 36",(gid,signature)).fetchall()
+            rows=self.db.execute("SELECT feature,feature_algorithm_version,context FROM samples WHERE game_id=? AND action_signature=? ORDER BY created DESC,id DESC LIMIT 36",(gid,signature)).fetchall()
         query=feature_bytes(feature)
         query_coarse=coarse_feature(query)
+        query_context=context if isinstance(context,dict) else {}
         for row in rows:
             try:
                 candidate=upgrade_feature(zlib.decompress(row["feature"]),row["feature_algorithm_version"])
-                if candidate is None:
+                candidate_context=json.loads(row["context"])
+                if candidate is None or not isinstance(candidate_context,dict):
+                    continue
+                if temporal_distance(query_context,candidate_context)>0.08:
                     continue
                 if coarse_distance(query_coarse,coarse_feature(candidate))<=max(2.0,float(threshold)*2.5) and feature_distance(query,candidate)<=float(threshold):
                     return True
@@ -1567,7 +1960,7 @@ class DataStore:
         if repeat_policy not in REPEAT_POLICIES:
             repeat_policy="one_shot"
         duplicate_threshold=float(context.get("duplicate_threshold",3.0)) if finite_number(context.get("duplicate_threshold",3.0)) else 3.0
-        fingerprint=self._sample_fingerprint(fbytes,clean)
+        fingerprint=self._sample_fingerprint(fbytes,clean,context)
         kind=clean["kind"]
         with self.lock:
             if not self.db.execute("SELECT 1 FROM games WHERE id=?",(gid,)).fetchone():
@@ -1576,7 +1969,7 @@ class DataStore:
                 row=self.db.execute("SELECT SUM(CASE WHEN kind='no_op' THEN 1 ELSE 0 END) AS noops,SUM(CASE WHEN kind!='no_op' THEN 1 ELSE 0 END) AS actions FROM samples WHERE game_id=?",(gid,)).fetchone()
                 if int(row["noops"] or 0)>=max(1,int(row["actions"] or 0)//3):
                     return False
-            if enforce_quota and self._near_duplicate(gid,fbytes,signature,duplicate_threshold):
+            if enforce_quota and self._near_duplicate(gid,fbytes,signature,duplicate_threshold,context):
                 return False
             try:
                 with self.db:
@@ -1589,6 +1982,14 @@ class DataStore:
         if count>MAX_SAMPLES:
             self.compact_samples(gid,MAX_SAMPLES)
         return cursor.rowcount>0
+    def discard_session_window(self,gid,session_id,start_time,end_time):
+        with self.lock,self.db:
+            cursor=self.db.execute("DELETE FROM samples WHERE game_id=? AND session_id=? AND created BETWEEN ? AND ?",(gid,str(session_id),float(start_time),float(end_time)))
+            removed=max(0,int(cursor.rowcount or 0))
+            if removed:
+                self.db.execute("UPDATE games SET needs_review=1 WHERE id=?",(gid,))
+        self.model_cache.pop(gid,None)
+        return removed
     def append_sample(self,gid,feature,action,source,context=None,thumbnail=None,weight=1.0):
         return self._insert_sample(gid,feature,action,source,context or {},thumbnail,weight,True,True)
     def append_rejection(self,gid,feature,candidates,source="teach_reject",thumbnail=None,context=None):
@@ -1733,34 +2134,20 @@ class DataStore:
         try:
             if not isinstance(item,dict) or str(item.get("game_id",gid))!=gid:
                 return None
-            feature_version=int(item.get("feature_algorithm_version",3))
+            if int(item.get("format_version",0))!=FORMAT_VERSION or int(item.get("action_algorithm_version",0))!=ACTION_ALGORITHM_VERSION:
+                return None
             upgraded=[]
             for proto in item.get("prototypes",[]):
                 if not isinstance(proto,dict):
                     return None
                 action=normalize_action(proto.get("a"))
-                feature=upgrade_feature(proto.get("f"),feature_version)
+                feature=upgrade_feature(proto.get("f"),int(item.get("feature_algorithm_version",FEATURE_ALGORITHM_VERSION)))
                 if not action or feature is None:
                     return None
                 entry=dict(proto)
                 entry["f"]=feature
                 entry["coarse"]=coarse_feature(feature)
-                old_identifier=str(entry.get("cluster_id") or entry.get("action_signature") or "")
-                if old_identifier.startswith("action|"):
-                    cluster_id=old_identifier
-                else:
-                    token=hashlib.sha256(canonical_bytes({"a":action,"old":old_identifier})).hexdigest()[:20]
-                    cluster_id="action|"+action_family_key(action)+"|"+token
-                entry["cluster_id"]=cluster_id
-                entry["canonical_action_signature"]=str(entry.get("canonical_action_signature") or action_signature(action))
-                entry.pop("action_signature",None)
-                if str(entry.get("previous_action","")).startswith("action|"):
-                    entry["previous_action"]=""
-                policy=str(entry.get("repeat_policy","one_shot"))
-                entry["repeat_policy"]=policy if policy in REPEAT_POLICIES else "one_shot"
-                entry["max_rate"]=float(entry.get("max_rate",3.0)) if finite_number(entry.get("max_rate",3.0)) else 3.0
-                conflict=entry.get("nearest_conflicting_distance")
-                entry["ambiguous"]=bool(entry.get("ambiguous",conflict is not None and finite_number(conflict) and float(conflict)<=max(1e-6,float(entry.get("threshold",1.0))*0.05)))
+                entry["temporal"]=temporal_from_context(entry.get("temporal",{}))
                 upgraded.append(entry)
             result=dict(item)
             result.update({"format_version":FORMAT_VERSION,"feature_width":FEATURE_W,"feature_height":FEATURE_H,"feature_algorithm_version":FEATURE_ALGORITHM_VERSION,"action_algorithm_version":ACTION_ALGORITHM_VERSION,"game_id":gid,"complete":bool(complete),"prototypes":upgraded})
@@ -1772,10 +2159,11 @@ class DataStore:
             if not isinstance(item,dict) or item.get("format_version")!=FORMAT_VERSION or item.get("feature_width")!=FEATURE_W or item.get("feature_height")!=FEATURE_H or item.get("feature_algorithm_version")!=FEATURE_ALGORITHM_VERSION or item.get("action_algorithm_version")!=ACTION_ALGORITHM_VERSION or item.get("game_id")!=gid or bool(item.get("complete"))!=bool(complete):
                 return False
             prototypes=item.get("prototypes")
-            if not isinstance(prototypes,list) or not prototypes:
+            if not isinstance(prototypes,list) or not prototypes or len(prototypes)>MAX_PROTOTYPES:
                 return False
             for proto in prototypes:
-                if not isinstance(proto,dict) or not str(proto.get("id","")) or not str(proto.get("cluster_id","")) or not str(proto.get("canonical_action_signature","")) or not feature_valid(proto.get("f")) or not isinstance(proto.get("coarse"),(bytes,bytearray)) or len(proto.get("coarse"))!=COARSE_LEN or not normalize_action(proto.get("a")) or not finite_number(proto.get("threshold")) or float(proto.get("threshold"))<=0 or int(proto.get("support",0))<=0:
+                temporal=temporal_from_context(proto.get("temporal",{}))
+                if not isinstance(proto,dict) or not str(proto.get("id","")) or not str(proto.get("cluster_id","")) or not str(proto.get("canonical_action_signature","")) or not feature_valid(proto.get("f")) or not isinstance(proto.get("coarse"),(bytes,bytearray)) or len(proto.get("coarse"))!=COARSE_LEN or not normalize_action(proto.get("a")) or not finite_number(proto.get("threshold")) or float(proto.get("threshold"))<=0 or int(proto.get("support",0))<=0 or not temporal.get("complete") or not finite_number(proto.get("temporal_threshold",0)) or float(proto.get("temporal_threshold",0))<=0:
                     return False
                 conflict=proto.get("nearest_conflicting_distance")
                 if conflict is not None and (not finite_number(conflict) or float(conflict)<0):
@@ -1785,7 +2173,8 @@ class DataStore:
                     return False
                 if not finite_number(proto.get("minimum_second_candidate_gap",0)) or str(proto.get("repeat_policy","one_shot")) not in REPEAT_POLICIES or not finite_number(proto.get("max_rate",1.0)) or float(proto.get("max_rate",1.0))<=0:
                     return False
-            return isinstance(item.get("validation"),dict)
+            validation=item.get("validation")
+            return isinstance(validation,dict) and isinstance(item.get("capture_backends"),list) and bool(item.get("capture_backends"))
         except Exception:
             return False
     def save_model(self,gid,model,complete=True):
@@ -1904,11 +2293,12 @@ class App:
         self.ask_session_id=None
         self.ask_counts=None
         self.error_recent={}
-        self.error_windows=[]
-        self.info_windows=[]
+        self.result_modal=None
+        self.result_modal_widget=None
         self.ui_queue=queue.Queue()
         self.closing=False
         self.shutdown_started=False
+        self.shutdown_deadline=None
         self.status=tk.StringVar(value="就绪")
         self.game_text=tk.StringVar(value="未选择")
         self.window_text=tk.StringVar(value="未选择")
@@ -1996,6 +2386,73 @@ class App:
         self.ui(lambda:self.confidence_text.set(str(text)))
     def set_progress(self,value):
         self.ui(lambda:self.progress_value.set(max(0.0,min(100.0,float(value)))))
+    def _show_result_modal(self,title,text):
+        if self.result_modal is not None:
+            try:
+                if self.result_modal.winfo_exists():
+                    self.result_modal.title(str(title))
+                    if self.result_modal_widget is not None:
+                        self.result_modal_widget.configure(state="normal")
+                        self.result_modal_widget.insert("end","\n\n"+str(text))
+                        self.result_modal_widget.configure(state="disabled")
+                        self.result_modal_widget.see("end")
+                    self.result_modal.lift()
+                    return
+            except Exception:
+                self.result_modal=None
+                self.result_modal_widget=None
+        previous_grab=None
+        try:
+            previous_grab=self.root.grab_current()
+        except Exception:
+            previous_grab=None
+        win=tk.Toplevel(self.root)
+        self.result_modal=win
+        win.title(str(title))
+        win.geometry("720x420")
+        win.minsize(520,320)
+        win.transient(self.root)
+        frame=ttk.Frame(win,padding=14)
+        frame.pack(fill="both",expand=True)
+        ttk.Label(frame,text=str(title),font=("Microsoft YaHei UI",14,"bold")).pack(anchor="w",pady=(0,8))
+        body=ttk.Frame(frame)
+        body.pack(fill="both",expand=True)
+        widget=tk.Text(body,wrap="word",font=("Microsoft YaHei UI",10),relief="solid",borderwidth=1)
+        self.result_modal_widget=widget
+        scroll=ttk.Scrollbar(body,orient="vertical",command=widget.yview)
+        widget.configure(yscrollcommand=scroll.set)
+        widget.pack(side="left",fill="both",expand=True)
+        scroll.pack(side="right",fill="y")
+        widget.insert("1.0",str(text))
+        widget.configure(state="disabled")
+        closed={"done":False}
+        def confirm():
+            if closed["done"]:
+                return
+            closed["done"]=True
+            self.result_modal=None
+            self.result_modal_widget=None
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            if previous_grab is not None:
+                try:
+                    if previous_grab.winfo_exists():
+                        previous_grab.grab_set()
+                except Exception:
+                    pass
+        ttk.Button(frame,text="确认",command=confirm).pack(pady=(12,0),ipadx=28)
+        win.bind("<Return>",lambda event:confirm())
+        win.protocol("WM_DELETE_WINDOW",confirm)
+        win.wait_visibility()
+        win.grab_set()
+        win.focus_force()
+        win.wait_window()
     def show_error(self,text):
         if threading.current_thread() is not threading.main_thread():
             self.ui(lambda:self.show_error(text))
@@ -2007,73 +2464,14 @@ class App:
         if digest in self.error_recent:
             return
         self.error_recent[digest]=now
-        win=tk.Toplevel(self.root)
-        self.error_windows.append(win)
-        win.title("报错信息")
-        win.geometry("700x390")
-        win.minsize(500,300)
-        win.transient(self.root)
-        frame=ttk.Frame(win,padding=14)
-        frame.pack(fill="both",expand=True)
-        ttk.Label(frame,text="报错信息",font=("Microsoft YaHei UI",14,"bold")).pack(anchor="w",pady=(0,8))
-        body=ttk.Frame(frame)
-        body.pack(fill="both",expand=True)
-        widget=tk.Text(body,wrap="word",font=("Microsoft YaHei UI",10),relief="solid",borderwidth=1)
-        scroll=ttk.Scrollbar(body,orient="vertical",command=widget.yview)
-        widget.configure(yscrollcommand=scroll.set)
-        widget.pack(side="left",fill="both",expand=True)
-        scroll.pack(side="right",fill="y")
-        widget.insert("1.0",message)
-        widget.configure(state="disabled")
-        def close_error():
-            try:
-                self.error_windows.remove(win)
-            except ValueError:
-                pass
-            win.destroy()
-        ttk.Button(frame,text="确认",command=close_error).pack(pady=(12,0),ipadx=24)
-        win.bind("<Return>",lambda event:close_error())
-        win.protocol("WM_DELETE_WINDOW",close_error)
-        win.wait_visibility()
-        win.focus_force()
+        self._show_result_modal("报错信息",message)
     def show_info(self,title,text):
         if threading.current_thread() is not threading.main_thread():
             self.ui(lambda:self.show_info(title,text))
             return
         if self.shutdown_started:
             return
-        win=tk.Toplevel(self.root)
-        self.info_windows.append(win)
-        win.title(str(title))
-        win.geometry("720x420")
-        win.minsize(520,320)
-        win.transient(self.root)
-        frame=ttk.Frame(win,padding=14)
-        frame.pack(fill="both",expand=True)
-        ttk.Label(frame,text=str(title),font=("Microsoft YaHei UI",14,"bold")).pack(anchor="w",pady=(0,8))
-        body=ttk.Frame(frame)
-        body.pack(fill="both",expand=True)
-        widget=tk.Text(body,wrap="word",font=("Microsoft YaHei UI",10),relief="solid",borderwidth=1)
-        scroll=ttk.Scrollbar(body,orient="vertical",command=widget.yview)
-        widget.configure(yscrollcommand=scroll.set)
-        widget.pack(side="left",fill="both",expand=True)
-        scroll.pack(side="right",fill="y")
-        widget.insert("1.0",str(text))
-        widget.configure(state="disabled")
-        def confirm():
-            try:
-                self.info_windows.remove(win)
-            except ValueError:
-                pass
-            try:
-                win.destroy()
-            except Exception:
-                pass
-        ttk.Button(frame,text="确认",command=confirm).pack(pady=(12,0),ipadx=28)
-        win.bind("<Return>",lambda event:confirm())
-        win.protocol("WM_DELETE_WINDOW",confirm)
-        win.wait_visibility()
-        win.focus_force()
+        self._show_result_modal(str(title),str(text))
     def prompt_text(self,title,label,initial=""):
         result={"value":None}
         win=tk.Toplevel(self.root)
@@ -2286,13 +2684,13 @@ class App:
             return
         win=tk.Toplevel(self.root)
         win.title("选择窗口")
-        win.geometry("820x540")
+        win.geometry("820x590")
         win.transient(self.root)
         win.grab_set()
         frame=ttk.Frame(win,padding=16)
         frame.pack(fill="both",expand=True)
         ttk.Label(frame,text="选择雷电模拟器窗口或其他窗口",font=("Microsoft YaHei UI",13,"bold")).pack(anchor="w",pady=(0,6))
-        ttk.Label(frame,text="确认后会短暂执行后台采集兼容性与窗口自适应阈值校准。",wraplength=760).pack(anchor="w",pady=(0,10))
+        ttk.Label(frame,text="确认后将在工作线程执行动态采集校准。请让目标窗口画面发生变化；校准失败、窗口消失、最小化、权限不足或后端切换时不会保存选择。",wraplength=760).pack(anchor="w",pady=(0,10))
         list_frame=ttk.Frame(frame)
         list_frame.pack(fill="both",expand=True)
         box=tk.Listbox(list_frame,exportselection=False,font=("Microsoft YaHei UI",10))
@@ -2300,10 +2698,22 @@ class App:
         box.configure(yscrollcommand=scroll.set)
         box.pack(side="left",fill="both",expand=True)
         scroll.pack(side="right",fill="y")
+        status=tk.StringVar(value="请选择窗口")
+        ttk.Label(frame,textvariable=status,wraplength=760).pack(anchor="w",fill="x",pady=(8,2))
+        progress=ttk.Progressbar(frame,maximum=100)
+        progress.pack(fill="x",pady=(0,8))
         windows=[]
+        cancel_event=threading.Event()
+        state={"calibrating":False,"closed":False}
         def refresh():
             nonlocal windows
-            windows=self.api.enum_windows()
+            if state["calibrating"]:
+                return
+            try:
+                windows=self.api.enum_windows()
+            except Exception as error:
+                self.show_error(str(error))
+                return
             box.delete(0,"end")
             selected_index=None
             for index,item in enumerate(windows):
@@ -2314,30 +2724,84 @@ class App:
             if selected_index is not None:
                 box.selection_set(selected_index)
                 box.see(selected_index)
+        def set_busy(value):
+            state["calibrating"]=bool(value)
+            confirm_button.configure(state="disabled" if value else "normal")
+            refresh_button.configure(state="disabled" if value else "normal")
+            box.configure(state="disabled" if value else "normal")
+        def finish_success(item,calibration):
+            if state["closed"] or cancel_event.is_set():
+                return
+            item=dict(item)
+            item["integrity"]=int(calibration["integrity"])
+            item["capture_backend"]=str(calibration["validated_backend"])
+            self.selected_window=item
+            self.api.reset_frame_history(item["hwnd"])
+            self._refresh_all()
+            self.status.set("已选择窗口："+item["title"]+"；后端"+str(calibration["validated_backend"])+"；动态校准"+str(round(float(calibration.get("fps",0.0)),1))+"fps")
+            state["closed"]=True
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+        def finish_error(message):
+            if state["closed"] or cancel_event.is_set():
+                return
+            set_busy(False)
+            progress["value"]=0
+            status.set("校准失败："+str(message))
         def confirm():
+            if state["calibrating"]:
+                return
             selection=box.curselection()
             if not selection:
                 self.show_error("请先选择一个窗口")
                 return
             item=dict(windows[selection[0]])
-            self.api.validate_target(item,False)
-            self.status.set("正在检测窗口采集兼容性并校准阈值")
             try:
-                calibration=self.api.calibrate(item,1.2)
+                self.api.validate_target(item,False)
+                item["integrity"]=self.api.validate_uipi(item)
             except Exception as error:
-                self.api.capture_reports[item["hwnd"]]="兼容性检测未完成："+str(error)+"；运行时仍会按WGC、PrintWindow、窗口DC、前台裁剪顺序降级"
-                calibration=self.api.calibration_for(item)
-            self.selected_window=item
-            self.api.reset_frame_history(item["hwnd"])
-            self._refresh_all()
-            self.status.set("已选择窗口："+item["title"]+"；校准帧率"+str(round(float(calibration.get("fps",0.0)),1))+"fps")
+                self.show_error(str(error))
+                return
+            cancel_event.clear()
+            set_busy(True)
+            status.set("正在动态检测采集后端、画面变化、窗口身份和权限；可点击取消")
+            progress["value"]=1
+            def update_progress(value):
+                self.ui(lambda:progress.configure(value=max(1,min(99,float(value)*100))) if not state["closed"] else None)
+            def work():
+                try:
+                    calibration=self.api.calibrate(item,1.8,cancel_event,update_progress)
+                    self.ui(lambda:finish_success(item,calibration))
+                except Exception as error:
+                    self.ui(lambda message=str(error):finish_error(message))
+                finally:
+                    try:
+                        self.api.wgc.release_thread(threading.get_ident())
+                    except Exception:
+                        pass
+            threading.Thread(target=work,name="UniversalGameAI-WindowCalibration",daemon=True).start()
+        def cancel():
+            if state["closed"]:
+                return
+            state["closed"]=True
+            cancel_event.set()
+            try:
+                win.grab_release()
+            except Exception:
+                pass
             win.destroy()
         tools=ttk.Frame(frame)
-        tools.pack(fill="x",pady=(10,0))
-        ttk.Button(tools,text="刷新",command=refresh).pack(side="left")
-        ttk.Button(tools,text="确认",command=confirm).pack(side="right",padx=(6,0))
-        ttk.Button(tools,text="取消",command=win.destroy).pack(side="right")
+        tools.pack(fill="x",pady=(4,0))
+        refresh_button=ttk.Button(tools,text="刷新",command=refresh)
+        refresh_button.pack(side="left")
+        confirm_button=ttk.Button(tools,text="确认",command=confirm)
+        confirm_button.pack(side="right",padx=(6,0))
+        ttk.Button(tools,text="取消",command=cancel).pack(side="right")
         box.bind("<Double-Button-1>",lambda event:confirm())
+        win.protocol("WM_DELETE_WINDOW",cancel)
         refresh()
         win.wait_visibility()
         box.focus_set()
@@ -2368,20 +2832,23 @@ class App:
             return
         self.mode=name
         self.stop_event=threading.Event()
+        self.api.allow_input(self.stop_event)
         self.set_controls(True)
         self.progress_value.set(0)
         self.status.set(name+"已开始，按ESC或点击“停止”结束")
-        self.mode_thread=threading.Thread(target=self.worker_entry,args=(name,target),name="UniversalGameAI-"+name,daemon=False)
+        self.mode_thread=threading.Thread(target=self.worker_entry,args=(name,target),name="UniversalGameAI-"+name,daemon=True)
         self.mode_thread.start()
     def worker_entry(self,name,target):
         error=None
         final_text=name+"已结束"
         try:
             final_text=target()
+        except InputStopped:
+            final_text=name+"已停止"
         except Exception:
             error=traceback.format_exc()
         finally:
-            self.api.release_all_buttons()
+            self.api.block_input()
         def finish():
             if self.shutdown_started:
                 return
@@ -2398,22 +2865,27 @@ class App:
                 self.show_info(name+"完成",final_text)
         self.ui(finish)
     def request_stop(self):
-        self.api.release_all_buttons()
+        if self.stop_event:
+            self.stop_event.set()
+        self.api.block_input()
         if self.ask_window is not None:
             self.close_ask()
             return
+        self.status.set("正在停止，已阻止新的鼠标按下并释放全部鼠标键")
+    def _keyboard_escape(self,event=None):
         if self.stop_event:
             self.stop_event.set()
-            self.status.set("正在停止，已释放全部鼠标键")
+        self.api.block_input()
     def wait_escape_release(self):
         while self.api.key_down(0x1B) and self.stop_event and not self.stop_event.is_set():
             time.sleep(0.04)
     def should_stop(self):
         if not self.stop_event or self.stop_event.is_set():
+            self.api.block_input()
             return True
         if self.api.key_down(0x1B):
             self.stop_event.set()
-            self.api.release_all_buttons()
+            self.api.block_input()
             return True
         return False
     def inside(self,x,y,rect):
@@ -2425,9 +2897,28 @@ class App:
     def point_to_screen(self,point,rect):
         x,y,width,height=rect
         return x+round(max(0.0,min(1.0,float(point[0])))*max(1,width-1)),y+round(max(0.0,min(1.0,float(point[1])))*max(1,height-1))
-    def sample_context(self,last_signature,last_time,last_changed,motion_valid=True,session_id="",capture_method="unknown",repeat_policy="one_shot"):
+    def sample_context(self,last_signature,last_time,last_changed,motion_valid=True,session_id="",capture_method="unknown",repeat_policy="one_shot",temporal=None):
         calibration=self.api.calibration_for(self.selected_window.get("hwnd") if self.selected_window else 0)
-        return {"previous_action":last_signature or "","seconds_since_previous":round(max(0.0,min(60.0,time.time()-last_time)) if last_time else 60.0,3),"previous_action_changed_frame":bool(last_changed),"motion_channel_valid":bool(motion_valid),"session_id":str(session_id or "unspecified"),"capture_method":str(capture_method or "unknown"),"repeat_policy":repeat_policy if repeat_policy in REPEAT_POLICIES else "one_shot","duplicate_threshold":float(calibration.get("duplicate",3.0)),"calibration":dict(calibration)}
+        result={"previous_action":last_signature or "","seconds_since_previous":round(max(0.0,min(60.0,time.time()-last_time)) if last_time else 60.0,3),"previous_action_changed_frame":bool(last_changed),"motion_channel_valid":bool(motion_valid),"session_id":str(session_id or "unspecified"),"capture_method":str(capture_method or "unknown"),"repeat_policy":repeat_policy if repeat_policy in REPEAT_POLICIES else "one_shot","duplicate_threshold":float(calibration.get("duplicate",3.0)),"calibration":dict(calibration)}
+        if isinstance(temporal,dict):
+            result.update(temporal)
+        return result
+    def build_temporal_context(self,frame_buffer,frame,recent_actions,state_since,cursor_point=None):
+        frames=[item for item in frame_buffer.snapshot(1.5) if item.get("capture_valid") and item.get("backend_validated") and item["time"]<=float(frame["time"])+0.001 and item.get("method")==frame.get("method")]
+        frames=frames[-5:]
+        deltas=[round(visual_distance(first["f"],second["f"]),6) for first,second in zip(frames,frames[1:])]
+        if cursor_point is None:
+            try:
+                x,y=self.api.cursor()
+                rect=tuple(frame.get("rect",()))
+                cursor_point=self.normalize_point(x,y,rect) if len(rect)==4 and self.inside(x,y,rect) else None
+            except Exception:
+                cursor_point=None
+        rect=tuple(frame.get("rect",()))
+        actions=list(recent_actions)[-4:]
+        while len(actions)<2:
+            actions.insert(0,"<START>")
+        return {"recent_frame_count":len(frames),"recent_frame_deltas":deltas,"recent_actions":actions,"state_duration":round(max(0.0,min(60.0,time.time()-float(state_since))),3),"cursor":cursor_point,"window_size":[int(rect[2]),int(rect[3])] if len(rect)==4 else None,"dpi":int(frame.get("dpi",0)),"capture_method":str(frame.get("method","unknown"))}
     def start_learning(self):
         self.start_worker("学习",self.learning_worker,True)
     def learning_worker(self):
@@ -2436,69 +2927,128 @@ class App:
         hwnd=target["hwnd"]
         session_id="learn|"+uuid.uuid4().hex
         calibration=self.api.calibration_for(target)
-        focused=self.api.request_foreground(hwnd)
-        if not focused:
+        if not calibration.get("dynamic_passed") or not calibration.get("validated_backend"):
+            raise RuntimeError("目标窗口尚未通过动态采集验收，请重新选择窗口")
+        if not self.api.request_foreground(hwnd):
             self.set_status("无法自动切换到目标窗口，学习将等待目标窗口成为前台")
         self.wait_escape_release()
-        frame_buffer=FrameBuffer(self.api,target,20.0,2.0,0.1).start()
-        monitor=MouseMonitor(self.api)
-        monitor.start()
-        active={}
-        pending_click={}
+        keyboard_queue=queue.Queue()
+        keyboard_state={"until":0.0,"generation":0,"last_time":0.0}
+        def other_key(event):
+            keyboard_state["until"]=max(float(keyboard_state["until"]),float(event["time"])+0.75)
+            keyboard_state["generation"]=int(keyboard_state["generation"])+1
+            keyboard_state["last_time"]=float(event["time"])
+            try:
+                keyboard_queue.put_nowait(event)
+            except Exception:
+                pass
+            self.api.release_all_buttons()
         learned=0
         discarded=0
         duplicates=0
         invalid_frames=0
+        keyboard_discarded=0
+        keyboard_count=0
+        recent_actions=deque(["<START>","<START>"],maxlen=4)
         last_action_signature=""
         last_action_time=0.0
         last_action_feature=None
         last_action_changed=True
-        last_negative=0.0
-        last_motion_time=0.0
-        motion=None
-        last_cursor=None
-        hover_start=0.0
-        hover_point=None
-        last_update=0.0
-        def capture_safe(stamp=None):
-            nonlocal invalid_frames
-            frame=frame_buffer.latest(stamp,0.75)
-            if frame is None:
-                invalid_frames+=1
-            return frame
-        def save(frame,action,source,weight=1.0):
-            nonlocal learned,duplicates,last_action_signature,last_action_time,last_action_feature,last_action_changed
-            if frame is None:
-                return False
-            context=self.sample_context(last_action_signature,last_action_time,last_action_changed,frame.get("motion_valid",False),session_id,frame.get("method","unknown"),"one_shot")
-            saved=self.store.append_sample(game["id"],frame["f"],action,source,context,frame.get("gray"),weight)
-            if saved:
-                learned+=1
-                last_action_signature=action_signature(action)
-                last_action_time=time.time()
-                last_action_changed=True if last_action_feature is None else visual_distance(last_action_feature,frame["f"])>float(calibration.get("significant_change",60.0))
-                last_action_feature=frame["f"]
-            else:
-                duplicates+=1
-            return saved
-        def save_click(button,item):
-            save(item["frame"],{"kind":"click","button":button,"path":[item["point"]],"duration":item["duration"]},"learn")
-        def flush_pending(now,force=False):
-            for button,item in list(pending_click.items()):
-                if force or now-item["time"]>0.42:
-                    save_click(button,item)
-                    pending_click.pop(button,None)
-        try:
+        state_since=time.time()
+        with ModeSession(self,target) as session:
+            frame_buffer=session.start_frames(20.0,2.0,0.1,"learning")
+            keyboard=session.start_keyboard(other_key)
+            monitor=session.start_mouse()
+            active={}
+            pending_click={}
+            last_negative=0.0
+            last_motion_time=0.0
+            motion=None
+            last_cursor=None
+            hover_start=0.0
+            hover_point=None
+            last_update=0.0
+            def paused(now=None):
+                current=time.time() if now is None else float(now)
+                return current<float(keyboard_state["until"]) or not keyboard.all_released()
+            def capture_safe(stamp=None):
+                nonlocal invalid_frames
+                frame=frame_buffer.latest(stamp,0.75,"learning")
+                if frame is None:
+                    invalid_frames+=1
+                return frame
+            def save(frame,action,source,weight=1.0,cursor_point=None):
+                nonlocal learned,duplicates,last_action_signature,last_action_time,last_action_feature,last_action_changed,keyboard_discarded,state_since,invalid_frames
+                if frame is None or not frame.get("usable_for_learning"):
+                    return False
+                if paused():
+                    keyboard_discarded+=1
+                    return False
+                generation=int(keyboard_state["generation"])
+                temporal=self.build_temporal_context(frame_buffer,frame,recent_actions,state_since,cursor_point or ((action.get("path") or [None])[-1] if isinstance(action,dict) else None))
+                if not temporal_from_context({**temporal,"previous_action_changed_frame":last_action_changed}).get("complete"):
+                    invalid_frames+=1
+                    return False
+                context=self.sample_context(last_action_signature,last_action_time,last_action_changed,frame.get("motion_valid",False),session_id,frame.get("method","unknown"),"one_shot",temporal)
+                saved=self.store.append_sample(game["id"],frame["f"],action,source,context,frame.get("gray"),weight)
+                if saved and (generation!=int(keyboard_state["generation"]) or paused()):
+                    event_time=float(keyboard_state.get("last_time") or time.time())
+                    keyboard_discarded+=self.store.discard_session_window(game["id"],session_id,event_time-0.75,event_time+0.75)
+                    return False
+                if saved:
+                    learned+=1
+                    signature=action_signature(action)
+                    recent_actions.append(signature)
+                    last_action_signature=signature
+                    last_action_time=time.time()
+                    changed=True if last_action_feature is None else visual_distance(last_action_feature,frame["f"])>float(calibration.get("significant_change",60.0))
+                    last_action_changed=changed
+                    if changed:
+                        state_since=time.time()
+                    last_action_feature=frame["f"]
+                else:
+                    duplicates+=1
+                return saved
+            def save_click(button,item):
+                save(item["frame"],{"kind":"click","button":button,"path":[item["point"]],"duration":item["duration"]},"learn",1.0,item["point"])
+            def flush_pending(now,force=False):
+                for button,item in list(pending_click.items()):
+                    if force or now-item["time"]>0.42:
+                        if not self.should_stop() and not paused(now):
+                            save_click(button,item)
+                        pending_click.pop(button,None)
             while not self.should_stop():
                 now=time.time()
+                while True:
+                    try:
+                        event=keyboard_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    keyboard_count+=1
+                    keyboard_state["until"]=max(float(keyboard_state["until"]),float(event["time"])+0.75)
+                    keyboard_discarded+=self.store.discard_session_window(game["id"],session_id,float(event["time"])-0.75,float(event["time"])+0.75)
+                    active.clear()
+                    pending_click.clear()
+                    motion=None
+                    last_cursor=None
+                    hover_point=None
+                    hover_start=0.0
+                    monitor.drain()
+                if paused(now):
+                    active.clear()
+                    pending_click.clear()
+                    motion=None
+                    self.api.release_all_buttons()
+                    self.set_status("检测到非ESC键盘输入，学习已暂停并废弃按键前后样本；等待全部按键释放")
+                    time.sleep(0.03)
+                    continue
                 try:
                     rect=self.api.validate_target(target,True)
                     focused=True
                 except TargetUnavailable:
                     focused=False
                     active.clear()
-                    if motion is not None:
-                        motion["outside"]=True
+                    pending_click.clear()
                     motion=None
                     last_cursor=None
                     hover_point=None
@@ -2507,10 +3057,11 @@ class App:
                     self.set_status("目标窗口失去焦点，等待恢复；已释放全部鼠标键")
                 events=monitor.drain()
                 if not focused:
-                    flush_pending(now)
                     time.sleep(0.05)
                     continue
                 for event in events:
+                    if paused(event["time"]) or self.should_stop():
+                        break
                     etype=event["type"]
                     x=event["x"]
                     y=event["y"]
@@ -2523,8 +3074,6 @@ class App:
                             if frame is not None:
                                 point=self.normalize_point(x,y,rect)
                                 active[button]={"frame":frame,"path":[point],"start":event_time,"outside":False,"last":point}
-                        if motion is not None:
-                            motion["outside"]=True
                         motion=None
                         last_cursor=None
                         hover_point=None
@@ -2553,9 +3102,6 @@ class App:
                                     motion["outside"]=True
                                 continue
                             point=self.normalize_point(x,y,rect)
-                            if motion is not None and motion.get("outside"):
-                                discarded+=1
-                                motion=None
                             if last_cursor is None:
                                 last_cursor=point
                                 hover_point=point
@@ -2580,18 +3126,15 @@ class App:
                                 item["outside"]=True
                             if item["outside"]:
                                 discarded+=1
-                                last_cursor=None
-                                hover_point=None
-                                hover_start=0.0
                                 continue
                             point=self.normalize_point(x,y,rect)
                             item["path"].append(point)
                             duration=max(0.03,min(3.0,event_time-item["start"]))
                             length=path_length(item["path"])
                             if length>0.045:
-                                save(item["frame"],{"kind":"drag","button":button,"path":item["path"],"duration":duration},"learn",1.4)
+                                save(item["frame"],{"kind":"drag","button":button,"path":item["path"],"duration":duration},"learn",1.4,point)
                             elif duration>=0.48:
-                                save(item["frame"],{"kind":"long_press","button":button,"path":[point],"duration":duration},"learn",1.2)
+                                save(item["frame"],{"kind":"long_press","button":button,"path":[point],"duration":duration},"learn",1.2,point)
                             else:
                                 previous=pending_click.get(button)
                                 if previous:
@@ -2599,15 +3142,15 @@ class App:
                                     close=math.hypot(point[0]-previous["point"][0],point[1]-previous["point"][1])<=0.035
                                     if click_gap<=0.42 and close:
                                         pending_click.pop(button,None)
-                                        save(previous["frame"],{"kind":"double_click","button":button,"path":[previous["point"]],"duration":max(0.06,event_time-previous["time"])},"learn",1.3)
+                                        save(previous["frame"],{"kind":"double_click","button":button,"path":[previous["point"]],"duration":max(0.06,event_time-previous["time"])},"learn",1.3,previous["point"])
                                         continue
                                     save_click(button,previous)
-                                    pending_click.pop(button,None)
                                 pending_click[button]={"frame":item["frame"],"point":point,"duration":duration,"time":event_time}
                     elif etype in {"wheel","hwheel"} and inside and not active:
                         frame=capture_safe(event_time)
+                        point=self.normalize_point(x,y,rect)
                         if frame is not None:
-                            save(frame,{"kind":"scroll_h" if etype=="hwheel" else "scroll_v","delta":event.get("delta",0),"path":[self.normalize_point(x,y,rect)],"duration":0.08},"learn",1.2)
+                            save(frame,{"kind":"scroll_h" if etype=="hwheel" else "scroll_v","delta":event.get("delta",0),"path":[point],"duration":0.08},"learn",1.2,point)
                 flush_pending(now)
                 try:
                     polled_x,polled_y=self.api.cursor()
@@ -2624,7 +3167,7 @@ class App:
                         item["outside"]=True
                 if motion is not None and now-last_motion_time>0.22:
                     if not motion["outside"] and path_length(motion["path"])>0.06:
-                        save(motion["frame"],{"kind":"move","path":motion["path"],"duration":max(0.05,min(2.0,now-motion["start"]))},"learn")
+                        save(motion["frame"],{"kind":"move","path":motion["path"],"duration":max(0.05,min(2.0,now-motion["start"]))},"learn",1.0,motion["path"][-1])
                     elif motion["outside"]:
                         discarded+=1
                     motion=None
@@ -2640,32 +3183,22 @@ class App:
                         if math.hypot(current_point[0]-hover_point[0],current_point[1]-hover_point[1])<=0.02:
                             frame=capture_safe(now)
                             if frame is not None:
-                                save(frame,{"kind":"hover","path":[current_point],"duration":0.85},"learn")
+                                save(frame,{"kind":"hover","path":[current_point],"duration":0.85},"learn",1.0,current_point)
                             hover_start=now+1.5
                         else:
                             hover_point=current_point
                             hover_start=now
-                    else:
-                        last_cursor=None
-                        hover_point=None
-                        hover_start=0.0
-                        if motion is not None:
-                            motion["outside"]=True
                 if not active and not pending_click and now-last_negative>0.9 and now-last_motion_time>0.35:
                     frame=capture_safe(now)
                     if frame is not None:
-                        save(frame,{"kind":"no_op","duration":0.45},"negative",0.6)
+                        cursor_point=self.normalize_point(polled_x,polled_y,rect) if polled_inside else None
+                        save(frame,{"kind":"no_op","duration":0.45},"negative",0.6,cursor_point)
                     last_negative=now
                 if now-last_update>0.45:
-                    self.set_status("学习中：有效"+str(learned)+"  重复或配额抑制"+str(duplicates)+"  越界废弃"+str(discarded)+"  无效画面"+str(invalid_frames)+"；事件使用发生前最近帧，仅保存全程位于客户区内的动作")
+                    self.set_status("学习中：有效"+str(learned)+"  重复"+str(duplicates)+"  越界废弃"+str(discarded)+"  无效画面"+str(invalid_frames)+"  非ESC键"+str(keyboard_count)+"  键盘关联废弃"+str(keyboard_discarded))
                     last_update=now
                 time.sleep(0.012)
-        finally:
-            flush_pending(time.time(),True)
-            monitor.stop()
-            frame_buffer.stop()
-            self.api.release_all_buttons()
-        return "学习已结束：有效"+str(learned)+"，重复或配额抑制"+str(duplicates)+"，废弃"+str(discarded)+"，无效画面"+str(invalid_frames)
+        return "学习已结束：有效"+str(learned)+"，重复或配额抑制"+str(duplicates)+"，越界废弃"+str(discarded)+"，无效画面"+str(invalid_frames)+"，检测到非ESC键盘输入"+str(keyboard_count)+"次，因此废弃样本"+str(keyboard_discarded)+"个"
     def _prototype_medoid(self,members):
         if len(members)==1:
             return members[0]
@@ -2673,9 +3206,13 @@ class App:
         comparisons=members if len(members)<=72 else [members[round(index*(len(members)-1)/71)] for index in range(72)]
         best=candidates[0]
         best_total=float("inf")
+        operations=0
         for candidate in candidates:
             total=0.0
             for other in comparisons:
+                operations+=1
+                if operations%32==0 and self.should_stop():
+                    raise InputStopped("复习已停止")
                 total+=feature_distance(candidate["f"],other["f"])
             if total<best_total:
                 best_total=total
@@ -2686,25 +3223,46 @@ class App:
             return members[0]
         candidates=members if len(members)<=36 else [members[round(index*(len(members)-1)/35)] for index in range(36)]
         comparisons=members if len(members)<=96 else [members[round(index*(len(members)-1)/95)] for index in range(96)]
-        return min(candidates,key=lambda candidate:sum(action_geometry_distance(candidate["a"],other["a"])*float(other.get("weight",1.0)) for other in comparisons))
+        best=candidates[0]
+        best_total=float("inf")
+        operations=0
+        for candidate in candidates:
+            total=0.0
+            for other in comparisons:
+                operations+=1
+                if operations%32==0 and self.should_stop():
+                    raise InputStopped("复习已停止")
+                total+=action_geometry_distance(candidate["a"],other["a"])*float(other.get("weight",1.0))
+            if total<best_total:
+                best_total=total
+                best=candidate
+        return best
     def _cluster_action_samples(self,samples):
         families=defaultdict(list)
-        for sample in samples:
+        for index,sample in enumerate(samples):
+            if index%64==0 and self.should_stop():
+                raise InputStopped("复习已停止")
             family=action_family_key(sample["a"])
             if family:
                 families[family].append(sample)
         clusters=[]
+        operations=0
         for family,items in sorted(families.items()):
             if self.should_stop():
-                break
+                raise InputStopped("复习已停止")
             local=[]
             for item in sorted(items,key=lambda value:str(value.get("checksum",""))):
                 if self.should_stop():
-                    break
+                    raise InputStopped("复习已停止")
                 if not local:
                     local.append({"family":family,"members":[item],"medoid":item})
                     continue
-                distances=[action_geometry_distance(item["a"],cluster["medoid"]["a"]) for cluster in local]
+                distances=[]
+                for cluster in local:
+                    operations+=1
+                    if operations%32==0 and self.should_stop():
+                        raise InputStopped("复习已停止")
+                    distances.append(action_geometry_distance(item["a"],cluster["medoid"]["a"]))
                 best_index=min(range(len(distances)),key=lambda index:distances[index])
                 if distances[best_index]<=action_cluster_limit(item["a"]):
                     cluster=local[best_index]
@@ -2720,6 +3278,9 @@ class App:
                     if changed:
                         break
                     for second in range(first+1,len(local)):
+                        operations+=1
+                        if operations%16==0 and self.should_stop():
+                            raise InputStopped("复习已停止")
                         limit=min(action_cluster_limit(local[first]["medoid"]["a"]),action_cluster_limit(local[second]["medoid"]["a"]))*0.82
                         if action_geometry_distance(local[first]["medoid"]["a"],local[second]["medoid"]["a"])<=limit:
                             local[first]["members"].extend(local[second]["members"])
@@ -2728,13 +3289,17 @@ class App:
                             changed=True
                             break
             for index,cluster in enumerate(local):
+                if self.should_stop():
+                    raise InputStopped("复习已停止")
                 action=normalize_action(cluster["medoid"]["a"])
                 canonical=action_signature(action)
                 token=hashlib.sha256(canonical_bytes({"family":family,"action":action,"index":index})).hexdigest()[:20]
                 cluster_id="action|"+family+"|"+token
                 intervals=[]
                 learned_policies=[]
-                for member in cluster["members"]:
+                for member_index,member in enumerate(cluster["members"]):
+                    if member_index%32==0 and self.should_stop():
+                        raise InputStopped("复习已停止")
                     context=member.get("context",{}) if isinstance(member.get("context"),dict) else {}
                     if context.get("previous_action")==canonical and not context.get("previous_action_changed_frame",True) and finite_number(context.get("seconds_since_previous")) and float(context.get("seconds_since_previous"))<=1.5:
                         intervals.append(max(0.05,float(context.get("seconds_since_previous"))))
@@ -2773,7 +3338,7 @@ class App:
         visual_threshold=statistics.median(calibrated) if calibrated else 420.0
         for index,item in enumerate(items):
             if self.should_stop():
-                break
+                raise InputStopped("复习已停止")
             if not clusters:
                 clusters.append([item])
             else:
@@ -2788,26 +3353,40 @@ class App:
                 progress_callback(index,len(items),len(clusters))
         result=[]
         canonical=action_signature(action)
-        for cluster in clusters:
+        for cluster_index,cluster in enumerate(clusters):
+            if self.should_stop():
+                raise InputStopped("复习已停止")
             medoid=self._prototype_medoid(cluster)
-            distances=[feature_distance(item["f"],medoid["f"]) for item in cluster]
+            distances=[]
+            temporal_distances=[]
+            temporal=temporal_from_context(medoid.get("context",{}))
+            for item_index,item in enumerate(cluster):
+                if item_index%32==0 and self.should_stop():
+                    raise InputStopped("复习已停止")
+                distances.append(feature_distance(item["f"],medoid["f"]))
+                temporal_distances.append(temporal_distance(item.get("context",{}),temporal))
             mean=statistics.fmean(distances) if distances else 0.0
             std=statistics.pstdev(distances) if len(distances)>1 else 0.0
             limit95=quantile(distances,0.95)
             limit99=quantile(distances,0.99)
             threshold_value=max(1.0,min(1800.0,max(limit99,mean+2.58*std)+max(8.0,std*0.35)))
+            temporal_threshold=max(0.12,min(0.42,quantile(temporal_distances,0.95)+0.05))
             previous=Counter(str(item.get("context",{}).get("previous_action","")) for item in cluster)
             previous.pop("",None)
             prev=previous.most_common(1)[0][0] if previous else ""
-            result.append({"id":uuid.uuid4().hex,"cluster_id":cluster_id,"canonical_action_signature":canonical,"f":feature_bytes(medoid["f"]),"coarse":coarse_feature(medoid["f"]),"a":normalize_action(action),"support":len(cluster),"action_support":int(action_support),"mean_distance":round(mean,6),"std_distance":round(std,6),"limit95":round(limit95,6),"limit99":round(limit99,6),"intra_threshold":round(threshold_value,6),"threshold":round(threshold_value,6),"previous_action":prev,"repeat_policy":repeat_policy if repeat_policy in REPEAT_POLICIES else "one_shot","max_rate":max(0.25,min(12.0,float(max_rate))),"ambiguous":False,"created_from_sample_checksum":medoid.get("checksum","")})
+            methods=sorted({str(item.get("capture_method") or item.get("context",{}).get("capture_method") or "unknown") for item in cluster})
+            result.append({"id":uuid.uuid4().hex,"cluster_id":cluster_id,"canonical_action_signature":canonical,"f":feature_bytes(medoid["f"]),"coarse":coarse_feature(medoid["f"]),"a":normalize_action(action),"support":len(cluster),"action_support":int(action_support),"mean_distance":round(mean,6),"std_distance":round(std,6),"limit95":round(limit95,6),"limit99":round(limit99,6),"intra_threshold":round(threshold_value,6),"threshold":round(threshold_value,6),"temporal":temporal,"temporal_threshold":round(temporal_threshold,6),"capture_methods":methods,"previous_action":prev,"repeat_policy":repeat_policy if repeat_policy in REPEAT_POLICIES else "one_shot","max_rate":max(0.25,min(12.0,float(max_rate))),"ambiguous":False,"created_from_sample_checksum":medoid.get("checksum","")})
         return result
-    def rank_action_candidates(self,feature,prototypes,last_action_signature="",full_limit=16):
+    def rank_action_candidates(self,feature,prototypes,last_action_signature="",full_limit=16,temporal_context=None):
         if not feature_valid(feature):
             return []
+        query_temporal=temporal_from_context(temporal_context or {})
         query_coarse=coarse_feature(feature)
         coarse_rank=[]
         best_per_cluster={}
-        for proto in prototypes:
+        for index,proto in enumerate(prototypes):
+            if index%64==0 and self.stop_event is not None and self.should_stop():
+                return []
             pc=proto.get("coarse")
             if not isinstance(pc,(bytes,bytearray)) or len(pc)!=COARSE_LEN:
                 pc=coarse_feature(proto["f"])
@@ -2835,21 +3414,23 @@ class App:
             penalty=0.0
             if expected and last_action_signature and expected!=last_action_signature:
                 penalty=min(120.0,raw*0.08+18.0)
+            tdistance=temporal_distance(query_temporal,proto.get("temporal",{}))
+            temporal_penalty=tdistance*max(40.0,float(proto.get("threshold",100.0))*0.35)
             cluster_id=str(proto.get("cluster_id",proto.get("action_signature","")))
             if cluster_id:
-                grouped[cluster_id].append((raw+penalty,raw,proto))
+                grouped[cluster_id].append((raw+penalty+temporal_penalty,raw,tdistance,proto))
         result=[]
         for cluster_id,items in grouped.items():
             items.sort(key=lambda item:item[0])
-            best_score,best_distance,best_proto=items[0]
+            best_score,best_distance,best_temporal,best_proto=items[0]
             vote_score=best_score if len(items)==1 else 0.88*best_score+0.12*items[1][0]
             action=normalize_action(best_proto["a"])
-            result.append({"cluster_id":cluster_id,"canonical_action_signature":str(best_proto.get("canonical_action_signature") or action_signature(action)),"score":vote_score,"best_score":best_score,"distance":best_distance,"proto":best_proto,"a":action,"support":max(int(item[2].get("action_support",item[2].get("support",0))) for item in items),"prototype_votes":len(items)})
+            result.append({"cluster_id":cluster_id,"canonical_action_signature":str(best_proto.get("canonical_action_signature") or action_signature(action)),"score":vote_score,"best_score":best_score,"distance":best_distance,"temporal_distance":best_temporal,"proto":best_proto,"a":action,"support":max(int(item[3].get("action_support",item[3].get("support",0))) for item in items),"prototype_votes":len(items)})
         result.sort(key=lambda item:item["score"])
         return result
     def evaluate_action_candidates(self,ranked):
         if not ranked:
-            return {"accepted":False,"confidence":0.0,"reason":"没有候选"}
+            return {"accepted":False,"confidence":0.0,"reason":"没有候选或停止请求"}
         best=ranked[0]
         second=ranked[1] if len(ranked)>1 else None
         proto=best["proto"]
@@ -2862,169 +3443,234 @@ class App:
         support=int(best.get("support",0))
         rejected_distance=proto.get("nearest_rejected_distance")
         rejection_ok=rejected_distance is None or best["distance"]<float(rejected_distance)*0.65
+        temporal_ok=float(best.get("temporal_distance",1.0))<=float(proto.get("temporal_threshold",0.0))
+        query_backend=str(temporal_from_context(proto.get("temporal",{})).get("capture_method","unknown"))
         ambiguous=bool(proto.get("ambiguous",False))
-        accepted=not ambiguous and best["distance"]<threshold and margin_ok and support>=min_support and rejection_ok
-        confidence=max(0.0,min(1.0,1.0-best["distance"]/max(1.0,threshold)))
-        reason="视觉状态存在不同动作歧义，必须请教" if ambiguous else "未达到动作阈值、差距或支持数要求"
-        return {"accepted":accepted,"best":best,"second":second,"threshold":threshold,"margin":margin,"required_gap":required_gap,"support":support,"min_support":min_support,"confidence":confidence,"margin_ok":margin_ok,"rejection_ok":rejection_ok,"ambiguous":ambiguous,"reason":reason,"nearest_rejected_distance":rejected_distance}
+        accepted=not ambiguous and best["distance"]<threshold and margin_ok and support>=min_support and rejection_ok and temporal_ok
+        confidence=max(0.0,min(1.0,1.0-best["distance"]/max(1.0,threshold)))*(1.0-min(1.0,float(best.get("temporal_distance",1.0))))
+        if ambiguous:
+            reason="视觉与短时序状态仍对应不同动作，必须请教"
+        elif not temporal_ok:
+            reason="最近3至5帧、最近动作、状态时长或鼠标位置不匹配"
+        else:
+            reason="未达到动作阈值、差距或支持数要求"
+        return {"accepted":accepted,"best":best,"second":second,"threshold":threshold,"margin":margin,"required_gap":required_gap,"support":support,"min_support":min_support,"confidence":confidence,"margin_ok":margin_ok,"rejection_ok":rejection_ok,"temporal_ok":temporal_ok,"ambiguous":ambiguous,"reason":reason,"nearest_rejected_distance":rejected_distance,"query_backend":query_backend}
     def start_review(self):
         self.start_worker("复习",self.review_worker,False)
     def _limit_prototypes(self,prototypes,limit):
-        if len(prototypes)<=int(limit):
+        limit=int(limit)
+        if len(prototypes)<=limit:
             return list(prototypes)
         groups=defaultdict(list)
         for proto in prototypes:
             groups[str(proto.get("cluster_id",""))].append(proto)
+        if len(groups)>limit:
+            raise RuntimeError("动作簇数量"+str(len(groups))+"超过原型上限"+str(limit)+"，拒绝生成模型")
+        def danger(item):
+            action=normalize_action(item.get("a")) or {"kind":"no_op"}
+            return 1 if action["kind"] in {"double_click","long_press","drag"} or action.get("button") in {"right","middle"} else 0
         chosen=[]
         remaining=[]
-        for cluster_id,items in groups.items():
-            ordered=sorted(items,key=lambda item:(int(item.get("support",0)),int(item.get("action_support",0))),reverse=True)
+        for items in groups.values():
+            ordered=sorted(items,key=lambda item:(danger(item),int(item.get("support",0)),int(item.get("action_support",0))),reverse=True)
             chosen.append(ordered[0])
             remaining.extend(ordered[1:])
-        if len(chosen)>int(limit):
-            return chosen
-        remaining.sort(key=lambda item:(int(item.get("support",0)),int(item.get("action_support",0))),reverse=True)
-        chosen.extend(remaining[:int(limit)-len(chosen)])
+        remaining.sort(key=lambda item:(danger(item),int(item.get("support",0)),int(item.get("action_support",0))),reverse=True)
+        chosen.extend(remaining[:limit-len(chosen)])
+        if len(chosen)>limit:
+            raise RuntimeError("原型限制执行失败")
         return chosen
     def review_worker(self):
         game=self.require_game()
         samples,stats=self.store.load_samples(game["id"])
         valid=[]
-        for sample in samples:
+        for index,sample in enumerate(samples):
+            if index%64==0 and self.should_stop():
+                return "复习已中断：旧完整模型未被覆盖"
             action=normalize_action(sample.get("a"))
-            if feature_valid(sample.get("f")) and action:
+            context=sample.get("context",{})
+            temporal=temporal_from_context(context)
+            calibration=context.get("calibration",{}) if isinstance(context,dict) else {}
+            if feature_valid(sample.get("f")) and action and temporal.get("complete") and str(sample.get("capture_method","unknown")) not in {"","unknown","legacy"} and calibration.get("dynamic_passed"):
                 item=dict(sample)
                 item["a"]=action
                 valid.append(item)
         if not valid:
-            raise RuntimeError("没有可复习的有效学习数据，请先进行学习")
+            raise RuntimeError("没有同时具备已验收采集后端和完整短时序上下文的学习数据；数据不足时只允许请教")
         self.wait_escape_release()
         action_clusters=self._cluster_action_samples(valid)
         if self.should_stop():
-            return "复习已中断：尚未保存不完整的动作聚类，旧完整模型未被覆盖"
+            return "复习已中断：旧完整模型未被覆盖"
         session_groups=defaultdict(list)
         for item in valid:
             session_groups[str(item.get("session_id") or item.get("context",{}).get("session_id") or "legacy")].append(item)
         sessions=sorted(session_groups,key=lambda key:hashlib.sha256(key.encode("utf-8","replace")).hexdigest())
         holdout_sessions=set()
-        target=max(20,round(len(valid)*0.22))
+        target=max(20,round(len(valid)*0.25))
         selected_count=0
         if len(sessions)>1:
-            for session in sessions:
-                if len(valid)-selected_count-len(session_groups[session])<1:
+            for session_id in sessions:
+                if len(valid)-selected_count-len(session_groups[session_id])<1:
                     continue
-                holdout_sessions.add(session)
-                selected_count+=len(session_groups[session])
+                holdout_sessions.add(session_id)
+                selected_count+=len(session_groups[session_id])
                 if selected_count>=target:
                     break
         train=[item for item in valid if str(item.get("session_id") or item.get("context",{}).get("session_id") or "legacy") not in holdout_sessions]
         holdout=[item for item in valid if item not in train]
-        groups=defaultdict(list)
         cluster_map={cluster["id"]:cluster for cluster in action_clusters}
+        groups=defaultdict(list)
         for sample in train:
             groups[sample["_action_cluster"]].append(sample)
         ordered=sorted(groups.items(),key=lambda item:(normalize_action(cluster_map[item[0]]["a"])["kind"]=="no_op",-len(item[1])))
         prototypes=[]
         processed=0
-        stopped=False
-        for cluster_id,items in ordered:
-            if self.should_stop():
-                stopped=True
-                break
-            cluster=cluster_map[cluster_id]
-            def progress(local,total_local,count):
-                self.set_progress(82*(processed+local)/max(1,len(train)))
-                self.set_status("复习中：按动作几何聚类和窗口自适应视觉阈值生成原型；"+str(processed+local)+"/"+str(len(train)))
-            prototypes.extend(self._cluster_action_group(cluster_id,cluster["a"],len(cluster["members"]),items,progress,cluster.get("repeat_policy","one_shot"),cluster.get("max_rate",3.0)))
-            processed+=len(items)
-            prototypes=self._limit_prototypes(prototypes,MAX_PROTOTYPES)
+        try:
+            for cluster_id,items in ordered:
+                if self.should_stop():
+                    raise InputStopped("复习已停止")
+                cluster=cluster_map[cluster_id]
+                def progress(local,total_local,count):
+                    self.set_progress(78*(processed+local)/max(1,len(train)))
+                    self.set_status("复习中：生成短时序原型；"+str(processed+local)+"/"+str(len(train)))
+                prototypes.extend(self._cluster_action_group(cluster_id,cluster["a"],len(items),items,progress,cluster.get("repeat_policy","one_shot"),cluster.get("max_rate",3.0)))
+                processed+=len(items)
+                prototypes=self._limit_prototypes(prototypes,MAX_PROTOTYPES)
+        except InputStopped:
+            if prototypes:
+                partial={"created":time.time(),"samples":len(valid),"training_samples":len(train),"invalid_samples":stats["invalid"],"prototypes":prototypes,"capture_backends":sorted({str(item.get("capture_method")) for item in train}),"validation":{"status":"stopped"},"stopped":True}
+                self.store.save_model(game["id"],partial,False)
+            return "复习已中断：旧完整模型未被覆盖，部分结果仅保存为临时模型"
+        operations=0
         for index,proto in enumerate(prototypes):
-            conflicting=[other for other in prototypes if other["id"]!=proto["id"] and other.get("cluster_id")!=proto.get("cluster_id")]
+            conflicting=[]
+            for other in prototypes:
+                operations+=1
+                if operations%64==0 and self.should_stop():
+                    return "复习已中断：旧完整模型未被覆盖"
+                if other["id"]!=proto["id"] and other.get("cluster_id")!=proto.get("cluster_id"):
+                    conflicting.append(other)
             nearest=float("inf")
+            temporal_nearest=1.0
             if conflicting:
                 rough=sorted((coarse_distance(proto["coarse"],other["coarse"]),other) for other in conflicting)[:20]
-                nearest=min(feature_distance(proto["f"],other["f"]) for _,other in rough)
+                distances=[]
+                for _,other in rough:
+                    operations+=1
+                    if operations%32==0 and self.should_stop():
+                        return "复习已中断：旧完整模型未被覆盖"
+                    distances.append((feature_distance(proto["f"],other["f"]),temporal_distance(proto.get("temporal",{}),other.get("temporal",{}))))
+                nearest,temporal_nearest=min(distances,key=lambda item:item[0])
             proto["nearest_conflicting_distance"]=None if math.isinf(nearest) else round(nearest,6)
             intra=float(proto.get("intra_threshold",proto["threshold"]))
-            ambiguity_limit=max(1e-6,intra*0.05)
-            proto["ambiguous"]=not math.isinf(nearest) and nearest<=ambiguity_limit
+            visual_close=not math.isinf(nearest) and nearest<=max(1e-6,intra*0.20)
+            temporal_close=temporal_nearest<=max(float(proto.get("temporal_threshold",0.25)),0.25)
+            proto["ambiguous"]=bool(visual_close and temporal_close)
             proto["threshold"]=round(max(0.001,intra if math.isinf(nearest) else min(intra,max(0.001,nearest*0.62))),6)
-            proto["minimum_second_candidate_gap"]=round(max(8.0,float(proto["threshold"])*0.12,0.0 if math.isinf(nearest) else nearest*0.08),6)
+            proto["minimum_second_candidate_gap"]=round(max(10.0,float(proto["threshold"])*0.15,0.0 if math.isinf(nearest) else nearest*0.10),6)
             if index%12==0:
-                self.set_progress(82+6*(index+1)/max(1,len(prototypes)))
+                self.set_progress(78+7*(index+1)/max(1,len(prototypes)))
         rejections=self.store.load_rejections(game["id"],500)
         rejection_constraints=0
-        for proto in prototypes:
+        for proto_index,proto in enumerate(prototypes):
             matching=[]
-            for rejection in rejections:
+            for rejection_index,rejection in enumerate(rejections):
+                if (proto_index*max(1,len(rejections))+rejection_index)%64==0 and self.should_stop():
+                    return "复习已中断：旧完整模型未被覆盖"
                 candidate_actions=[normalize_action(item.get("a")) for item in rejection.get("candidates",[]) if isinstance(item,dict)]
                 if any(action and action_family_key(action)==action_family_key(proto["a"]) and action_geometry_distance(action,proto["a"])<=action_cluster_limit(proto["a"])*1.25 for action in candidate_actions):
                     matching.append((coarse_distance(proto["coarse"],coarse_feature(rejection["f"])),rejection))
             if matching:
                 nearest_rejected=min(feature_distance(proto["f"],rejection["f"]) for _,rejection in sorted(matching,key=lambda item:item[0])[:8])
                 proto["nearest_rejected_distance"]=round(nearest_rejected,6)
-                proto["threshold"]=round(max(0.001,min(float(proto["threshold"]),nearest_rejected*0.78)),6)
+                proto["threshold"]=round(max(0.001,min(float(proto["threshold"]),nearest_rejected*0.72)),6)
                 rejection_constraints+=1
             else:
                 proto["nearest_rejected_distance"]=None
-        if stopped:
-            if prototypes:
-                self.store.save_model(game["id"],{"created":time.time(),"samples":len(valid),"training_samples":len(train),"invalid_samples":stats["invalid"],"rejection_constraints":rejection_constraints,"prototypes":prototypes,"validation":{"status":"stopped","holdout":0,"accepted":0,"coverage":0.0,"accepted_error_rate":None,"overall_accuracy":0.0,"reject_rate":1.0},"stopped":True},False)
-            return "复习已中断：旧完整模型未被覆盖，部分结果仅保存为临时模型"
         errors=accepted=correct=0
         by_action=defaultdict(lambda:{"total":0,"accepted":0,"correct":0,"errors":0,"unrecognized":0})
-        by_method=defaultdict(lambda:{"total":0,"accepted":0,"correct":0})
+        by_method=defaultdict(lambda:{"total":0,"accepted":0,"correct":0,"errors":0})
         dangerous_false=0
         for index,sample in enumerate(holdout):
-            ranked=self.rank_action_candidates(sample["f"],prototypes,str(sample.get("context",{}).get("previous_action","")),16)
+            if index%8==0 and self.should_stop():
+                return "复习已中断：旧完整模型未被覆盖"
+            ranked=self.rank_action_candidates(sample["f"],prototypes,str(sample.get("context",{}).get("previous_action","")),16,sample.get("context",{}))
             decision=self.evaluate_action_candidates(ranked)
             expected=sample["_action_cluster"]
             canonical=sample.get("_canonical_action_signature",action_signature(sample["a"]))
             method=str(sample.get("capture_method") or sample.get("context",{}).get("capture_method") or "unknown")
-            arow=by_action[canonical]; mrow=by_method[method]
-            arow["total"]+=1; mrow["total"]+=1
+            arow=by_action[canonical]
+            mrow=by_method[method]
+            arow["total"]+=1
+            mrow["total"]+=1
             if decision.get("accepted"):
-                accepted+=1; arow["accepted"]+=1; mrow["accepted"]+=1
+                accepted+=1
+                arow["accepted"]+=1
+                mrow["accepted"]+=1
                 predicted=decision["best"]
                 if predicted["cluster_id"]==expected:
-                    correct+=1; arow["correct"]+=1; mrow["correct"]+=1
+                    correct+=1
+                    arow["correct"]+=1
+                    mrow["correct"]+=1
                 else:
-                    errors+=1; arow["errors"]+=1
-                    action=normalize_action(predicted["a"])
-                    if action["kind"] in {"double_click","long_press","drag"} or action.get("button") in {"right","middle"}:
+                    errors+=1
+                    arow["errors"]+=1
+                    mrow["errors"]+=1
+                    predicted_action=normalize_action(predicted["a"])
+                    if predicted_action["kind"] in {"double_click","long_press","drag"} or predicted_action.get("button") in {"right","middle"}:
                         dangerous_false+=1
             else:
                 arow["unrecognized"]+=1
             if index%5==0:
-                self.set_progress(88+10*(index+1)/max(1,len(holdout)))
+                self.set_progress(85+13*(index+1)/max(1,len(holdout)))
         holdout_count=len(holdout)
         coverage=accepted/holdout_count if holdout_count else 0.0
         accepted_error_rate=errors/accepted if accepted else None
         overall_accuracy=correct/holdout_count if holdout_count else 0.0
-        reject_rate=1.0-coverage if holdout_count else 1.0
         dangerous_false_rate=dangerous_false/max(1,holdout_count)
-        per_action={key:{**value,"recall":value["correct"]/value["total"] if value["total"] else 0.0,"error_rate":value["errors"]/value["total"] if value["total"] else 0.0,"unrecognized_rate":value["unrecognized"]/value["total"] if value["total"] else 0.0} for key,value in by_action.items()}
-        per_method={key:{**value,"accuracy":value["correct"]/value["total"] if value["total"] else 0.0,"coverage":value["accepted"]/value["total"] if value["total"] else 0.0} for key,value in by_method.items()}
-        if holdout_count<20 or accepted==0 or coverage<0.55:
-            validation_status="insufficient"
-        elif (accepted_error_rate is not None and accepted_error_rate>0.12) or overall_accuracy<0.45 or dangerous_false_rate>0.03:
-            validation_status="failed"
-        else:
-            validation_status="passed"
-        validation={"status":validation_status,"split":"session_id","holdout_sessions":len(holdout_sessions),"minimum_holdout":20,"minimum_coverage":0.55,"maximum_accepted_error_rate":0.12,"minimum_overall_accuracy":0.45,"maximum_dangerous_false_rate":0.03,"holdout":holdout_count,"accepted":accepted,"errors":errors,"correct":correct,"coverage":coverage,"accepted_error_rate":accepted_error_rate,"overall_accuracy":overall_accuracy,"reject_rate":reject_rate,"dangerous_false_rate":dangerous_false_rate,"per_action":per_action,"per_capture_method":per_method,"ambiguous_prototypes":sum(1 for proto in prototypes if proto.get("ambiguous"))}
-        model={"created":time.time(),"samples":len(valid),"training_samples":len(train),"invalid_samples":stats["invalid"],"action_clusters":len(action_clusters),"rejection_constraints":rejection_constraints,"prototypes":prototypes,"validation":validation,"stopped":False}
+        per_action={}
+        action_rules_pass=True
+        train_signatures={str(item.get("_canonical_action_signature",action_signature(item["a"]))) for item in train}
+        for signature in sorted(train_signatures|set(by_action)):
+            row=dict(by_action[signature])
+            row["recall"]=row["correct"]/row["total"] if row["total"] else 0.0
+            row["accepted_error_rate"]=row["errors"]/row["accepted"] if row["accepted"] else None
+            row["unrecognized_rate"]=row["unrecognized"]/row["total"] if row["total"] else 0.0
+            action=next((item["a"] for item in valid if str(item.get("_canonical_action_signature",action_signature(item["a"])))==signature),{"kind":"no_op"})
+            dangerous=action["kind"] in {"double_click","long_press","drag"} or action.get("button") in {"right","middle"}
+            row["dangerous"]=dangerous
+            row_pass=row["total"]>=1 and row["accepted"]>=1 and row["errors"]==0 if dangerous else row["total"]>=1 and row["accepted"]>=1 and row["accepted_error_rate"] is not None and row["accepted_error_rate"]<=0.02
+            row["passed"]=bool(row_pass)
+            action_rules_pass=action_rules_pass and bool(row_pass)
+            per_action[signature]=row
+        train_methods=sorted({str(item.get("capture_method")) for item in train})
+        per_method={}
+        method_rules_pass=True
+        for method in sorted(set(train_methods)|set(by_method)):
+            row=dict(by_method[method])
+            row["accuracy"]=row["correct"]/row["total"] if row["total"] else 0.0
+            row["coverage"]=row["accepted"]/row["total"] if row["total"] else 0.0
+            row["accepted_error_rate"]=row["errors"]/row["accepted"] if row["accepted"] else None
+            row["passed"]=bool(row["total"]>=3 and row["accepted"]>=1 and row["accepted_error_rate"] is not None and row["accepted_error_rate"]<=0.02 and row["coverage"]>=0.80)
+            method_rules_pass=method_rules_pass and row["passed"]
+            per_method[method]=row
+        enough=holdout_count>=20 and len(holdout_sessions)>=1 and accepted>0 and bool(train_methods)
+        global_pass=coverage>=0.80 and overall_accuracy>=0.80 and accepted_error_rate is not None and accepted_error_rate<=0.02 and dangerous_false==0
+        validation_status="passed" if enough and global_pass and action_rules_pass and method_rules_pass and prototypes and not any(proto.get("ambiguous") for proto in prototypes) else ("insufficient" if not enough or not action_rules_pass or not method_rules_pass else "failed")
+        validation={"status":validation_status,"split":"session_id","holdout_sessions":len(holdout_sessions),"minimum_holdout":20,"minimum_coverage":0.80,"maximum_accepted_error_rate":0.02,"minimum_overall_accuracy":0.80,"maximum_dangerous_false":0,"holdout":holdout_count,"accepted":accepted,"errors":errors,"correct":correct,"coverage":coverage,"accepted_error_rate":accepted_error_rate,"overall_accuracy":overall_accuracy,"dangerous_false":dangerous_false,"dangerous_false_rate":dangerous_false_rate,"per_action":per_action,"per_capture_method":per_method,"ambiguous_prototypes":sum(1 for proto in prototypes if proto.get("ambiguous"))}
+        model={"created":time.time(),"samples":len(valid),"training_samples":len(train),"invalid_samples":stats["invalid"],"action_clusters":len(action_clusters),"rejection_constraints":rejection_constraints,"prototypes":prototypes,"capture_backends":train_methods,"validation":validation,"stopped":False}
         if not prototypes:
             raise RuntimeError("复习未生成可用原型")
         self.store.save_model(game["id"],model,validation_status=="passed")
         self.set_progress(100)
-        label="通过验收" if validation_status=="passed" else ("验证不足" if validation_status=="insufficient" else "验证未通过")
+        label="通过验收" if validation_status=="passed" else ("验证不足，仅保存临时模型并禁止训练" if validation_status=="insufficient" else "验证失败，仅保存临时模型并禁止训练")
         error_text="无可计算值" if accepted_error_rate is None else str(round(accepted_error_rate*100,2))+"%"
-        lines=["复习完成，"+label+"：原型"+str(len(prototypes))+"，歧义原型"+str(validation["ambiguous_prototypes"])+"，按会话留出"+str(holdout_count)+"，覆盖率"+str(round(coverage*100,2))+"%，接受错误率"+error_text+"，总体正确率"+str(round(overall_accuracy*100,2))+"%，危险动作误触率"+str(round(dangerous_false_rate*100,2))+"%","各动作验证："]
+        lines=["复习完成，"+label+"：原型"+str(len(prototypes))+"，按会话留出"+str(holdout_count)+"，覆盖率"+str(round(coverage*100,2))+"%，接受错误率"+error_text+"，总体正确率"+str(round(overall_accuracy*100,2))+"%，危险动作误触"+str(dangerous_false)+"次","各动作独立留出验证："]
         for signature,row in sorted(per_action.items()):
-            lines.append(signature+"：样本"+str(row["total"])+"，召回率"+str(round(row["recall"]*100,2))+"%，错误率"+str(round(row["error_rate"]*100,2))+"%，未识别率"+str(round(row["unrecognized_rate"]*100,2))+"%")
-        lines.append("各采集方式验证：")
+            lines.append(signature+"：留出"+str(row["total"])+"，接受"+str(row["accepted"])+"，错误"+str(row["errors"])+"，"+("通过" if row["passed"] else "未通过"))
+        lines.append("各采集后端独立验证：")
         for method,row in sorted(per_method.items()):
-            lines.append(method+"：样本"+str(row["total"])+"，准确率"+str(round(row["accuracy"]*100,2))+"%，覆盖率"+str(round(row["coverage"]*100,2))+"%")
+            lines.append(method+"：留出"+str(row["total"])+"，覆盖率"+str(round(row["coverage"]*100,2))+"%，"+("通过" if row["passed"] else "未通过"))
         return "\n".join(lines)
     def action_text(self,action):
         item=normalize_action(action) or {"kind":"no_op","duration":0.3}
@@ -3066,88 +3712,124 @@ class App:
             raise RuntimeError("模型包含无效动作")
         expected_rect=tuple(expected_frame.get("rect",())) if isinstance(expected_frame,dict) else ()
         expected_dpi=int(expected_frame.get("dpi",0)) if isinstance(expected_frame,dict) and finite_number(expected_frame.get("dpi",0)) else 0
-        def geometry():
+        def stop_check():
+            if self.should_stop() or not self.api.input_allowed():
+                self.api.block_input()
+                raise InputStopped("已停止，拒绝剩余动作")
+        def geometry(point=None):
+            stop_check()
             rect=self.api.validate_target(target,True)
             dpi=self.api.dpi_for_window(int(target["hwnd"]))
-            if len(expected_rect)==4 and (max(abs(int(rect[i])-int(expected_rect[i])) for i in range(4))>2 or expected_dpi and abs(dpi-expected_dpi)>1):
+            if len(expected_rect)==4 and (max(abs(int(rect[index])-int(expected_rect[index])) for index in range(4))>2 or expected_dpi and abs(dpi-expected_dpi)>1):
                 raise TargetUnavailable("窗口客户区几何或DPI已变化，放弃当前动作并重新识别")
+            self.api.validate_uipi(target)
+            if point is not None:
+                x,y=self.point_to_screen(point,rect)
+                self.api.validate_action_point(target,x,y,expected_rect,expected_dpi)
             return rect
+        def sleep_checked(duration):
+            deadline=time.monotonic()+max(0.0,float(duration))
+            while time.monotonic()<deadline:
+                stop_check()
+                time.sleep(min(0.008,max(0.001,deadline-time.monotonic())))
         kind=item["kind"]
         if kind=="no_op":
-            end=time.time()+item.get("duration",0.35)
-            while time.time()<end and not self.should_stop():
+            deadline=time.monotonic()+item.get("duration",0.35)
+            while time.monotonic()<deadline:
                 geometry()
-                time.sleep(0.02)
+                sleep_checked(min(0.02,deadline-time.monotonic()))
             return
         path=item.get("path") or [[0.5,0.5]]*16
+        current_point=path[0]
         def move_to(point):
+            nonlocal current_point
+            stop_check()
             rect=geometry()
             x,y=self.point_to_screen(point,rect)
-            if not self.inside(x,y,rect):
-                raise TargetUnavailable("动作坐标超出客户区")
+            self.api.validate_action_point(target,x,y,expected_rect,expected_dpi)
             self.api.move_cursor(x,y)
-            geometry()
+            self.api.validate_action_point(target,x,y,expected_rect,expected_dpi)
+            current_point=point
         move_to(path[0])
-        if self.should_stop():
-            return
         if kind=="move":
             for point in path[1:]:
-                if self.should_stop():
-                    return
                 move_to(point)
-                time.sleep(max(0.004,item["duration"]/max(1,len(path)-1)))
+                sleep_checked(max(0.004,item["duration"]/max(1,len(path)-1)))
             return
         if kind=="hover":
-            end=time.time()+item["duration"]
-            while time.time()<end and not self.should_stop():
-                geometry()
-                time.sleep(0.02)
+            deadline=time.monotonic()+item["duration"]
+            while time.monotonic()<deadline:
+                geometry(current_point)
+                sleep_checked(min(0.02,deadline-time.monotonic()))
             return
         if kind in {"scroll_v","scroll_h"}:
-            geometry()
+            geometry(current_point)
+            stop_check()
             self.api.wheel(item["delta"],kind=="scroll_h")
-            geometry()
+            geometry(current_point)
             return
         button=item["button"]
         if kind=="double_click":
             for iteration in range(2):
-                geometry(); self.api.button(button,True); time.sleep(0.045); geometry(); self.api.button(button,False)
+                stop_check()
+                geometry(current_point)
+                self.api.button(button,True)
+                try:
+                    sleep_checked(0.045)
+                finally:
+                    self.api.button(button,False)
                 if iteration==0:
-                    time.sleep(0.09)
+                    stop_check()
+                    sleep_checked(0.09)
+                    stop_check()
             return
-        geometry(); self.api.button(button,True)
+        clip=None
+        pressed=False
         try:
+            if kind=="drag":
+                clip=self.api.clip_to_client(geometry(current_point))
+            stop_check()
+            geometry(current_point)
+            self.api.button(button,True)
+            pressed=True
             if kind=="drag":
                 step_time=item["duration"]/max(1,len(path)-1)
                 for point in path[1:]:
-                    if self.should_stop():
-                        break
                     move_to(point)
-                    end=time.time()+step_time
-                    while time.time()<end and not self.should_stop():
-                        geometry(); time.sleep(min(0.012,max(0.002,end-time.time())))
+                    deadline=time.monotonic()+step_time
+                    while time.monotonic()<deadline:
+                        geometry(current_point)
+                        sleep_checked(min(0.012,deadline-time.monotonic()))
             else:
                 hold=item["duration"] if kind=="long_press" else min(0.13,item["duration"])
-                end=time.time()+hold
-                while time.time()<end and not self.should_stop():
-                    geometry(); time.sleep(0.01)
+                deadline=time.monotonic()+hold
+                while time.monotonic()<deadline:
+                    geometry(current_point)
+                    sleep_checked(min(0.01,deadline-time.monotonic()))
         finally:
-            try:
-                self.api.button(button,False)
-            except Exception:
-                self.api.release_all_buttons()
+            if pressed:
+                try:
+                    self.api.button(button,False)
+                except Exception:
+                    self.api.release_all_buttons()
+            if clip is not None:
+                self.api.restore_clip(clip)
     def start_training(self):
         try:
             game=self.require_game()
-            self.require_window(False)
+            target=self.require_window(False)
             model=self.store.load_model(game["id"])
             if not model or not model.get("prototypes"):
                 raise RuntimeError("没有可用完整模型，请先学习并完成复习")
             if str(model.get("validation",{}).get("status",""))!="passed":
-                raise RuntimeError("完整模型未通过留出数量、覆盖率、错误率和总体正确率验收，请重新复习")
+                raise RuntimeError("完整模型未通过严格独立留出验收，请重新学习、请教或复习")
             current=next((item for item in self.store.games() if item["id"]==game["id"]),{})
             if current.get("needs_review"):
                 raise RuntimeError("模型需要复习：请先点击“复习”完成离线优化")
+            calibration=self.api.calibration_for(target)
+            backend=str(calibration.get("validated_backend",""))
+            if not calibration.get("dynamic_passed") or backend not in set(model.get("capture_backends",[])):
+                raise RuntimeError("当前采集后端未在模型中独立验证；请使用该后端重新学习和复习")
         except Exception as error:
             self.show_error(str(error))
             return
@@ -3157,11 +3839,21 @@ class App:
         target=self.require_window(False)
         model=self.store.load_model(game["id"])
         prototypes=model["prototypes"]
+        allowed_backends=set(model.get("capture_backends",[]))
         calibration=self.api.calibration_for(target)
+        validated_backend=str(calibration.get("validated_backend",""))
         self.api.request_foreground(target["hwnd"])
         self.wait_escape_release()
-        frame_buffer=FrameBuffer(self.api,target,max(8.0,float(calibration.get("fps",15.0))),2.5,0.1).start()
+        key_queue=queue.Queue()
+        def other_key(event):
+            try:
+                key_queue.put_nowait(event)
+            except Exception:
+                pass
+            self.api.block_input()
         actions=0
+        keyboard_count=0
+        recent_actions=deque(["<START>","<START>"],maxlen=4)
         candidate_id=None
         candidate_count=0
         candidate_frame_stamp=0.0
@@ -3174,77 +3866,154 @@ class App:
         frozen_count=0
         previous_feature=None
         previous_frame_stamp=0.0
+        state_since=time.time()
         action_hits=defaultdict(deque)
-        try:
+        pause_until=0.0
+        with ModeSession(self,target) as session:
+            frame_buffer=session.start_frames(max(8.0,float(calibration.get("fps",15.0))),2.5,0.1,"training")
+            keyboard=session.start_keyboard(other_key)
             while not self.should_stop():
+                while True:
+                    try:
+                        event=key_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    keyboard_count+=1
+                    pause_until=max(pause_until,float(event["time"])+0.25)
+                    self.api.block_input()
+                    candidate_id=None
+                    candidate_count=0
+                if time.time()<pause_until or not keyboard.all_released():
+                    self.api.block_input()
+                    self.set_status("检测到非ESC键盘输入，训练已暂停；等待全部按键释放")
+                    time.sleep(0.03)
+                    continue
+                if not self.api.input_allowed():
+                    self.api.allow_input(self.stop_event)
                 try:
                     self.api.validate_target(target,True)
                 except TargetUnavailable as error:
-                    self.api.release_all_buttons(); candidate_id=None; candidate_count=0
+                    self.api.block_input()
+                    candidate_id=None
+                    candidate_count=0
                     self.set_confidence("训练置信度：0%")
-                    self.set_status("目标窗口失去焦点，等待恢复；已释放全部鼠标键；"+str(error))
-                    time.sleep(0.08); continue
+                    self.set_status("目标窗口失去焦点，等待恢复；"+str(error))
+                    time.sleep(0.08)
+                    continue
                 captured=frame_buffer.latest(None,0.8)
-                if captured is None:
-                    self.api.release_all_buttons(); self.set_status("等待固定间隔画面缓冲；"+(frame_buffer.last_error or "尚无有效帧")); time.sleep(0.08); continue
+                if captured is None or not captured.get("usable_for_training"):
+                    self.api.block_input()
+                    self.set_status("采集画面不可用于训练；等待已验收、非黑屏、非重复且后端稳定的最新帧；"+(frame_buffer.last_error or "尚无画面"))
+                    time.sleep(0.08)
+                    continue
+                if captured.get("method")!=validated_backend or captured.get("method") not in allowed_backends:
+                    self.api.block_input()
+                    self.set_status("采集后端变化或未在模型中验证，拒绝自动动作；请重新学习和复习")
+                    time.sleep(0.1)
+                    continue
                 feature=captured["f"]
                 frame_change=float("inf")
                 if captured["time"]!=previous_frame_stamp:
                     if previous_feature is not None:
                         frame_change=visual_distance(previous_feature,feature)
                         frozen_count=frozen_count+1 if frame_change<float(calibration.get("freeze_change",1.5)) else 0
-                    previous_feature=feature; previous_frame_stamp=captured["time"]
-                if frozen_count>=int(calibration.get("freeze_frames",30)):
-                    self.set_status("画面长时间未变化；保留合法静止画面但暂停自动输入，等待变化或请教")
-                    self.api.release_all_buttons(); time.sleep(0.1); continue
+                        if frame_change>float(calibration.get("significant_change",60.0)):
+                            state_since=time.time()
+                    previous_feature=feature
+                    previous_frame_stamp=captured["time"]
+                if frozen_count>=int(calibration.get("freeze_frames",30)) or captured.get("stale"):
+                    self.api.block_input()
+                    self.set_status("画面长时间重复，训练停止输入并等待画面变化")
+                    time.sleep(0.1)
+                    continue
                 significant=last_action_feature is not None and visual_distance(last_action_feature,feature)>float(calibration.get("significant_change",60.0))
                 if significant:
-                    state_unlocked=True; no_change_count=0
-                ranked=self.rank_action_candidates(feature,prototypes,last_action_signature,18)
+                    state_unlocked=True
+                    no_change_count=0
+                    state_since=time.time()
+                temporal=self.build_temporal_context(frame_buffer,captured,recent_actions,state_since)
+                if not temporal_from_context({**temporal,"previous_action_changed_frame":significant}).get("complete"):
+                    self.api.block_input()
+                    self.set_status("等待至少3帧短时序上下文")
+                    time.sleep(0.05)
+                    continue
+                temporal["previous_action_changed_frame"]=bool(significant)
+                ranked=self.rank_action_candidates(feature,prototypes,last_action_signature,18,temporal)
                 decision=self.evaluate_action_candidates(ranked)
                 if not decision.get("accepted"):
-                    candidate_id=None; candidate_count=0
+                    candidate_id=None
+                    candidate_count=0
+                    self.api.block_input()
                     self.set_confidence("训练置信度："+str(round(float(decision.get("confidence",0.0))*100,1))+"%")
-                    self.set_status("训练中："+str(decision.get("reason","识别不确定"))+"；不执行动作并优先等待请教")
-                    time.sleep(0.12); continue
+                    self.set_status("训练中："+str(decision.get("reason","识别不确定"))+"；不执行动作并等待请教")
+                    time.sleep(0.12)
+                    continue
+                if not self.api.input_allowed():
+                    self.api.allow_input(self.stop_event)
                 best=decision["best"]
                 cluster_id=best["cluster_id"]
                 if candidate_id==cluster_id:
                     if captured["time"]==candidate_frame_stamp:
-                        time.sleep(0.025); continue
+                        time.sleep(0.025)
+                        continue
                     candidate_count+=1
                 else:
-                    candidate_id=cluster_id; candidate_count=1
+                    candidate_id=cluster_id
+                    candidate_count=1
                 candidate_frame_stamp=captured["time"]
-                confirmations=max(1,int(calibration.get("confirm_frames",2)))
+                confirmations=max(3,int(calibration.get("confirm_frames",3)))
                 self.set_confidence("训练置信度："+str(round(decision["confidence"]*100,1))+"%  连续确认"+str(candidate_count)+"/"+str(confirmations))
                 if candidate_count<confirmations:
-                    time.sleep(0.05); continue
+                    time.sleep(0.05)
+                    continue
                 action=normalize_action(best["a"])
                 canonical=action_signature(action)
                 proto=best["proto"]
+                if captured["method"] not in set(proto.get("capture_methods",[])):
+                    self.api.block_input()
+                    self.set_status("当前原型未在该采集后端训练，拒绝动作")
+                    time.sleep(0.1)
+                    continue
                 policy=str(proto.get("repeat_policy","one_shot"))
                 max_rate=max(0.25,min(12.0,float(proto.get("max_rate",3.0))))
                 if policy in {"one_shot","hold_until_change"} and last_cluster_id==cluster_id and not state_unlocked:
                     self.set_status("等待画面变化：该动作策略为"+policy)
-                    time.sleep(0.1); continue
+                    time.sleep(0.1)
+                    continue
                 minimum_gap=max(self.action_cooldown(action) if policy=="one_shot" else 0.0,1.0/max_rate if policy in {"rate_limited","repeatable"} else 0.0)
                 if time.time()-last_action_time<minimum_gap:
-                    time.sleep(0.03); continue
-                now=time.time(); hits=action_hits[cluster_id]
+                    time.sleep(0.03)
+                    continue
+                now=time.time()
+                hits=action_hits[cluster_id]
                 while hits and now-hits[0]>1.0:
                     hits.popleft()
                 if len(hits)>=max(1,int(math.ceil(max_rate))):
-                    self.set_status("动作专属频率限制中："+self.action_text(action)); time.sleep(0.05); continue
+                    self.set_status("动作专属频率限制中："+self.action_text(action))
+                    time.sleep(0.05)
+                    continue
                 before=feature
-                self.set_status("训练中："+self.action_text(action)+"；策略="+policy+"；采集="+captured["method"])
+                self.set_status("训练中："+self.action_text(action)+"；短时序已确认；采集="+captured["method"])
                 try:
                     self.execute_action(target,action,captured)
+                except InputStopped:
+                    if self.stop_event is not None and self.stop_event.is_set():
+                        raise
+                    self.api.block_input()
+                    candidate_id=None
+                    candidate_count=0
+                    self.set_status("检测到非ESC键盘输入，动作已中止并等待全部按键释放")
+                    continue
                 except TargetUnavailable as error:
-                    self.api.release_all_buttons(); candidate_id=None; candidate_count=0
-                    self.set_status(str(error)); continue
+                    self.api.block_input()
+                    candidate_id=None
+                    candidate_count=0
+                    self.set_status(str(error))
+                    continue
                 action_end=time.time()
-                actions+=1; hits.append(action_end)
+                actions+=1
+                hits.append(action_end)
+                recent_actions.append(canonical)
                 last_action_signature=canonical
                 last_cluster_id=cluster_id
                 last_action_time=action_end
@@ -3252,28 +4021,30 @@ class App:
                 state_unlocked=policy in {"repeatable","rate_limited"}
                 candidate_count=0
                 delay=float(calibration.get("input_delay",0.24))
-                end=time.time()+delay
-                while time.time()<end and not self.should_stop():
+                deadline=time.monotonic()+delay
+                while time.monotonic()<deadline and not self.should_stop():
                     time.sleep(0.02)
                 after=None
-                wait_end=time.time()+max(0.35,delay*2.0)
-                while time.time()<wait_end and not self.should_stop():
-                    after=frame_buffer.latest_after(action_end)
-                    if after is not None:
+                wait_end=time.monotonic()+max(0.35,delay*2.0)
+                while time.monotonic()<wait_end and not self.should_stop():
+                    candidate_after=frame_buffer.latest_after(action_end)
+                    if candidate_after is not None and candidate_after.get("usable_for_training") and candidate_after.get("method")==validated_backend:
+                        after=candidate_after
                         break
                     time.sleep(0.025)
                 change=visual_distance(before,after["f"]) if after is not None else 0.0
                 if change<float(calibration.get("post_action_change",45.0)):
                     no_change_count+=1
-                    if policy in {"one_shot","hold_until_change"} and no_change_count>=3:
-                        self.set_status("动作后画面变化不足，暂停该一次性动作并等待请教")
+                    if policy in {"one_shot","hold_until_change"} and no_change_count>=2:
+                        state_unlocked=False
+                        self.api.block_input()
+                        self.set_status("动作后未出现预期画面变化，暂停并等待请教")
                 else:
-                    no_change_count=0; state_unlocked=True
+                    no_change_count=0
+                    state_unlocked=True
+                    state_since=time.time()
                 time.sleep(0.05)
-        finally:
-            frame_buffer.stop()
-            self.api.release_all_buttons()
-        return "训练已结束，AI执行"+str(actions)+"个鼠标动作；窗口几何和DPI在每次动作前均已复核"
+        return "训练已结束，AI执行"+str(actions)+"个鼠标动作；检测到非ESC键盘输入"+str(keyboard_count)+"次；每次按下、滚轮和双击均复核前台、遮挡、客户区、DPI、PID、类名和完整性级别"
     def basic_actions(self):
         result=[]
         for y in (0.18,0.35,0.5,0.68,0.84):
@@ -3282,6 +4053,18 @@ class App:
         result.extend([normalize_action({"kind":"double_click","button":"left","path":[[0.5,0.5]],"duration":0.16}),normalize_action({"kind":"drag","button":"left","path":[[0.25,0.5],[0.75,0.5]],"duration":0.45}),normalize_action({"kind":"drag","button":"left","path":[[0.5,0.75],[0.5,0.25]],"duration":0.45}),normalize_action({"kind":"no_op","duration":0.4}),normalize_action({"kind":"scroll_v","delta":120,"path":[[0.5,0.5]],"duration":0.08}),normalize_action({"kind":"scroll_v","delta":-120,"path":[[0.5,0.5]],"duration":0.08})])
         return result
     def start_ask(self):
+        try:
+            return self._start_ask_impl()
+        except Exception:
+            error=traceback.format_exc()
+            try:
+                self.close_ask(show_summary=False,wait_buffer=False)
+            except Exception:
+                pass
+            self.mode=None
+            self.set_controls(False)
+            self.show_error(error)
+    def _start_ask_impl(self):
         if self.mode or self.closing:
             self.show_error("当前已有操作正在运行，请先停止")
             return
@@ -3299,6 +4082,9 @@ class App:
                 action=normalize_action(item.get("a"))
                 if feature_valid(item.get("f")) and action:
                     historical.append({"id":str(item.get("checksum",uuid.uuid4().hex)),"f":item["f"],"coarse":coarse_feature(item["f"]),"a":action,"cluster_id":"history|"+action_signature(action),"canonical_action_signature":action_signature(action),"repeat_policy":str(item.get("repeat_policy","one_shot")),"source":"sample"})
+            calibration=self.api.calibration_for(target)
+            if not calibration.get("dynamic_passed") or not calibration.get("validated_backend"):
+                raise RuntimeError("目标窗口尚未通过动态采集验收，请重新选择窗口")
             self.ask_session_id="teach|"+uuid.uuid4().hex
             self.ask_buffer=FrameBuffer(self.api,target,20.0,2.5,0.1).start()
         except Exception as error:
@@ -3322,12 +4108,14 @@ class App:
         ttk.Label(frame,text="优先展示歧义、拒识或候选动作接近的实时状态。请教窗口在前台时不会要求游戏窗口也在前台。",wraplength=730).pack(anchor="w",pady=(4,10))
         canvas=tk.Canvas(frame,width=672,height=378,bg="black",highlightthickness=1,highlightbackground="#777777")
         canvas.pack()
+        preview_info=tk.StringVar(value="等待彩色教学预览")
+        ttk.Label(frame,textvariable=preview_info,wraplength=730).pack(anchor="w",fill="x",pady=(6,0))
         choice_frame=ttk.Frame(frame)
         choice_frame.pack(fill="both",expand=True,pady=(10,0))
         answer_buttons=[]
         count={"saved":0,"duplicates":0,"skipped":0,"rejected":0}
         self.ask_counts=count
-        state={"frame":None,"choices":[],"image":None,"locked":False,"candidates":[]}
+        state={"frame":None,"choices":[],"image":None,"locked":False,"candidates":[],"recent_actions":deque(["<START>","<START>"],maxlen=4),"state_since":time.time(),"init_deadline":time.monotonic()+3.0,"initialized":False}
         sources=[]
         for proto in prototypes:
             sources.append({"a":normalize_action(proto["a"]),"repeat_policy":str(proto.get("repeat_policy","one_shot")),"cluster_id":str(proto.get("cluster_id",""))})
@@ -3358,32 +4146,64 @@ class App:
             skip_button.configure(state="disabled" if value else "normal")
             reject_button.configure(state="disabled" if value else "normal")
             custom_button.configure(state="disabled" if value else "normal")
-        def render(gray):
-            image=tk.PhotoImage(width=FEATURE_W,height=FEATURE_H)
-            source=gray_bytes(gray) or bytes(PIXELS)
-            rows=[]
-            for y in range(FEATURE_H):
-                row=[]
-                for x in range(FEATURE_W):
-                    value=source[y*FEATURE_W+x]
-                    row.append("#%02x%02x%02x"%(value,value,value))
-                rows.append("{"+" ".join(row)+"}")
-            image.put(" ".join(rows))
-            scaled=image.zoom(10,10)
+        def render(question_frame,choices):
+            preview=preview_rgb_bytes(question_frame.get("preview_rgb")) or bytes(PREVIEW_W*PREVIEW_H*3)
+            ppm=b"P6\n"+str(PREVIEW_W).encode("ascii")+b" "+str(PREVIEW_H).encode("ascii")+b"\n255\n"+preview
+            image=tk.PhotoImage(data=base64.b64encode(ppm).decode("ascii"),format="PPM")
+            scaled=image.zoom(2,2)
             state["image"]=(image,scaled)
             canvas.delete("all")
-            canvas.create_image(336,189,image=scaled)
+            x0=16
+            y0=9
+            canvas.create_image(x0,y0,image=scaled,anchor="nw")
+            colors=("#00ffff","#ffff00","#ff66ff","#66ff66")
+            for index,entry in enumerate(choices[:4]):
+                action=normalize_action(entry.get("a"))
+                if not action or action["kind"]=="no_op":
+                    continue
+                path=action.get("path") or []
+                points=[]
+                for point in path:
+                    points.extend([x0+float(point[0])*639,y0+float(point[1])*359])
+                color=colors[index%len(colors)]
+                if len(points)>=4:
+                    canvas.create_line(*points,fill=color,width=3,arrow="last")
+                if len(points)>=2:
+                    canvas.create_oval(points[-2]-6,points[-1]-6,points[-2]+6,points[-1]+6,outline=color,width=3)
+                    canvas.create_text(points[-2]+10,points[-1]-10,text=chr(65+index),fill=color,font=("Microsoft YaHei UI",12,"bold"),anchor="sw")
+            latest=self.ask_buffer.latest(None,2.0) if self.ask_buffer is not None else None
+            is_latest=bool(latest and abs(float(latest["time"])-float(question_frame.get("time",0)))<0.05)
+            warnings=[]
+            if question_frame.get("protected_or_black"):
+                warnings.append("黑屏/受保护画面")
+            if question_frame.get("stale"):
+                warnings.append("长时间重复")
+            if question_frame.get("backend_changed"):
+                warnings.append("采集后端变化")
+            if not question_frame.get("backend_validated"):
+                warnings.append("后端未验收")
+            if not question_frame.get("capture_valid"):
+                warnings.append("画面无效")
+            stamp=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(float(question_frame.get("time",time.time()))))
+            preview_info.set("采集时间："+stamp+"  后端："+str(question_frame.get("method","未知"))+"  最新帧："+("是" if is_latest else "否")+"  质量告警："+("、".join(warnings) if warnings else "无"))
         def select_question_frame():
             frames=self.ask_buffer.snapshot(1.8) if self.ask_buffer is not None else []
             if not frames:
                 return None,[]
-            if not prototypes:
+            usable=[frame for frame in frames if frame.get("usable_for_teaching")]
+            if not usable:
                 return frames[-1],[]
-            selected=frames[-1]
-            selected_ranked=self.rank_action_candidates(selected["f"],prototypes,"",18)
+            if not prototypes:
+                return usable[-1],[]
+            selected=usable[-1]
+            temporal=self.build_temporal_context(self.ask_buffer,selected,state["recent_actions"],state["state_since"])
+            temporal["previous_action_changed_frame"]=True
+            selected_ranked=self.rank_action_candidates(selected["f"],prototypes,"",18,temporal)
             selected_priority=float("inf")
-            for candidate_frame in frames[-28:]:
-                ranked=self.rank_action_candidates(candidate_frame["f"],prototypes,"",18)
+            for candidate_frame in usable[-28:]:
+                temporal=self.build_temporal_context(self.ask_buffer,candidate_frame,state["recent_actions"],state["state_since"])
+                temporal["previous_action_changed_frame"]=True
+                ranked=self.rank_action_candidates(candidate_frame["f"],prototypes,"",18,temporal)
                 if not ranked:
                     priority=-2.0
                 else:
@@ -3440,19 +4260,41 @@ class App:
             try:
                 self.api.validate_target(target,False)
             except Exception as error:
+                if not state["initialized"] and time.monotonic()>=state["init_deadline"]:
+                    self.close_ask(show_summary=False,wait_buffer=False)
+                    self.show_error("请教启动失败："+str(error))
+                    return
                 self.status.set("请教等待目标窗口恢复或等待后台采集画面："+str(error))
                 schedule(180,new_question)
                 return
             question_frame,ranked=select_question_frame()
             if question_frame is None:
+                if not state["initialized"] and time.monotonic()>=state["init_deadline"]:
+                    message=self.ask_buffer.last_error if self.ask_buffer is not None else "尚无画面"
+                    self.close_ask(show_summary=False,wait_buffer=False)
+                    self.show_error("请教启动失败：未在3秒内获得合格画面；"+str(message))
+                    return
                 self.status.set("请教等待目标窗口恢复或等待后台采集画面："+(self.ask_buffer.last_error if self.ask_buffer is not None else "尚无画面"))
                 schedule(160,new_question)
                 return
+            if not question_frame.get("usable_for_teaching"):
+                if not state["initialized"] and time.monotonic()>=state["init_deadline"]:
+                    self.close_ask(show_summary=False,wait_buffer=False)
+                    self.show_error("请教启动失败：采集画面未通过黑屏、重复、动态后端或质量验收")
+                    return
+                state["frame"]=question_frame
+                state["choices"]=[]
+                state["candidates"]=[]
+                render(question_frame,[])
+                self.status.set("当前画面仅可预览，因黑屏、重复、未验收或后端变化而拒绝请教答案")
+                schedule(180,new_question)
+                return
+            state["initialized"]=True
             choices,candidates=make_choices(question_frame,ranked)
             state["frame"]=question_frame
             state["choices"]=choices
             state["candidates"]=candidates
-            render(question_frame["gray"])
+            render(question_frame,choices)
             for index,button in enumerate(answer_buttons):
                 if index<len(choices):
                     button.configure(text=chr(65+index)+". "+self.action_text(choices[index]["a"]))
@@ -3462,7 +4304,9 @@ class App:
         def context_for(entry=None):
             question_frame=state["frame"] or {}
             policy=str((entry or {}).get("repeat_policy","one_shot"))
-            return self.sample_context("",0,True,question_frame.get("motion_valid",False),self.ask_session_id,question_frame.get("method","unknown"),policy)
+            temporal=self.build_temporal_context(self.ask_buffer,question_frame,state["recent_actions"],state["state_since"])
+            temporal["previous_action_changed_frame"]=True
+            return self.sample_context(state["recent_actions"][-1] if state["recent_actions"] else "",0,True,question_frame.get("motion_valid",False),self.ask_session_id,question_frame.get("method","unknown"),policy,temporal)
         def finish_answer():
             self.status.set("请教中：已保存"+str(count["saved"])+"，重复未保存"+str(count["duplicates"])+"，跳过"+str(count["skipped"])+"，拒绝记录"+str(count["rejected"])+"；模型需要复习")
             schedule(140,new_question)
@@ -3470,11 +4314,20 @@ class App:
             if self.ask_window is None or state["locked"] or index>=len(state["choices"]):
                 return
             set_locked(True)
-            entry=state["choices"][index]
-            question_frame=state["frame"]
-            saved=self.store.append_sample(game["id"],question_frame["f"],entry["a"],"teach_live",context_for(entry),question_frame.get("gray"),3.0)
-            count["saved" if saved else "duplicates"]+=1
-            finish_answer()
+            try:
+                entry=state["choices"][index]
+                question_frame=state["frame"]
+                if not question_frame.get("usable_for_teaching"):
+                    raise CaptureUnavailable("当前画面不可用于请教")
+                saved=self.store.append_sample(game["id"],question_frame["f"],entry["a"],"teach_live",context_for(entry),question_frame.get("gray"),3.0)
+                count["saved" if saved else "duplicates"]+=1
+                if saved:
+                    state["recent_actions"].append(action_signature(entry["a"]))
+                    state["state_since"]=time.time()
+                finish_answer()
+            except Exception as error:
+                self.close_ask(show_summary=False,wait_buffer=False)
+                self.show_error("请教数据库写入失败，已逆序释放资源："+str(error))
         def skip():
             if state["locked"]:
                 return
@@ -3483,10 +4336,16 @@ class App:
             if state["locked"]:
                 return
             set_locked(True)
-            question_frame=state["frame"]
-            self.store.append_rejection(game["id"],question_frame["f"],state["candidates"],"teach_live_reject",question_frame.get("gray"),context_for())
-            count["rejected"]+=1
-            finish_answer()
+            try:
+                question_frame=state["frame"]
+                if not question_frame.get("usable_for_teaching"):
+                    raise CaptureUnavailable("当前画面不可用于请教")
+                self.store.append_rejection(game["id"],question_frame["f"],state["candidates"],"teach_live_reject",question_frame.get("gray"),context_for())
+                count["rejected"]+=1
+                finish_answer()
+            except Exception as error:
+                self.close_ask(show_summary=False,wait_buffer=False)
+                self.show_error("请教数据库写入失败，已逆序释放资源："+str(error))
         def custom():
             if state["locked"]:
                 return
@@ -3547,11 +4406,21 @@ class App:
                         raise ValueError("动作参数无效")
                     question_frame=state["frame"]
                     entry={"a":action,"repeat_policy":policy_var.get()}
+                    if not question_frame.get("usable_for_teaching"):
+                        raise CaptureUnavailable("当前画面不可用于请教")
                     saved=self.store.append_sample(game["id"],question_frame["f"],action,"teach_live_custom",context_for(entry),question_frame.get("gray"),3.5)
                     count["saved" if saved else "duplicates"]+=1
+                    if saved:
+                        state["recent_actions"].append(action_signature(action))
+                        state["state_since"]=time.time()
                     dialog.destroy(); finish_answer()
                 except Exception as error:
-                    error_var.set(str(error))
+                    try:
+                        dialog.destroy()
+                    except Exception:
+                        pass
+                    self.close_ask(show_summary=False,wait_buffer=False)
+                    self.show_error("请教数据库写入失败，已逆序释放资源："+str(error))
             def cancel():
                 dialog.destroy(); set_locked(False)
             custom_canvas.bind("<ButtonPress-1>",press)
@@ -3603,7 +4472,7 @@ class App:
                     pass
             self.ask_after_ids.clear()
         if self.ask_buffer is not None:
-            self.ask_buffer.stop(wait_buffer)
+            self.ask_buffer.stop(wait_buffer,1.0)
             if wait_buffer or not self.ask_buffer.alive():
                 self.ask_buffer=None
         if win is not None:
@@ -3680,10 +4549,22 @@ class App:
         if self.closing:
             return
         self.closing=True
-        self.status.set("正在安全关闭：等待工作线程释放资源")
-        self.api.release_all_buttons()
+        self.shutdown_deadline=time.monotonic()+3.0
+        self.status.set("正在安全关闭：最多等待3秒")
         if self.stop_event:
             self.stop_event.set()
+        self.api.block_input()
+        if self.result_modal is not None:
+            try:
+                self.result_modal.grab_release()
+            except Exception:
+                pass
+            try:
+                self.result_modal.destroy()
+            except Exception:
+                pass
+            self.result_modal=None
+            self.result_modal_widget=None
         for button in self.controls:
             try:
                 button.configure(state="disabled")
@@ -3698,10 +4579,11 @@ class App:
             self.close_ask(show_summary=False,wait_buffer=False)
         self._poll_shutdown()
     def _poll_shutdown(self):
-        self.api.release_all_buttons()
+        self.api.block_input()
         mode_alive=bool(self.mode_thread and self.mode_thread.is_alive())
         ask_alive=bool(self.ask_buffer and self.ask_buffer.alive())
-        if mode_alive or ask_alive:
+        deadline_reached=bool(self.shutdown_deadline is not None and time.monotonic()>=self.shutdown_deadline)
+        if (mode_alive or ask_alive) and not deadline_reached:
             try:
                 self.root.after(50,self._poll_shutdown)
             except Exception:
@@ -3709,13 +4591,20 @@ class App:
             return
         self.shutdown_started=True
         try:
-            self.api.wgc.close()
+            if self.ask_buffer is not None:
+                self.ask_buffer.stop(False,0.0)
         except Exception:
             pass
-        try:
-            self.store.close()
-        except Exception:
-            pass
+        def close_resources():
+            try:
+                self.api.wgc.close()
+            except Exception:
+                pass
+            try:
+                self.store.close()
+            except Exception:
+                pass
+        threading.Thread(target=close_resources,name="UniversalGameAI-FinalClose",daemon=True).start()
         try:
             self.root.destroy()
         except Exception:
