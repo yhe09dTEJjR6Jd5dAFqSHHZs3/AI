@@ -19,6 +19,7 @@ import io
 import tokenize
 import tempfile
 import shutil
+import subprocess
 from contextlib import contextmanager
 from pathlib import Path
 from collections import deque,Counter,defaultdict,OrderedDict
@@ -4576,7 +4577,7 @@ class TeachingController:
             app.ask_session_id=session_id
             app.ask_buffer=buffer
             app.ask_producer=producer
-            app.ask_counts={"saved":0,"duplicates":0,"skipped":0,"rejected":0}
+            app.ask_counts={"saved":0,"duplicates":0,"skipped":0,"rejected":0,"ocr":0}
             answer_queue=queue.Queue()
             app.ask_answer_queue=answer_queue
             producer.request(deque(["<START>","<START>"],maxlen=4),time.monotonic())
@@ -4648,8 +4649,8 @@ class TeachingController:
             app.store.invalidate_learning_session(game["id"],session_id,app.lifecycle.snapshot()[4] or "teaching_failed")
         else:
             app.store.validate_learning_session(game["id"],session_id)
-        counts=app.ask_counts if isinstance(app.ask_counts,dict) else {"saved":0,"duplicates":0,"skipped":0,"rejected":0}
-        summary="请教已结束：已保存"+str(counts.get("saved",0))+"，重复未保存"+str(counts.get("duplicates",0))+"，跳过"+str(counts.get("skipped",0))+"，拒绝记录"+str(counts.get("rejected",0))+"；模型需要复习"
+        counts=app.ask_counts if isinstance(app.ask_counts,dict) else {"saved":0,"duplicates":0,"skipped":0,"rejected":0,"ocr":0}
+        summary="请教已结束：已保存"+str(counts.get("saved",0))+"，重复未保存"+str(counts.get("duplicates",0))+"，跳过"+str(counts.get("skipped",0))+"，拒绝记录"+str(counts.get("rejected",0))+"，OCR语义"+str(counts.get("ocr",0))+"；模型需要复习"
         if status=="failed":
             return ModeResult("failed",app.lifecycle.snapshot()[4] or summary)
         return ModeResult(status if status in {"completed","stopped"} else "stopped",summary,{"samples":stats.get("valid",0)})
@@ -4709,6 +4710,7 @@ class TeachingController:
                 skip_button.configure(state="disabled" if value else "normal")
                 reject_button.configure(state="disabled" if value else "normal")
                 custom_button.configure(state="disabled" if value else "normal")
+                ocr_button.configure(state="disabled" if value else "normal")
             def render(packet):
                 question_frame=packet["frame"]
                 choices=packet["choices"]
@@ -4808,6 +4810,21 @@ class TeachingController:
                 queue_answer("skip")
             def reject():
                 queue_answer("reject",{},state["candidates"])
+            def ocr_teach():
+                if state["locked"] or state["frame"] is None:
+                    return
+                set_locked(True)
+                def reopen_actions():
+                    if self.ask_window is not None:
+                        try:
+                            set_locked(False)
+                        except Exception:
+                            pass
+                try:
+                    self.open_ocr_teaching_dialog(win,game,buffer,state["frame"],reopen_actions)
+                except Exception as error:
+                    set_locked(False)
+                    self.show_error("OCR请教无法启动："+str(error))
             def custom():
                 if state["locked"] or state["image"] is None:
                     return
@@ -4918,6 +4935,8 @@ class TeachingController:
             reject_button.pack(side="left",padx=6)
             custom_button=ttk.Button(tools,text="自定义动作",command=custom)
             custom_button.pack(side="left",padx=6)
+            ocr_button=ttk.Button(tools,text="OCR数字语义",command=ocr_teach)
+            ocr_button.pack(side="left",padx=6)
             ttk.Button(tools,text="结束请教",command=lambda:self.close_ask(reason="completed")).pack(side="right")
             win.protocol("WM_DELETE_WINDOW",lambda:self.close_ask(reason="stopped"))
             self.ask_escape_armed=not self.api.key_down(0x1B)
@@ -9611,6 +9630,1433 @@ def run_acceptance_test(path=None):
         report["status"]="failed"
     sys.stdout.write(json.dumps(report,ensure_ascii=False,sort_keys=True,separators=(",",":"))+"\n")
     return 0 if report["status"]=="passed" else 1
+EXTENSION_SCHEMA_VERSION=2
+VISION_ARCHITECTURE_VERSION=1
+OCR_SEMANTIC_VERSION=1
+SELECTED_DATA_DIR=None
+CURRENT_VISION_RUNTIME=None
+CURRENT_OCR_RUNTIME=None
+class SemanticEventHub:
+    def __init__(self):
+        self.lock=threading.RLock()
+        self.events={}
+    def publish(self,game_id,region_id,event):
+        value=dict(event) if isinstance(event,dict) else {}
+        value["time"]=time.monotonic()
+        value["game_id"]=str(game_id)
+        value["region_id"]=str(region_id)
+        with self.lock:
+            self.events[(str(game_id),str(region_id))]=value
+    def latest(self,game_id=None,max_age=1.5):
+        now=time.monotonic()
+        with self.lock:
+            values=[dict(value) for value in self.events.values() if game_id is None or str(value.get("game_id"))==str(game_id)]
+        values=[value for value in values if now-safe_float(value.get("time"),0.0)<=float(max_age)]
+        if not values:
+            return None
+        values.sort(key=lambda value:(1 if value.get("terminal") else 0,abs(safe_float(value.get("progress"),0.0)),safe_float(value.get("time"),0.0)),reverse=True)
+        result={"terminal":"","progress":0.0,"status":"neutral","events":[]}
+        for value in values:
+            result["events"].append({key:value.get(key) for key in ("region_id","terminal","progress","status","reset")})
+            if value.get("terminal") in {"success","failure"}:
+                result["terminal"]=value["terminal"]
+                break
+            if abs(safe_float(value.get("progress"),0.0))>abs(result["progress"]):
+                result["progress"]=max(-1.0,min(1.0,safe_float(value.get("progress"),0.0)))
+                result["status"]=str(value.get("status","neutral"))
+        return result
+SEMANTIC_EVENT_HUB=SemanticEventHub()
+def configure_data_directory(path):
+    global SELECTED_DATA_DIR
+    base=Path(path).expanduser().resolve()
+    base.mkdir(parents=True,exist_ok=True)
+    for name in ("python_packages","models","models/vision","models/ocr","cache","cache/pip","temp","logs","backups"):
+        (base/name).mkdir(parents=True,exist_ok=True)
+    package_dir=str(base/"python_packages")
+    if package_dir not in sys.path:
+        sys.path.insert(0,package_dir)
+    os.environ["UGAI_DATA_DIR"]=str(base)
+    os.environ["PIP_TARGET"]=package_dir
+    os.environ["PIP_CACHE_DIR"]=str(base/"cache"/"pip")
+    os.environ["TORCH_HOME"]=str(base/"models"/"torch")
+    os.environ["HF_HOME"]=str(base/"models"/"huggingface")
+    os.environ["XDG_CACHE_HOME"]=str(base/"cache")
+    os.environ["TMP"]=str(base/"temp")
+    os.environ["TEMP"]=str(base/"temp")
+    tempfile.tempdir=str(base/"temp")
+    SELECTED_DATA_DIR=base
+    return base
+def startup_select_data_directory(root):
+    from tkinter import filedialog
+    root.title("通用游戏AI控制面板")
+    root.geometry("760x360")
+    root.minsize(680,320)
+    root.option_add("*Font",("Microsoft YaHei UI",10))
+    holder={"path":None,"done":False,"cancelled":False}
+    path_var=tk.StringVar(value="尚未选择数据目录")
+    status_var=tk.StringVar(value="请选择一个具有至少256MB可用空间的数据目录。数据库、模型、依赖、缓存、日志和临时文件都会放入该目录。")
+    outer=ttk.Frame(root,padding=24)
+    outer.pack(fill="both",expand=True)
+    ttk.Label(outer,text="通用游戏AI控制面板",font=("Microsoft YaHei UI",18,"bold")).pack(anchor="w")
+    ttk.Label(outer,text="第一步：选择数据目录",font=("Microsoft YaHei UI",14,"bold")).pack(anchor="w",pady=(20,6))
+    ttk.Label(outer,textvariable=path_var,wraplength=700).pack(anchor="w",fill="x")
+    ttk.Label(outer,textvariable=status_var,wraplength=700).pack(anchor="w",fill="x",pady=(8,16))
+    buttons=ttk.Frame(outer)
+    buttons.pack(fill="x")
+    confirm_button=ttk.Button(buttons,text="确认",state="disabled")
+    def choose():
+        value=filedialog.askdirectory(parent=root,title="选择通用游戏AI数据目录",mustexist=False)
+        if not value:
+            return
+        try:
+            base=Path(value).expanduser().resolve()
+            base.mkdir(parents=True,exist_ok=True)
+            usage=shutil.disk_usage(base)
+            if int(usage.free)<MIN_FREE_DISK:
+                raise RuntimeError("剩余磁盘空间不足256MB")
+            test=base/(".ugai_write_test_"+uuid.uuid4().hex)
+            test.write_bytes(b"ok")
+            test.unlink()
+            holder["path"]=base
+            path_var.set(str(base))
+            status_var.set("目录读写与空间检查通过。点击“确认”后进入完整控制面板。")
+            confirm_button.configure(state="normal")
+        except Exception as error:
+            holder["path"]=None
+            confirm_button.configure(state="disabled")
+            status_var.set("目录不可用："+str(error))
+    def confirm():
+        if holder["path"] is None:
+            return
+        try:
+            configure_data_directory(holder["path"])
+            holder["done"]=True
+            root.quit()
+        except Exception as error:
+            status_var.set("初始化数据目录失败："+str(error))
+    def cancel():
+        holder["cancelled"]=True
+        root.quit()
+    ttk.Button(buttons,text="选择数据目录",command=choose).pack(side="left",fill="x",expand=True,ipady=8)
+    confirm_button.configure(command=confirm)
+    confirm_button.pack(side="left",fill="x",expand=True,padx=(10,0),ipady=8)
+    root.protocol("WM_DELETE_WINDOW",cancel)
+    root.mainloop()
+    for child in list(root.winfo_children()):
+        child.destroy()
+    if holder["cancelled"] or not holder["done"]:
+        return None
+    return holder["path"]
+class RuntimeInstaller:
+    def __init__(self,base):
+        self.base=Path(base)
+        self.process=None
+        self.lock=threading.RLock()
+    def _gpu_vendor(self):
+        try:
+            creationflags=0x08000000 if os.name=="nt" else 0
+            value=subprocess.check_output(["powershell","-NoProfile","-ExecutionPolicy","Bypass","-Command","(Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name) -join ';'"],stderr=subprocess.STDOUT,text=True,timeout=12,creationflags=creationflags)
+            text=value.lower()
+            if "nvidia" in text:
+                return "nvidia"
+            if "amd" in text or "radeon" in text:
+                return "amd"
+            if "intel" in text:
+                return "intel"
+        except Exception:
+            pass
+        return "unknown"
+    def _run_command(self,command,stop_event,on_line):
+        env=os.environ.copy()
+        env["PYTHONNOUSERSITE"]="1"
+        env["PIP_DISABLE_PIP_VERSION_CHECK"]="1"
+        env["PIP_NO_INPUT"]="1"
+        creationflags=0x08000000 if os.name=="nt" else 0
+        with self.lock:
+            self.process=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,encoding="utf-8",errors="replace",env=env,creationflags=creationflags)
+        try:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    self.stop()
+                    raise InputStopped("下载已由ESC或停止按钮终止")
+                line=self.process.stdout.readline() if self.process.stdout is not None else ""
+                if line and on_line is not None:
+                    on_line(line.rstrip())
+                code=self.process.poll()
+                if code is not None:
+                    if code!=0:
+                        raise RuntimeError("命令退出码"+str(code)+"："+" ".join(command[:5]))
+                    return
+                if not line:
+                    time.sleep(0.05)
+        finally:
+            with self.lock:
+                self.process=None
+    def run(self,stop_event,on_progress=None,on_line=None):
+        package_dir=self.base/"python_packages"
+        package_dir.mkdir(parents=True,exist_ok=True)
+        python=sys.executable
+        steps=[]
+        steps.append([python,"-m","ensurepip","--upgrade"])
+        steps.append([python,"-m","pip","install","--upgrade","pip","setuptools","wheel","--target",str(package_dir)])
+        vendor=self._gpu_vendor()
+        common=["numpy","pillow","opencv-python-headless","rapidocr"]
+        if vendor=="nvidia":
+            common.append("onnxruntime-gpu")
+            steps.append([python,"-m","pip","install","--upgrade","--target",str(package_dir),"torch","torchvision","--index-url","https://download.pytorch.org/whl/cu128"])
+        else:
+            common.append("onnxruntime-directml")
+            steps.append([python,"-m","pip","install","--upgrade","--target",str(package_dir),"torch","torchvision"])
+            if sys.version_info[:2]<=(3,10):
+                steps.append([python,"-m","pip","install","--upgrade","--target",str(package_dir),"torch-directml"])
+        steps.insert(2,[python,"-m","pip","install","--upgrade","--target",str(package_dir),*common])
+        for index,command in enumerate(steps):
+            if on_progress is not None:
+                on_progress(index*90/max(1,len(steps)))
+            self._run_command(command,stop_event,on_line)
+        marker={"completed":time.time(),"python":sys.version,"vendor":vendor,"packages":common,"format":1}
+        (self.base/"models"/"runtime_manifest.json").write_text(json.dumps(marker,ensure_ascii=False,sort_keys=True,separators=(",",":")),encoding="utf-8")
+        if on_progress is not None:
+            on_progress(100)
+        return marker
+    def stop(self):
+        with self.lock:
+            process=self.process
+        if process is None or process.poll() is not None:
+            return
+        try:
+            if os.name=="nt":
+                subprocess.run(["taskkill","/PID",str(process.pid),"/T","/F"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=4)
+            else:
+                process.terminate()
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+class OfflineVisionRuntime:
+    def __init__(self,base):
+        self.base=Path(base)
+        self.model_dir=self.base/"models"/"vision"
+        self.model_dir.mkdir(parents=True,exist_ok=True)
+        self.lock=threading.RLock()
+        self.torch=None
+        self.np=None
+        self.device=None
+        self.device_name="unavailable"
+        self.model=None
+        self.active_game=""
+        self.active_path=None
+        self.trained_steps=0
+        self.ready=False
+        self.error="尚未下载AI运行库"
+        self._load_runtime()
+    def _load_runtime(self):
+        try:
+            import importlib
+            self.np=importlib.import_module("numpy")
+            self.torch=importlib.import_module("torch")
+            torch=self.torch
+            if bool(torch.cuda.is_available()):
+                self.device=torch.device("cuda")
+                self.device_name=str(torch.cuda.get_device_name(0))
+                try:
+                    torch.backends.cudnn.benchmark=True
+                    torch.backends.cuda.matmul.allow_tf32=True
+                    torch.backends.cudnn.allow_tf32=True
+                except Exception:
+                    pass
+            else:
+                try:
+                    directml=importlib.import_module("torch_directml")
+                    self.device=directml.device()
+                    self.device_name="DirectML GPU"
+                except Exception:
+                    self.device=torch.device("cpu")
+                    self.device_name="CPU回退"
+            self.ready=True
+            self.error=""
+        except Exception as error:
+            self.ready=False
+            self.error=str(error)
+    def require_ready(self):
+        if not self.ready:
+            self._load_runtime()
+        if not self.ready:
+            raise RuntimeError("AI视觉运行库不可用，请先点击“下载”："+self.error)
+        return True
+    def _build_model(self):
+        torch=self.torch
+        class Encoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.c1=torch.nn.Conv2d(3,24,3,padding=1)
+                self.c2=torch.nn.Conv2d(24,32,3,padding=1)
+                self.c3=torch.nn.Conv2d(32,32,3,padding=1)
+                self.out=torch.nn.Conv2d(32,4,1)
+            def forward(self,value):
+                value=torch.nn.functional.gelu(self.c1(value))
+                value=torch.nn.functional.gelu(self.c2(value))
+                value=torch.nn.functional.gelu(self.c3(value))
+                return torch.sigmoid(self.out(value))
+        return Encoder().to(self.device)
+    def _path_for(self,game_id):
+        safe=hashlib.sha256(str(game_id).encode("utf-8","replace")).hexdigest()
+        return self.model_dir/(safe+".pt")
+    def activate_game(self,game_id):
+        self.require_ready()
+        gid=str(game_id or "default")
+        with self.lock:
+            if self.active_game==gid and self.model is not None:
+                return self.manifest()
+            seed=int(hashlib.sha256((gid+"|"+str(VISION_ARCHITECTURE_VERSION)).encode("utf-8")).hexdigest()[:8],16)
+            self.torch.manual_seed(seed)
+            if bool(getattr(self.torch,"cuda",None)) and self.torch.cuda.is_available():
+                self.torch.cuda.manual_seed_all(seed)
+            model=self._build_model()
+            path=self._path_for(gid)
+            steps=0
+            if path.exists():
+                try:
+                    packet=self.torch.load(str(path),map_location="cpu",weights_only=False)
+                except TypeError:
+                    packet=self.torch.load(str(path),map_location="cpu")
+                if isinstance(packet,dict) and int(packet.get("architecture_version",0))==VISION_ARCHITECTURE_VERSION:
+                    model.load_state_dict(packet.get("encoder",{}),strict=True)
+                    steps=safe_int(packet.get("trained_steps",0),0,0,1000000000)
+            else:
+                self._atomic_save(path,{"architecture_version":VISION_ARCHITECTURE_VERSION,"encoder":{key:value.detach().cpu() for key,value in model.state_dict().items()},"trained_steps":0,"created":time.time()})
+            model.eval()
+            self.model=model
+            self.active_game=gid
+            self.active_path=path
+            self.trained_steps=steps
+            return self.manifest()
+    def _atomic_save(self,path,packet):
+        temp=path.with_suffix(path.suffix+"."+uuid.uuid4().hex+".tmp")
+        self.torch.save(packet,str(temp))
+        os.replace(temp,path)
+    def manifest(self):
+        checksum=""
+        if self.active_path is not None and self.active_path.exists():
+            checksum=hashlib.sha256(self.active_path.read_bytes()).hexdigest()
+        return {"architecture_version":VISION_ARCHITECTURE_VERSION,"game_id":self.active_game,"checksum":checksum,"trained_steps":self.trained_steps,"device":self.device_name,"relative_path":str(self.active_path.relative_to(self.base)) if self.active_path is not None else ""}
+    def _tensor_from_rgb(self,rgb):
+        source=rgb_bytes(rgb)
+        if source is None:
+            raise CaptureUnavailable("AI视觉输入尺寸无效")
+        array=self.np.frombuffer(source,dtype=self.np.uint8).reshape(FEATURE_H,FEATURE_W,3).copy()
+        tensor=self.torch.from_numpy(array).permute(2,0,1).unsqueeze(0).to(self.device,dtype=self.torch.float32)/255.0
+        return tensor
+    def encode(self,rgb,previous_rgb=None):
+        self.require_ready()
+        with self.lock:
+            if self.model is None:
+                self.activate_game(self.active_game or "default")
+            tensor=self._tensor_from_rgb(rgb)
+            with self.torch.inference_mode():
+                if getattr(self.device,"type","")=="cuda":
+                    with self.torch.autocast(device_type="cuda",dtype=self.torch.float16):
+                        encoded=self.model(tensor)
+                else:
+                    encoded=self.model(tensor)
+            encoded=(encoded.squeeze(0).clamp(0,1)*255.0).to("cpu",dtype=self.torch.uint8).numpy()
+            channels=[bytes(encoded[index].reshape(-1).tolist()) for index in range(4)]
+        current=rgb_bytes(rgb)
+        previous=rgb_bytes(previous_rgb)
+        motion=bytearray(PIXELS)
+        if previous is not None:
+            for pixel in range(PIXELS):
+                offset=pixel*3
+                motion[pixel]=(abs(current[offset]-previous[offset])+abs(current[offset+1]-previous[offset+1])+abs(current[offset+2]-previous[offset+2]))//3
+        return b"".join(channels)+bytes(motion)
+    def encode_gray(self,gray):
+        raw=gray_bytes(gray)
+        if raw is None:
+            raise RuntimeError("灰度样本无效")
+        rgb=bytes(value for pixel in raw for value in (pixel,pixel,pixel))
+        return self.encode(rgb,None)
+    def train(self,game_id,grays,stop_event=None,progress=None):
+        self.require_ready()
+        valid=[gray_bytes(value) for value in grays if gray_bytes(value) is not None]
+        if not valid:
+            self.activate_game(game_id)
+            return self.manifest()
+        with self.lock:
+            self.activate_game(game_id)
+            torch=self.torch
+            encoder=self.model
+            class Autoencoder(torch.nn.Module):
+                def __init__(self,enc):
+                    super().__init__()
+                    self.encoder=enc
+                    self.decoder=torch.nn.Sequential(torch.nn.Conv2d(4,24,3,padding=1),torch.nn.GELU(),torch.nn.Conv2d(24,16,3,padding=1),torch.nn.GELU(),torch.nn.Conv2d(16,3,1),torch.nn.Sigmoid())
+                def forward(self,value):
+                    latent=self.encoder(value)
+                    return latent,self.decoder(latent)
+            model=Autoencoder(encoder).to(self.device)
+            model.train()
+            optimizer=torch.optim.AdamW(model.parameters(),lr=0.0015,weight_decay=0.0001)
+            arrays=self.np.stack([self.np.frombuffer(value,dtype=self.np.uint8).reshape(FEATURE_H,FEATURE_W) for value in valid]).astype(self.np.float32)/255.0
+            arrays=self.np.repeat(arrays[:,None,:,:],3,axis=1)
+            total_steps=max(24,min(240,len(valid)*3))
+            generator=random.Random(int(hashlib.sha256((str(game_id)+"|train").encode()).hexdigest()[:16],16)+self.trained_steps)
+            for step in range(total_steps):
+                if stop_event is not None and stop_event.is_set():
+                    raise InputStopped("GPU离线视觉模型训练已停止")
+                indexes=[generator.randrange(len(valid)) for _ in range(min(32,max(4,len(valid))))]
+                batch=torch.from_numpy(arrays[indexes].copy()).to(self.device)
+                noise=(torch.rand_like(batch)-0.5)*0.08
+                noisy=(batch+noise).clamp(0,1)
+                latent,reconstruction=model(noisy)
+                loss=torch.nn.functional.smooth_l1_loss(reconstruction,batch)+0.02*(latent.var(dim=(2,3)).mean()+0.0001).reciprocal().clamp(max=10)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(),2.0)
+                optimizer.step()
+                if progress is not None and step%2==0:
+                    progress(35.0*(step+1)/total_steps)
+            encoder=model.encoder
+            encoder.eval()
+            self.model=encoder
+            self.trained_steps+=total_steps
+            packet={"architecture_version":VISION_ARCHITECTURE_VERSION,"encoder":{key:value.detach().cpu() for key,value in encoder.state_dict().items()},"trained_steps":self.trained_steps,"updated":time.time()}
+            self._atomic_save(self.active_path,packet)
+            return self.manifest()
+class OfflineOCRRuntime:
+    def __init__(self,base):
+        self.base=Path(base)
+        self.lock=threading.RLock()
+        self.engine=None
+        self.np=None
+        self.ready=False
+        self.error="尚未下载OCR运行库"
+        self._load_runtime()
+    def _load_runtime(self):
+        try:
+            import importlib
+            self.np=importlib.import_module("numpy")
+            try:
+                module=importlib.import_module("rapidocr")
+                device_name=str(getattr(CURRENT_VISION_RUNTIME,"device_name",""))
+                params={"EngineConfig.onnxruntime.use_cuda":True} if "NVIDIA" in device_name or "CUDA" in device_name.upper() else {"EngineConfig.onnxruntime.use_dml":True} if "DirectML" in device_name else {}
+                try:
+                    self.engine=module.RapidOCR(params=params) if params else module.RapidOCR()
+                except Exception:
+                    self.engine=module.RapidOCR()
+            except Exception:
+                module=importlib.import_module("rapidocr_onnxruntime")
+                self.engine=module.RapidOCR()
+            self.ready=True
+            self.error=""
+        except Exception as error:
+            self.engine=None
+            self.ready=False
+            self.error=str(error)
+    def require_ready(self):
+        if not self.ready:
+            self._load_runtime()
+        if not self.ready:
+            raise RuntimeError("OCR运行库不可用，请先点击“下载”："+self.error)
+        return True
+    def _array(self,rgb,width,height):
+        raw=bytes(rgb)
+        if len(raw)!=int(width)*int(height)*3:
+            raise RuntimeError("OCR图像尺寸无效")
+        return self.np.frombuffer(raw,dtype=self.np.uint8).reshape(int(height),int(width),3).copy()
+    def recognize(self,rgb,width,height,region=None):
+        self.require_ready()
+        image=self._array(rgb,width,height)
+        offset_x=0
+        offset_y=0
+        if region is not None:
+            x,y,w,h=region
+            x=max(0,min(int(width)-1,int(x))); y=max(0,min(int(height)-1,int(y)))
+            w=max(1,min(int(width)-x,int(w))); h=max(1,min(int(height)-y,int(h)))
+            image=image[y:y+h,x:x+w]
+            offset_x=x
+            offset_y=y
+        with self.lock:
+            output=self.engine(image)
+        values=[]
+        if hasattr(output,"boxes"):
+            records=zip(output.boxes or [],output.txts or [],output.scores or [])
+        elif isinstance(output,tuple) and len(output)>=1:
+            records=output[0] or []
+        else:
+            records=output or []
+        for item in records:
+            try:
+                box,text,score=item[:3] if isinstance(item,(list,tuple)) else item
+                xs=[float(point[0])+offset_x for point in box]
+                ys=[float(point[1])+offset_y for point in box]
+                values.append({"box":[min(xs),min(ys),max(xs)-min(xs),max(ys)-min(ys)],"text":str(text),"confidence":max(0.0,min(1.0,float(score)))})
+            except Exception:
+                continue
+        return values
+    def recognize_region(self,frame,norm):
+        preview=preview_rgb_bytes(frame.get("preview_rgb"))
+        width=safe_int(frame.get("preview_width",PREVIEW_W),PREVIEW_W,1,8192)
+        height=safe_int(frame.get("preview_height",PREVIEW_H),PREVIEW_H,1,8192)
+        if preview is None:
+            preview=rgb_bytes(frame.get("rgb"))
+            width=FEATURE_W
+            height=FEATURE_H
+        if preview is None:
+            raise RuntimeError("当前帧没有可用OCR图像")
+        x=max(0,min(width-1,round(safe_float(norm[0])*width)))
+        y=max(0,min(height-1,round(safe_float(norm[1])*height)))
+        right=max(x+1,min(width,round((safe_float(norm[0])+safe_float(norm[2]))*width)))
+        bottom=max(y+1,min(height,round((safe_float(norm[1])+safe_float(norm[3]))*height)))
+        values=self.recognize(preview,width,height,[x,y,right-x,bottom-y])
+        text="".join(value["text"] for value in values).strip()
+        confidence=sum(value["confidence"] for value in values)/max(1,len(values))
+        return {"text":text,"confidence":confidence,"items":values}
+    def candidate_regions(self,frame,maximum=8):
+        preview=preview_rgb_bytes(frame.get("preview_rgb"))
+        width=safe_int(frame.get("preview_width",PREVIEW_W),PREVIEW_W,1,8192)
+        height=safe_int(frame.get("preview_height",PREVIEW_H),PREVIEW_H,1,8192)
+        if preview is None:
+            raise RuntimeError("当前画面没有教学预览")
+        regions=[]
+        try:
+            for item in self.recognize(preview,width,height):
+                x,y,w,h=item["box"]
+                margin=max(2,int(min(width,height)*0.008))
+                x=max(0,x-margin); y=max(0,y-margin); w=min(width-x,w+margin*2); h=min(height-y,h+margin*2)
+                if w>=4 and h>=4:
+                    regions.append({"norm":[x/width,y/height,w/width,h/height],"score":2.0+item["confidence"],"text":item["text"]})
+        except Exception:
+            pass
+        gray=[]
+        for index in range(0,len(preview),3):
+            gray.append((preview[index]*77+preview[index+1]*150+preview[index+2]*29)>>8)
+        cells=[]
+        cell_w=max(8,width//20)
+        cell_h=max(6,height//14)
+        for y in range(0,height,cell_h):
+            for x in range(0,width,cell_w):
+                values=[]
+                for yy in range(y,min(height,y+cell_h)):
+                    start=yy*width+x
+                    values.extend(gray[start:start+min(cell_w,width-x)])
+                if len(values)<8:
+                    continue
+                mean=sum(values)/len(values)
+                variance=sum((value-mean)*(value-mean) for value in values)/len(values)
+                if variance>=650:
+                    cells.append([x,y,min(cell_w,width-x),min(cell_h,height-y),variance])
+        cells.sort(key=lambda value:value[4],reverse=True)
+        for x,y,w,h,score in cells[:maximum*3]:
+            norm=[x/width,y/height,w/width,h/height]
+            if any(_rect_iou(norm,value["norm"])>0.45 for value in regions):
+                continue
+            regions.append({"norm":norm,"score":score/1000.0,"text":""})
+        regions.sort(key=lambda value:value["score"],reverse=True)
+        selected=[]
+        for value in regions:
+            if any(_rect_iou(value["norm"],old["norm"])>0.65 for old in selected):
+                continue
+            selected.append(value)
+            if len(selected)>=maximum:
+                break
+        if not selected:
+            selected=[{"norm":[0.05,0.05,0.25,0.15],"score":0.0,"text":""},{"norm":[0.7,0.05,0.25,0.15],"score":0.0,"text":""},{"norm":[0.05,0.8,0.25,0.15],"score":0.0,"text":""},{"norm":[0.7,0.8,0.25,0.15],"score":0.0,"text":""}]
+        return selected
+def _rect_iou(first,second):
+    ax,ay,aw,ah=[safe_float(value) for value in first]
+    bx,by,bw,bh=[safe_float(value) for value in second]
+    left=max(ax,bx); top=max(ay,by); right=min(ax+aw,bx+bw); bottom=min(ay+ah,by+bh)
+    intersection=max(0.0,right-left)*max(0.0,bottom-top)
+    union=max(1e-9,aw*ah+bw*bh-intersection)
+    return intersection/union
+def parse_ocr_number(text,number_format="auto"):
+    import re
+    raw=str(text or "").strip().replace("，",",").replace("％","%").replace("：",":").replace("／","/").replace("−","-").replace("O","0").replace("o","0")
+    compact=re.sub(r"\s+","",raw)
+    result={"valid":False,"kind":"unknown","value":None,"maximum":None,"seconds":None,"unit":"","normalized":compact}
+    if not compact:
+        return result
+    time_match=re.fullmatch(r"(-?\d+):([0-5]?\d)(?::([0-5]?\d))?",compact)
+    if time_match:
+        parts=[int(value) for value in time_match.groups() if value is not None]
+        seconds=parts[0]*60+parts[1] if len(parts)==2 else parts[0]*3600+parts[1]*60+parts[2]
+        result.update({"valid":True,"kind":"time","seconds":float(seconds),"value":float(seconds)})
+        return result
+    pair=re.search(r"(-?\d+(?:\.\d+)?)[/](-?\d+(?:\.\d+)?)",compact)
+    if pair:
+        result.update({"valid":True,"kind":"current_max","value":float(pair.group(1)),"maximum":float(pair.group(2))})
+        return result
+    match=re.search(r"[-+]?\d+(?:[.,]\d+)?",compact)
+    if not match:
+        return result
+    number=float(match.group(0).replace(",","."))
+    suffix=compact[match.end():].upper()
+    multiplier=1.0
+    unit=suffix
+    if suffix.startswith("K"):
+        multiplier=1000.0; unit="K"
+    elif suffix.startswith("M"):
+        multiplier=1000000.0; unit="M"
+    elif suffix.startswith("B"):
+        multiplier=1000000000.0; unit="B"
+    value=number*multiplier
+    kind="decimal" if "." in match.group(0) or "," in match.group(0) else "integer"
+    if "%" in compact:
+        kind="percent"
+    elif multiplier!=1.0:
+        kind="unit"
+    elif any(symbol in compact for symbol in ("$","¥","￥","€","£","分")):
+        kind="currency_or_score"
+    result.update({"valid":True,"kind":kind,"value":value,"unit":unit})
+    return result
+class OCRSemanticEngine:
+    def __init__(self):
+        self.previous={}
+        self.lock=threading.RLock()
+    def evaluate(self,definition,parsed):
+        region_id=str(definition.get("id",""))
+        event={"terminal":"","progress":0.0,"status":"neutral","reset":"","semantic_version":OCR_SEMANTIC_VERSION}
+        if not isinstance(parsed,dict) or not parsed.get("valid"):
+            event["status"]="unreadable"
+            return event
+        current=safe_float(parsed.get("value"),0.0)
+        with self.lock:
+            previous=self.previous.get(region_id)
+            self.previous[region_id]=current
+        target_min=definition.get("target_min")
+        target_max=definition.get("target_max")
+        relation=str(definition.get("goal_relation","uncertain"))
+        special=definition.get("special_value")
+        if finite_number(special) and abs(current-safe_float(special))<=max(1e-6,abs(safe_float(special))*0.001):
+            meaning=str(definition.get("special_meaning","none"))
+            if meaning=="success":
+                event["terminal"]="success"
+            elif meaning=="failure":
+                event["terminal"]="failure"
+            elif meaning=="next_level":
+                event["status"]="next_level"
+            elif meaning=="new_round":
+                event["reset"]="new_round"
+        if previous is not None:
+            delta=current-previous
+            tolerance=max(1e-6,max(abs(current),abs(previous),1.0)*0.0005)
+            if abs(delta)>tolerance:
+                if relation in {"higher_better","increase_progress"}:
+                    event["progress"]=1.0 if delta>0 else -1.0
+                elif relation in {"lower_better","decrease_progress","countdown"}:
+                    event["progress"]=1.0 if delta<0 else -1.0
+                elif relation=="near_target" and finite_number(target_min):
+                    event["progress"]=1.0 if abs(current-safe_float(target_min))<abs(previous-safe_float(target_min)) else -1.0
+                elif relation=="in_range" and finite_number(target_min) and finite_number(target_max):
+                    low=min(safe_float(target_min),safe_float(target_max)); high=max(safe_float(target_min),safe_float(target_max))
+                    before=0.0 if low<=previous<=high else min(abs(previous-low),abs(previous-high))
+                    after=0.0 if low<=current<=high else min(abs(current-low),abs(current-high))
+                    event["progress"]=1.0 if after<before else -1.0 if after>before else 0.0
+            if previous!=0 and abs(current-previous)>max(10.0,abs(previous)*0.65):
+                reset=str(definition.get("reset_meaning","uncertain"))
+                if reset in {"new_round","level_change","player_failure","cycle","normal"}:
+                    event["reset"]=reset
+                if reset=="player_failure":
+                    event["terminal"]="failure"
+        if relation=="in_range" and finite_number(target_min) and finite_number(target_max):
+            low=min(safe_float(target_min),safe_float(target_max)); high=max(safe_float(target_min),safe_float(target_max))
+            event["status"]="in_range" if low<=current<=high else "out_of_range"
+        elif relation=="resource":
+            maximum=parsed.get("maximum")
+            if finite_number(maximum) and safe_float(maximum)>0:
+                ratio=current/safe_float(maximum)
+                event["status"]="critical" if ratio<=0.2 else "full" if ratio>=0.95 else "normal"
+            else:
+                event["status"]="resource"
+        elif relation=="countdown":
+            event["status"]="countdown"
+        return event
+OCR_SEMANTIC_ENGINE=OCRSemanticEngine()
+class OCRMonitor:
+    def __init__(self,app,frame_buffer,purpose):
+        self.app=app
+        self.frame_buffer=frame_buffer
+        self.purpose=str(purpose)
+        self.stop_event=threading.Event()
+        self.thread=None
+        self.last_stamp=0.0
+        self.last_saved=defaultdict(float)
+    def start(self):
+        self.thread=threading.Thread(target=self._run,name="UniversalGameAI-OCR-"+self.purpose,daemon=True)
+        self.thread.start()
+        return self
+    def _run(self):
+        try:
+            game=self.app.require_game()
+            definitions=self.app.store.list_ocr_regions(game["id"],True)
+            if not definitions:
+                return
+            while not self.stop_event.is_set() and not self.app.should_stop():
+                frame=self.frame_buffer.latest(None,1.0)
+                if frame is None or frame.get("time")==self.last_stamp or not frame.get("capture_valid"):
+                    self.stop_event.wait(0.12)
+                    continue
+                self.last_stamp=frame.get("time")
+                for definition in definitions:
+                    if self.stop_event.is_set() or self.app.should_stop():
+                        break
+                    try:
+                        recognized=self.app.ocr_runtime.recognize_region(frame,definition["region_norm"])
+                        parsed=parse_ocr_number(recognized.get("text"),definition.get("number_format","auto")) if definition.get("region_type")=="number" else {"valid":False}
+                        event=OCR_SEMANTIC_ENGINE.evaluate(definition,parsed) if definition.get("region_type")=="number" else {"terminal":"","progress":0.0,"status":"text_only","reset":"","semantic_version":OCR_SEMANTIC_VERSION}
+                        SEMANTIC_EVENT_HUB.publish(game["id"],definition["id"],event)
+                        now=time.monotonic()
+                        if now-self.last_saved[definition["id"]]>=0.8:
+                            self.last_saved[definition["id"]]=now
+                            self.app.store.append_ocr_observation(game["id"],definition["id"],recognized.get("text",""),parsed,recognized.get("confidence",0.0),1,event)
+                    except Exception as error:
+                        self.app.store.log_error("OCR_MONITOR_FRAME_FAILED",error,mode=self.app.mode,game_id=game["id"])
+                self.stop_event.wait(0.18 if self.purpose=="training" else 0.3)
+        finally:
+            self.app.store.close_current_thread()
+    def stop(self,timeout=1.0):
+        self.stop_event.set()
+        if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread() and timeout>0:
+            self.thread.join(max(0.0,float(timeout)))
+        return not bool(self.thread and self.thread.is_alive())
+    def alive(self):
+        return bool(self.thread and self.thread.is_alive())
+class ScreenNumericKeypad:
+    def __init__(self,parent,title,initial=""):
+        self.value=tk.StringVar(value=str(initial))
+        self.frame=ttk.LabelFrame(parent,text=title,padding=8)
+        self.entry=ttk.Entry(self.frame,textvariable=self.value,state="readonly",justify="right",font=("Consolas",14))
+        self.entry.grid(row=0,column=0,columnspan=4,sticky="ew",pady=(0,6))
+        keys=[("7","7"),("8","8"),("9","9"),("←","back"),("4","4"),("5","5"),("6","6"),("清空","clear"),("1","1"),("2","2"),("3","3"),("-","-"),("0","0"),(".","."),("K","K"),("M","M")]
+        for index,(label,token) in enumerate(keys):
+            ttk.Button(self.frame,text=label,command=lambda token=token:self.press(token)).grid(row=1+index//4,column=index%4,sticky="nsew",padx=2,pady=2,ipady=4)
+        for column in range(4):
+            self.frame.columnconfigure(column,weight=1)
+    def press(self,token):
+        text=self.value.get()
+        if token=="back":
+            self.value.set(text[:-1])
+        elif token=="clear":
+            self.value.set("")
+        elif len(text)<32:
+            self.value.set(text+token)
+    def get_number(self):
+        parsed=parse_ocr_number(self.value.get())
+        if not parsed.get("valid"):
+            raise ValueError("请输入有效数字")
+        return parsed.get("value")
+class OCRTeachingDialog:
+    TYPE_CHOICES=[("A","数字","number"),("B","普通文字","text"),("C","图标或状态","icon"),("D","游戏画面内容","game_content"),("E","无意义区域","meaningless"),("F","不确定","uncertain")]
+    FORMAT_CHOICES=[("A","整数","integer"),("B","小数","decimal"),("C","百分比","percent"),("D","时间","time"),("E","当前值/最大值，例如35/100","current_max"),("F","带单位，例如1.5K、2M","unit"),("G","货币或分数","currency_or_score"),("H","自动判断","auto")]
+    RELATION_CHOICES=[("A","越高越好","higher_better"),("B","越低越好","lower_better"),("C","越接近指定值越好","near_target"),("D","保持在指定范围内最好","in_range"),("E","增加代表取得进展","increase_progress"),("F","减少代表取得进展","decrease_progress"),("G","只用于判断状态，不直接计算奖励","status_only"),("H","表示倒计时","countdown"),("I","表示生命、次数或资源","resource"),("J","不确定","uncertain")]
+    SPECIAL_CHOICES=[("A","游戏成功","success"),("B","游戏失败","failure"),("C","进入下一关","next_level"),("D","新一局开始","new_round"),("E","没有特殊含义","none"),("F","不确定","uncertain")]
+    RESET_CHOICES=[("A","新一局开始","new_round"),("B","关卡切换","level_change"),("C","玩家失败","player_failure"),("D","数值循环或溢出","cycle"),("E","正常变化","normal"),("F","不确定","uncertain")]
+    CONFIRM_CHOICES=[("A","识别正确","correct"),("B","数字正确但含义错误","meaning_wrong"),("C","识别错误","recognition_wrong"),("D","当前画面无法判断","cannot_judge"),("E","删除此区域","delete")]
+    def __init__(self,app,parent,game,buffer,frame,on_close=None):
+        self.app=app
+        self.parent=parent
+        self.game=game
+        self.buffer=buffer
+        self.frame=frame
+        self.on_close=on_close
+        self.win=tk.Toplevel(parent)
+        self.win.title("请教：OCR与数字语义")
+        self.win.geometry("820x820")
+        self.win.minsize(760,720)
+        self.win.transient(parent)
+        self.win.grab_set()
+        self.win.protocol("WM_DELETE_WINDOW",self.cancel)
+        self.win.bind("<Escape>",lambda event:self.app.close_ask(reason="stopped"))
+        self.outer=ttk.Frame(self.win,padding=12)
+        self.outer.pack(fill="both",expand=True)
+        self.title=tk.StringVar(value="系统正在提出候选区域")
+        ttk.Label(self.outer,textvariable=self.title,font=("Microsoft YaHei UI",14,"bold")).pack(anchor="w")
+        self.info=tk.StringVar(value="正在执行离线OCR与画面变化分析")
+        ttk.Label(self.outer,textvariable=self.info,wraplength=780).pack(anchor="w",fill="x",pady=(4,8))
+        self.canvas=tk.Canvas(self.outer,width=ASK_CANVAS_W,height=ASK_CANVAS_H,bg="black",highlightthickness=1,highlightbackground="#777777")
+        self.canvas.pack()
+        self.question=ttk.Frame(self.outer)
+        self.question.pack(fill="both",expand=True,pady=(10,0))
+        self.state={"region":None,"region_type":"","number_format":"auto","goal_relation":"uncertain","target_min":None,"target_max":None,"special_value":None,"special_meaning":"uncertain","reset_meaning":"uncertain","recognized":{"text":"","confidence":0.0},"consistent":0,"corrected":None}
+        self.candidates=[]
+        self.images=[]
+        self.closed=False
+        self._render_image()
+        threading.Thread(target=self._load_candidates,name="UniversalGameAI-OCR-Teach-Candidates",daemon=True).start()
+    def _render_image(self):
+        preview=preview_rgb_bytes(self.frame.get("preview_rgb")) or bytes(PREVIEW_W*PREVIEW_H*3)
+        ppm=b"P6\n"+str(PREVIEW_W).encode("ascii")+b" "+str(PREVIEW_H).encode("ascii")+b"\n255\n"+preview
+        image=tk.PhotoImage(data=base64.b64encode(ppm).decode("ascii"),format="PPM")
+        scaled=image.zoom(2,2)
+        self.images=[image,scaled]
+        self.canvas.delete("all")
+        self.canvas.create_image(ASK_PREVIEW_X,ASK_PREVIEW_Y,image=scaled,anchor="nw")
+    def _load_candidates(self):
+        try:
+            candidates=self.app.ocr_runtime.candidate_regions(self.frame,8)
+            self.app.ui(lambda:self._show_candidates(candidates))
+        except Exception as error:
+            self.app.ui(lambda error=error:self._fail(str(error)))
+    def _fail(self,message):
+        if not self.closed:
+            self.info.set("OCR候选区域生成失败："+str(message))
+    def _show_candidates(self,candidates):
+        if self.closed:
+            return
+        self.candidates=list(candidates)
+        self._render_image()
+        colors=("#00ffff","#ffff00","#ff66ff","#66ff66","#ff9955","#55aaff","#ffffff","#ff5555")
+        for index,item in enumerate(self.candidates):
+            x,y,w,h=item["norm"]
+            left=ASK_PREVIEW_X+x*ASK_PREVIEW_W
+            top=ASK_PREVIEW_Y+y*ASK_PREVIEW_H
+            right=left+w*ASK_PREVIEW_W
+            bottom=top+h*ASK_PREVIEW_H
+            color=colors[index%len(colors)]
+            self.canvas.create_rectangle(left,top,right,bottom,outline=color,width=3,tags=("region"+str(index),))
+            self.canvas.create_text(left+4,top+4,text="区域"+str(index+1),fill=color,font=("Microsoft YaHei UI",11,"bold"),anchor="nw")
+        self.title.set("第一步：系统提出候选区域")
+        self.info.set("请用鼠标点击一个编号框。无需键盘输入。")
+        self.canvas.bind("<Button-1>",self._select_region)
+    def _select_region(self,event):
+        px=(event.x-ASK_PREVIEW_X)/ASK_PREVIEW_W
+        py=(event.y-ASK_PREVIEW_Y)/ASK_PREVIEW_H
+        matches=[]
+        for index,item in enumerate(self.candidates):
+            x,y,w,h=item["norm"]
+            if x<=px<=x+w and y<=py<=y+h:
+                matches.append((w*h,index,item))
+        if not matches:
+            self.info.set("请点击编号框内部。")
+            return
+        _,index,item=min(matches,key=lambda value:value[0])
+        self.state["region"]=list(item["norm"])
+        self.canvas.unbind("<Button-1>")
+        self._show_choices("第二步：询问区域类型","这个区域表示什么？",self.TYPE_CHOICES,self._type_selected)
+    def _clear_question(self):
+        for child in self.question.winfo_children():
+            child.destroy()
+    def _show_choices(self,title,prompt,choices,callback):
+        if self.closed:
+            return
+        self._clear_question()
+        self.title.set(title)
+        ttk.Label(self.question,text=prompt,font=("Microsoft YaHei UI",12,"bold"),wraplength=760).pack(anchor="w",pady=(0,6))
+        for letter,label,value in choices:
+            ttk.Button(self.question,text=letter+". "+label,command=lambda value=value:callback(value)).pack(fill="x",pady=2,ipady=4)
+    def _type_selected(self,value):
+        self.state["region_type"]=value
+        if value!="number":
+            self._save_non_number()
+            return
+        self._show_choices("第三步：数字格式","这个数字的格式是：",self.FORMAT_CHOICES,self._format_selected)
+    def _save_non_number(self):
+        payload=dict(self.state)
+        payload["region_norm"]=payload.pop("region")
+        payload["recognized_text"]=""
+        self.app.store.save_ocr_region(self.game["id"],payload)
+        self.app.ask_counts["ocr"]=safe_int(self.app.ask_counts.get("ocr",0),0)+1
+        self.info.set("区域类型已保存。普通文字、图标和游戏画面内容不会自动提升任何鼠标动作授权等级。")
+        self._finish_buttons()
+    def _format_selected(self,value):
+        self.state["number_format"]=value
+        self._show_choices("第四步：数字含义","这个数字与游戏目标的关系是：",self.RELATION_CHOICES,self._relation_selected)
+    def _relation_selected(self,value):
+        self.state["goal_relation"]=value
+        if value in {"near_target","in_range"}:
+            self._target_input(value)
+        else:
+            self._show_choices("第五步：终局含义","这个数字达到特殊值时通常代表什么？",self.SPECIAL_CHOICES,self._special_selected)
+    def _target_input(self,relation):
+        self._clear_question()
+        self.title.set("第四步：目标值或范围")
+        ttk.Label(self.question,text="只能点击屏幕数字键盘；这些按钮只产生Tkinter控件事件，不会产生系统键盘注入。",wraplength=760).pack(anchor="w")
+        first=ScreenNumericKeypad(self.question,"目标值" if relation=="near_target" else "范围下限")
+        first.frame.pack(fill="x",pady=6)
+        second=None
+        if relation=="in_range":
+            second=ScreenNumericKeypad(self.question,"范围上限")
+            second.frame.pack(fill="x",pady=6)
+        error=tk.StringVar()
+        ttk.Label(self.question,textvariable=error).pack(anchor="w")
+        def submit():
+            try:
+                self.state["target_min"]=first.get_number()
+                self.state["target_max"]=second.get_number() if second is not None else first.get_number()
+                self._show_choices("第五步：终局含义","这个数字达到特殊值时通常代表什么？",self.SPECIAL_CHOICES,self._special_selected)
+            except Exception as value:
+                error.set(str(value))
+        ttk.Button(self.question,text="确认目标值",command=submit).pack(fill="x",pady=6,ipady=5)
+    def _special_selected(self,value):
+        self.state["special_meaning"]=value
+        if value in {"success","failure","next_level","new_round"}:
+            self._special_value_input()
+        else:
+            self._show_choices("第六步：复位语义","数字突然回到初始值通常表示：",self.RESET_CHOICES,self._reset_selected)
+    def _special_value_input(self):
+        self._clear_question()
+        self.title.set("第五步：特殊值")
+        ttk.Label(self.question,text="请输入触发该终局含义的特殊值。只允许使用屏幕数字键盘。",wraplength=760).pack(anchor="w")
+        keypad=ScreenNumericKeypad(self.question,"特殊值")
+        keypad.frame.pack(fill="x",pady=6)
+        error=tk.StringVar()
+        ttk.Label(self.question,textvariable=error).pack(anchor="w")
+        def submit():
+            try:
+                self.state["special_value"]=keypad.get_number()
+                self._show_choices("第六步：复位语义","数字突然回到初始值通常表示：",self.RESET_CHOICES,self._reset_selected)
+            except Exception as value:
+                error.set(str(value))
+        ttk.Button(self.question,text="确认特殊值",command=submit).pack(fill="x",pady=6,ipady=5)
+    def _reset_selected(self,value):
+        self.state["reset_meaning"]=value
+        self._clear_question()
+        self.title.set("第七步：确认OCR")
+        ttk.Label(self.question,text="正在对同一区域执行连续帧离线OCR。",wraplength=760).pack(anchor="w")
+        threading.Thread(target=self._recognize_consistency,name="UniversalGameAI-OCR-Teach-Confirm",daemon=True).start()
+    def _recognize_consistency(self):
+        try:
+            frames=[value for value in self.buffer.snapshot(2.5) if value.get("preview_rgb")][-4:]
+            if not frames:
+                frames=[self.frame]
+            results=[self.app.ocr_runtime.recognize_region(value,self.state["region"]) for value in frames]
+            texts=[value.get("text","").strip() for value in results]
+            best=Counter(texts).most_common(1)[0][0] if texts else ""
+            consistent=sum(1 for value in texts if value==best and value!="")
+            selected=next((value for value in reversed(results) if value.get("text","").strip()==best),results[-1] if results else {"text":"","confidence":0.0})
+            confidence=sum(value.get("confidence",0.0) for value in results if value.get("text","").strip()==best)/max(1,consistent)
+            recognized={"text":best or selected.get("text",""),"confidence":confidence}
+            self.app.ui(lambda:self._show_confirmation(recognized,consistent))
+        except Exception as error:
+            self.app.ui(lambda error=error:self._show_confirmation({"text":"","confidence":0.0,"error":str(error)},0))
+    def _show_confirmation(self,recognized,consistent):
+        if self.closed:
+            return
+        self.state["recognized"]=recognized
+        self.state["consistent"]=consistent
+        self._clear_question()
+        self.title.set("第七步：确认OCR")
+        text=recognized.get("text","")
+        confidence=safe_float(recognized.get("confidence"),0.0)*100.0
+        ttk.Label(self.question,text="识别内容："+text+"\n置信度："+str(round(confidence,1))+"%\n连续一致："+str(consistent)+"帧",font=("Microsoft YaHei UI",13,"bold"),justify="left").pack(anchor="w",pady=(0,8))
+        if recognized.get("error"):
+            ttk.Label(self.question,text="OCR错误："+recognized["error"],wraplength=760).pack(anchor="w")
+        for letter,label,value in self.CONFIRM_CHOICES:
+            ttk.Button(self.question,text=letter+". "+label,command=lambda value=value:self._confirm_selected(value)).pack(fill="x",pady=2,ipady=4)
+    def _confirm_selected(self,value):
+        if value=="meaning_wrong":
+            self._show_choices("第四步：数字含义","请重新选择这个数字与游戏目标的关系：",self.RELATION_CHOICES,self._relation_selected)
+            return
+        if value=="recognition_wrong":
+            self._correct_recognition()
+            return
+        if value=="cannot_judge":
+            self.info.set("本次未保存；请在画面可判断时重新进入OCR请教。")
+            self._finish_buttons()
+            return
+        if value=="delete":
+            self.app.store.delete_ocr_region_by_overlap(self.game["id"],self.state["region"])
+            self.info.set("此区域的已保存OCR定义已删除。")
+            self._finish_buttons()
+            return
+        self._save_number()
+    def _correct_recognition(self):
+        self._clear_question()
+        self.title.set("第七步：修正OCR数字")
+        ttk.Label(self.question,text="请使用屏幕数字键盘输入正确数字。不会产生系统键盘注入。",wraplength=760).pack(anchor="w")
+        keypad=ScreenNumericKeypad(self.question,"正确数字",self.state["recognized"].get("text",""))
+        keypad.frame.pack(fill="x",pady=6)
+        error=tk.StringVar()
+        ttk.Label(self.question,textvariable=error).pack(anchor="w")
+        def submit():
+            parsed=parse_ocr_number(keypad.value.get(),self.state.get("number_format","auto"))
+            if not parsed.get("valid"):
+                error.set("请输入可解析数字")
+                return
+            self.state["corrected"]=keypad.value.get()
+            self._save_number()
+        ttk.Button(self.question,text="确认修正",command=submit).pack(fill="x",pady=6,ipady=5)
+    def _save_number(self):
+        text=self.state.get("corrected") or self.state["recognized"].get("text","")
+        parsed=parse_ocr_number(text,self.state.get("number_format","auto"))
+        if not parsed.get("valid"):
+            self.info.set("识别内容不是有效数字，请选择“识别错误”并修正。")
+            return
+        payload=dict(self.state)
+        payload["region_norm"]=payload.pop("region")
+        payload["recognized_text"]=text
+        payload["last_value"]=parsed.get("value")
+        payload["confidence"]=self.state["recognized"].get("confidence",0.0)
+        payload["stable_frames"]=self.state.get("consistent",0)
+        region=self.app.store.save_ocr_region(self.game["id"],payload)
+        event=OCR_SEMANTIC_ENGINE.evaluate(region,parsed)
+        self.app.store.append_ocr_observation(self.game["id"],region["id"],text,parsed,payload["confidence"],payload["stable_frames"],event)
+        SEMANTIC_EVENT_HUB.publish(self.game["id"],region["id"],event)
+        self.app.ask_counts["ocr"]=safe_int(self.app.ask_counts.get("ocr",0),0)+1
+        self.info.set("OCR数字语义已保存。奖励系统只接收离散语义事件，不接收OCR原始值；OCR文字不会改变动作授权等级。")
+        self._finish_buttons()
+    def _finish_buttons(self):
+        self._clear_question()
+        ttk.Button(self.question,text="继续动作请教",command=self.cancel).pack(fill="x",pady=6,ipady=5)
+        ttk.Button(self.question,text="结束请教",command=lambda:self.app.close_ask(reason="completed")).pack(fill="x",pady=6,ipady=5)
+    def cancel(self):
+        if self.closed:
+            return
+        self.closed=True
+        try:
+            self.win.grab_release()
+        except Exception:
+            pass
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        if self.on_close is not None:
+            try:
+                self.on_close()
+            except Exception:
+                pass
+_original_datastore_init=DataStore.__init__
+def _enhanced_datastore_init(self,base=None):
+    selected=base if base is not None else SELECTED_DATA_DIR
+    _original_datastore_init(self,selected)
+DataStore.__init__=_enhanced_datastore_init
+_original_initialize_schema=DataStore._initialize_schema
+def _enhanced_initialize_schema(self):
+    _original_initialize_schema(self)
+    with self.lock,self.db:
+        self.db.execute("CREATE TABLE IF NOT EXISTS ocr_regions(id TEXT PRIMARY KEY,game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,created REAL NOT NULL,updated REAL NOT NULL,region_norm TEXT NOT NULL,region_type TEXT NOT NULL,number_format TEXT NOT NULL,goal_relation TEXT NOT NULL,target_min REAL,target_max REAL,special_value REAL,special_meaning TEXT NOT NULL,reset_meaning TEXT NOT NULL,unit TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,last_text TEXT NOT NULL,last_value REAL,last_confidence REAL NOT NULL DEFAULT 0,stable_frames INTEGER NOT NULL DEFAULT 0,checksum TEXT NOT NULL)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_ocr_regions_game_enabled ON ocr_regions(game_id,enabled,updated DESC)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS ocr_observations(id INTEGER PRIMARY KEY AUTOINCREMENT,game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,region_id TEXT NOT NULL REFERENCES ocr_regions(id) ON DELETE CASCADE,created REAL NOT NULL,raw_text TEXT NOT NULL,parsed TEXT NOT NULL,confidence REAL NOT NULL,stable_frames INTEGER NOT NULL,semantic_event TEXT NOT NULL,checksum TEXT NOT NULL)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_ocr_observations_region_created ON ocr_observations(region_id,created DESC)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS vision_models(game_id TEXT PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE,architecture_version INTEGER NOT NULL,updated REAL NOT NULL,relative_path TEXT NOT NULL,checksum TEXT NOT NULL,trained_steps INTEGER NOT NULL,device TEXT NOT NULL,metadata TEXT NOT NULL)")
+        self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('extension_schema_version',?)",(str(EXTENSION_SCHEMA_VERSION),))
+DataStore._initialize_schema=_enhanced_initialize_schema
+def _save_ocr_region(self,gid,payload):
+    self._ensure_writable()
+    value=dict(payload) if isinstance(payload,dict) else {}
+    norm=value.get("region_norm")
+    if not isinstance(norm,(list,tuple)) or len(norm)!=4:
+        raise ValueError("OCR区域坐标无效")
+    norm=[round(max(0.0,min(1.0,safe_float(item))),8) for item in norm]
+    if norm[2]<=0 or norm[3]<=0 or norm[0]+norm[2]>1.000001 or norm[1]+norm[3]>1.000001:
+        raise ValueError("OCR区域必须位于确认内容区域内")
+    existing=None
+    for item in self.list_ocr_regions(gid,False):
+        if _rect_iou(item["region_norm"],norm)>=0.82:
+            existing=item
+            break
+    region_id=str(existing.get("id")) if existing else uuid.uuid4().hex
+    created=safe_float(existing.get("created"),time.time()) if existing else time.time()
+    now=time.time()
+    row={"id":region_id,"game_id":str(gid),"created":created,"updated":now,"region_norm":norm,"region_type":str(value.get("region_type","uncertain")),"number_format":str(value.get("number_format","auto")),"goal_relation":str(value.get("goal_relation","uncertain")),"target_min":safe_float(value.get("target_min")) if finite_number(value.get("target_min")) else None,"target_max":safe_float(value.get("target_max")) if finite_number(value.get("target_max")) else None,"special_value":safe_float(value.get("special_value")) if finite_number(value.get("special_value")) else None,"special_meaning":str(value.get("special_meaning","uncertain")),"reset_meaning":str(value.get("reset_meaning","uncertain")),"unit":str(value.get("unit","")),"enabled":1,"last_text":str(value.get("recognized_text",value.get("last_text","")))[:256],"last_value":safe_float(value.get("last_value")) if finite_number(value.get("last_value")) else None,"last_confidence":safe_float(value.get("confidence",0.0),0.0,0.0,1.0),"stable_frames":safe_int(value.get("stable_frames",0),0,0,1000)}
+    checksum=hashlib.sha256(canonical_bytes(row)).hexdigest()
+    with self.lock,self.db:
+        self.db.execute("INSERT OR REPLACE INTO ocr_regions(id,game_id,created,updated,region_norm,region_type,number_format,goal_relation,target_min,target_max,special_value,special_meaning,reset_meaning,unit,enabled,last_text,last_value,last_confidence,stable_frames,checksum) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(row["id"],row["game_id"],row["created"],row["updated"],json.dumps(norm,separators=(",",":")),row["region_type"],row["number_format"],row["goal_relation"],row["target_min"],row["target_max"],row["special_value"],row["special_meaning"],row["reset_meaning"],row["unit"],row["enabled"],row["last_text"],row["last_value"],row["last_confidence"],row["stable_frames"],checksum))
+        self.db.execute("UPDATE games SET needs_review=1 WHERE id=?",(str(gid),))
+    row["checksum"]=checksum
+    return row
+DataStore.save_ocr_region=_save_ocr_region
+def _list_ocr_regions(self,gid,enabled_only=True):
+    query="SELECT * FROM ocr_regions WHERE game_id=?"+(" AND enabled=1" if enabled_only else "")+" ORDER BY updated DESC"
+    with self.lock:
+        rows=self.db.execute(query,(str(gid),)).fetchall()
+    result=[]
+    for row in rows:
+        try:
+            item=dict(row)
+            item["region_norm"]=json.loads(item["region_norm"])
+            verification={key:item[key] for key in ("id","game_id","created","updated","region_norm","region_type","number_format","goal_relation","target_min","target_max","special_value","special_meaning","reset_meaning","unit","enabled","last_text","last_value","last_confidence","stable_frames")}
+            if hashlib.sha256(canonical_bytes(verification)).hexdigest()!=str(item.get("checksum","")):
+                continue
+            result.append(item)
+        except Exception:
+            continue
+    return result
+DataStore.list_ocr_regions=_list_ocr_regions
+def _delete_ocr_region_by_overlap(self,gid,norm):
+    removed=0
+    with self.lock,self.db:
+        rows=self.db.execute("SELECT id,region_norm FROM ocr_regions WHERE game_id=?",(str(gid),)).fetchall()
+        ids=[]
+        for row in rows:
+            try:
+                if _rect_iou(json.loads(row["region_norm"]),norm)>=0.45:
+                    ids.append(str(row["id"]))
+            except Exception:
+                pass
+        for region_id in ids:
+            removed+=max(0,int(self.db.execute("DELETE FROM ocr_regions WHERE id=?",(region_id,)).rowcount or 0))
+        if removed:
+            self.db.execute("UPDATE games SET needs_review=1 WHERE id=?",(str(gid),))
+    return removed
+DataStore.delete_ocr_region_by_overlap=_delete_ocr_region_by_overlap
+def _append_ocr_observation(self,gid,region_id,raw_text,parsed,confidence,stable_frames,event):
+    value={"game_id":str(gid),"region_id":str(region_id),"created":time.time(),"raw_text":str(raw_text)[:256],"parsed":parsed if isinstance(parsed,dict) else {},"confidence":safe_float(confidence,0.0,0.0,1.0),"stable_frames":safe_int(stable_frames,0,0,1000),"semantic_event":event if isinstance(event,dict) else {}}
+    checksum=hashlib.sha256(canonical_bytes(value)).hexdigest()
+    with self.lock,self.db:
+        self.db.execute("INSERT INTO ocr_observations(game_id,region_id,created,raw_text,parsed,confidence,stable_frames,semantic_event,checksum) VALUES(?,?,?,?,?,?,?,?,?)",(value["game_id"],value["region_id"],value["created"],value["raw_text"],json.dumps(value["parsed"],ensure_ascii=False,sort_keys=True,separators=(",",":")),value["confidence"],value["stable_frames"],json.dumps(value["semantic_event"],ensure_ascii=False,sort_keys=True,separators=(",",":")),checksum))
+        self.db.execute("DELETE FROM ocr_observations WHERE id IN (SELECT id FROM ocr_observations WHERE game_id=? ORDER BY created DESC LIMIT -1 OFFSET 20000)",(str(gid),))
+    return True
+DataStore.append_ocr_observation=_append_ocr_observation
+def _record_vision_model(self,gid,manifest):
+    value=dict(manifest) if isinstance(manifest,dict) else {}
+    metadata=json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(",",":"))
+    with self.lock,self.db:
+        self.db.execute("INSERT OR REPLACE INTO vision_models(game_id,architecture_version,updated,relative_path,checksum,trained_steps,device,metadata) VALUES(?,?,?,?,?,?,?,?)",(str(gid),safe_int(value.get("architecture_version"),0),time.time(),str(value.get("relative_path","")),str(value.get("checksum","")),safe_int(value.get("trained_steps"),0),str(value.get("device","")),metadata))
+    return True
+DataStore.record_vision_model=_record_vision_model
+def _reencode_samples(self,gid,runtime,stop_event=None,progress=None):
+    self.sample_write_barrier()
+    with self.lock:
+        rows=self.db.execute("SELECT id,thumbnail,action,context FROM samples WHERE game_id=? ORDER BY created,id",(str(gid),)).fetchall()
+    prepared=[]
+    manifest=runtime.manifest()
+    total=len(rows)
+    for index,row in enumerate(rows):
+        if stop_event is not None and stop_event.is_set():
+            raise InputStopped("样本AI特征升级已停止")
+        if row["thumbnail"] is None:
+            continue
+        try:
+            gray=bounded_decompress(row["thumbnail"],PIXELS*2)
+            feature=runtime.encode_gray(gray)
+            action=json.loads(row["action"])
+            context=json.loads(row["context"])
+            context["vision_architecture_version"]=VISION_ARCHITECTURE_VERSION
+            context["vision_model_checksum"]=manifest.get("checksum","")
+            fingerprint=self._sample_fingerprint(feature,action,context)
+            prepared.append((int(row["id"]),feature,coarse_feature(feature),json.dumps(context,ensure_ascii=False,separators=(",",":")),fingerprint))
+        except Exception as error:
+            self.logger.write("VISION_REENCODE_SAMPLE_FAILED",error,game_id=gid,details={"sample_id":int(row["id"])})
+        if progress is not None and index%8==0:
+            progress(35.0+25.0*(index+1)/max(1,total))
+    unique={}
+    for item in reversed(prepared):
+        unique.setdefault(item[4],item)
+    keep={item[0] for item in unique.values()}
+    all_ids={int(row["id"]) for row in rows}
+    with self.critical_transaction():
+        for sample_id in sorted(all_ids-keep):
+            self.db.execute("DELETE FROM samples WHERE id=?",(sample_id,))
+        for sample_id,feature,coarse,context,fingerprint in unique.values():
+            self.db.execute("UPDATE samples SET feature_algorithm_version=?,feature=?,coarse=?,context=?,fingerprint=? WHERE id=?",(FEATURE_ALGORITHM_VERSION,sqlite3.Binary(zlib.compress(feature,6)),sqlite3.Binary(coarse),context,fingerprint,sample_id))
+        self.db.execute("UPDATE games SET needs_review=1 WHERE id=?",(str(gid),))
+    self.model_cache.pop(str(gid),None)
+    return {"updated":len(unique),"removed":len(all_ids-keep),"manifest":manifest}
+DataStore.reencode_samples=_reencode_samples
+_original_bridge_feature_from_rgb=WinBridge.feature_from_rgb
+def _ai_feature_from_rgb(self,rgb,previous_rgb=None):
+    runtime=getattr(self,"ai_runtime",None)
+    if runtime is not None and runtime.ready and runtime.active_game:
+        return runtime.encode(rgb,previous_rgb)
+    return _original_bridge_feature_from_rgb(self,rgb,previous_rgb)
+WinBridge.feature_from_rgb=_ai_feature_from_rgb
+_original_mode_start_frames=ModeSession.start_frames
+def _enhanced_start_frames(self,hz,seconds,motion_interval,purpose):
+    buffer=_original_mode_start_frames(self,hz,seconds,motion_interval,purpose)
+    try:
+        game=self.app.require_game()
+        if getattr(self.app,"ocr_runtime",None) is not None and self.app.ocr_runtime.ready and self.app.store.list_ocr_regions(game["id"],True):
+            monitor=OCRMonitor(self.app,buffer,purpose).start()
+            self.add_resource("OCRMonitor",monitor)
+            self.app.active_ocr_monitor=monitor
+    except Exception as error:
+        self.app.store.log_error("OCR_MONITOR_START_FAILED",error,mode=self.app.mode)
+    return buffer
+ModeSession.start_frames=_enhanced_start_frames
+_original_task_policy_init=TaskAgentPolicy.__init__
+def _enhanced_task_policy_init(self,profile):
+    _original_task_policy_init(self,profile)
+    self.game_id=str(profile.get("game_id","")) if isinstance(profile,dict) else ""
+TaskAgentPolicy.__init__=_enhanced_task_policy_init
+_original_task_policy_classify=TaskAgentPolicy.classify
+def _semantic_task_policy_classify(self,feature):
+    state,reward=_original_task_policy_classify(self,feature)
+    if state!="neutral":
+        return state,reward
+    event=SEMANTIC_EVENT_HUB.latest(self.game_id or None,1.5)
+    if not event:
+        return state,reward
+    if event.get("terminal")=="success":
+        return "success",1.0
+    if event.get("terminal")=="failure":
+        return "failure",-1.0
+    semantic_reward=max(-0.25,min(0.25,safe_float(event.get("progress"),0.0)*0.25))
+    return "neutral",semantic_reward
+TaskAgentPolicy.classify=_semantic_task_policy_classify
+_original_load_game_profile=DataStore.load_game_profile
+def _enhanced_load_game_profile(self,gid):
+    profile=_original_load_game_profile(self,gid)
+    profile["game_id"]=str(gid)
+    return profile
+DataStore.load_game_profile=_enhanced_load_game_profile
+_original_save_model=DataStore.save_model
+def _enhanced_save_model(self,gid,model,complete=True):
+    value=dict(model) if isinstance(model,dict) else {}
+    runtime=CURRENT_VISION_RUNTIME
+    if runtime is not None and runtime.ready:
+        try:
+            runtime.activate_game(gid)
+            manifest=runtime.manifest()
+            value["vision_model_manifest"]=manifest
+            self.record_vision_model(gid,manifest)
+        except Exception as error:
+            self.logger.write("VISION_MODEL_BIND_FAILED",error,game_id=gid)
+    value["ocr_semantic_version"]=OCR_SEMANTIC_VERSION
+    value["ocr_regions_checksum"]=hashlib.sha256(canonical_bytes([{key:item.get(key) for key in ("id","region_norm","region_type","number_format","goal_relation","target_min","target_max","special_value","special_meaning","reset_meaning","checksum")} for item in self.list_ocr_regions(gid,True)])).hexdigest()
+    return _original_save_model(self,gid,value,complete)
+DataStore.save_model=_enhanced_save_model
+_original_validate_model_binding=App.validate_model_binding
+def _enhanced_validate_model_binding(self,model,target):
+    result=_original_validate_model_binding(self,model,target)
+    if not hasattr(self,"vision_runtime") or not hasattr(self,"ocr_runtime"):
+        return result
+    self.require_ai_runtime()
+    manifest=self.vision_runtime.manifest()
+    stored=model.get("vision_model_manifest") if isinstance(model,dict) else None
+    if not isinstance(stored,dict) or str(stored.get("checksum",""))!=str(manifest.get("checksum","")) or safe_int(stored.get("architecture_version"),0)!=VISION_ARCHITECTURE_VERSION:
+        raise RuntimeError("离线AI视觉模型版本或权重已变化，请重新复习")
+    current_ocr=hashlib.sha256(canonical_bytes([{key:item.get(key) for key in ("id","region_norm","region_type","number_format","goal_relation","target_min","target_max","special_value","special_meaning","reset_meaning","checksum")} for item in self.store.list_ocr_regions(self.require_game()["id"],True)])).hexdigest()
+    if str(model.get("ocr_regions_checksum",""))!=current_ocr or safe_int(model.get("ocr_semantic_version",0),0)!=OCR_SEMANTIC_VERSION:
+        raise RuntimeError("OCR区域或数字语义已变化，请重新复习")
+    return result
+App.validate_model_binding=_enhanced_validate_model_binding
+_original_app_init=App.__init__
+def _enhanced_app_init(self,root):
+    global CURRENT_VISION_RUNTIME,CURRENT_OCR_RUNTIME
+    _original_app_init(self,root)
+    self.data_directory=Path(self.store.base)
+    self.runtime_installer=RuntimeInstaller(self.data_directory)
+    self.vision_runtime=OfflineVisionRuntime(self.data_directory)
+    CURRENT_VISION_RUNTIME=self.vision_runtime
+    self.ocr_runtime=OfflineOCRRuntime(self.data_directory)
+    CURRENT_OCR_RUNTIME=self.ocr_runtime
+    self.api.ai_runtime=self.vision_runtime
+    self.active_ocr_monitor=None
+    if self.selected_game and self.vision_runtime.ready:
+        try:
+            self.vision_runtime.activate_game(self.selected_game["id"])
+        except Exception as error:
+            self.store.log_error("VISION_ACTIVATE_STARTUP_FAILED",error,game_id=self.selected_game.get("id",""))
+    self._update_runtime_status()
+App.__init__=_enhanced_app_init
+_original_app_build=App._build
+def _enhanced_app_build(self):
+    _original_app_build(self)
+    outer=self.root.winfo_children()[0] if self.root.winfo_children() else None
+    if outer is None:
+        return
+    children=outer.winfo_children()
+    before=children[1] if len(children)>1 else None
+    setup=ttk.LabelFrame(outer,text="数据与离线AI运行库",padding=10)
+    if before is not None:
+        setup.pack(fill="x",pady=(0,12),before=before)
+    else:
+        setup.pack(fill="x",pady=(0,12))
+    self.data_dir_text=tk.StringVar(value=str(getattr(self.store,"base","")))
+    ttk.Label(setup,textvariable=self.data_dir_text,wraplength=790).pack(anchor="w",fill="x")
+    buttons=ttk.Frame(setup)
+    buttons.pack(fill="x",pady=(8,0))
+    choose=ttk.Button(buttons,text="选择数据目录",command=self.choose_data_directory)
+    download=ttk.Button(buttons,text="下载",command=self.start_download)
+    choose.pack(side="left",fill="x",expand=True,ipady=6)
+    download.pack(side="left",fill="x",expand=True,padx=(8,0),ipady=6)
+    self.control_buttons["选择数据目录"]=choose
+    self.control_buttons["下载"]=download
+    self.controls.extend([choose,download])
+App._build=_enhanced_app_build
+def _update_runtime_status(self):
+    vision=getattr(self,"vision_runtime",None)
+    ocr=getattr(self,"ocr_runtime",None)
+    if vision is None:
+        return
+    if vision.ready and ocr is not None and ocr.ready:
+        manifest=vision.manifest() if vision.active_game else {"device":vision.device_name,"trained_steps":0}
+        self.set_confidence("AI视觉："+str(manifest.get("device",vision.device_name))+"，训练步数"+str(manifest.get("trained_steps",0))+"；OCR：离线可用")
+    else:
+        self.set_confidence("离线AI运行库未就绪，请点击“下载”；视觉="+str(vision.error)+"；OCR="+str(getattr(ocr,"error","未初始化")))
+App._update_runtime_status=_update_runtime_status
+def _require_ai_runtime(self):
+    self.vision_runtime.require_ready()
+    self.ocr_runtime.require_ready()
+    game=self.require_game()
+    manifest=self.vision_runtime.activate_game(game["id"])
+    self.api.ai_runtime=self.vision_runtime
+    self.store.record_vision_model(game["id"],manifest)
+    self._update_runtime_status()
+    return manifest
+App.require_ai_runtime=_require_ai_runtime
+_original_require_game=App.require_game
+def _enhanced_require_game(self):
+    game=_original_require_game(self)
+    runtime=getattr(self,"vision_runtime",None)
+    if runtime is not None and runtime.ready:
+        runtime.activate_game(game["id"])
+    return game
+App.require_game=_enhanced_require_game
+def _choose_data_directory(self):
+    from tkinter import filedialog
+    if self.mode_state!=MODE_IDLE:
+        self.show_error("运行模式期间不能切换数据目录")
+        return
+    value=filedialog.askdirectory(parent=self.root,title="选择通用游戏AI数据目录",mustexist=False,initialdir=str(self.store.base))
+    if not value:
+        return
+    try:
+        base=configure_data_directory(value)
+        if Path(self.store.base).resolve()==base:
+            self.status.set("数据目录未改变")
+            return
+        old=self.store
+        old.close(5.0)
+        self.store=DataStore(base)
+        self.store.set_writer_error_callback(self._writer_status_changed)
+        self.selected_game=self.store.selected_game()
+        self.selected_window=None
+        self.window_recommendation=self.store.load_window_descriptor()
+        self.storage_fault=bool(self.store.read_only)
+        self.data_directory=base
+        self.runtime_installer=RuntimeInstaller(base)
+        self.vision_runtime=OfflineVisionRuntime(base)
+        self.ocr_runtime=OfflineOCRRuntime(base)
+        global CURRENT_VISION_RUNTIME,CURRENT_OCR_RUNTIME
+        CURRENT_VISION_RUNTIME=self.vision_runtime
+        CURRENT_OCR_RUNTIME=self.ocr_runtime
+        self.api.ai_runtime=self.vision_runtime
+        self.data_dir_text.set(str(base))
+        self._refresh_all()
+        self._update_runtime_status()
+        self.show_info("数据目录","已切换到："+str(base)+"。所有后续数据库、模型、依赖、缓存、日志和临时文件均使用该目录。")
+    except Exception as error:
+        self.show_error("切换数据目录失败："+str(error))
+App.choose_data_directory=_choose_data_directory
+def _start_download(self):
+    if self.mode_state!=MODE_IDLE or self.closing:
+        self.show_error("当前已有操作正在运行，请先停止")
+        return
+    try:
+        stop_event=self.lifecycle.begin("下载")
+    except Exception as error:
+        self.show_error(str(error))
+        return
+    self.mode="下载"
+    self.mode_state=MODE_STARTING
+    self.stop_event=stop_event
+    self.pending_mode_result=None
+    self.pending_mode_error=None
+    self.mode_shutdown_deadline=None
+    self.mode_shutdown_forced=[]
+    self.mode_stop_started=False
+    self.mode_shutdown_polling=False
+    self.api.block_input()
+    self.set_input_status("已锁定")
+    self.set_controls(True)
+    self.progress_value.set(0)
+    self.status.set("正在把依赖与模型运行库下载到所选数据目录；按ESC或点击“停止”可中止")
+    self.mode_thread=threading.Thread(target=self.worker_entry,args=("下载",self.download_worker),name="UniversalGameAI-下载",daemon=True)
+    self.mode_thread.start()
+App.start_download=_start_download
+def _download_worker(self):
+    self.lifecycle.mark_running()
+    self.mode_state=MODE_RUNNING
+    def line(value):
+        if value:
+            self.set_status("下载中："+value[-180:])
+    marker=self.runtime_installer.run(self.stop_event,self.set_progress,line)
+    global CURRENT_VISION_RUNTIME,CURRENT_OCR_RUNTIME
+    self.vision_runtime=OfflineVisionRuntime(self.data_directory)
+    self.ocr_runtime=OfflineOCRRuntime(self.data_directory)
+    self.ocr_runtime.require_ready()
+    try:
+        warmup=self.ocr_runtime.np.zeros((48,192,3),dtype=self.ocr_runtime.np.uint8)
+        with self.ocr_runtime.lock:
+            self.ocr_runtime.engine(warmup)
+    except Exception as error:
+        raise RuntimeError("OCR离线模型初始化失败："+str(error))
+    CURRENT_VISION_RUNTIME=self.vision_runtime
+    CURRENT_OCR_RUNTIME=self.ocr_runtime
+    self.api.ai_runtime=self.vision_runtime
+    if self.selected_game:
+        manifest=self.vision_runtime.activate_game(self.selected_game["id"])
+        self.store.record_vision_model(self.selected_game["id"],manifest)
+    self.ui(self._update_runtime_status)
+    return ModeResult("completed","下载完成；AI视觉模型将在本机离线生成和训练，OCR已可离线运行",{"runtime":marker})
+App.download_worker=_download_worker
+_original_request_mode_stop=App.request_mode_stop
+def _enhanced_request_mode_stop(self,status="stopped",reason=""):
+    result=_original_request_mode_stop(self,status,reason)
+    if self.mode=="下载" and getattr(self,"runtime_installer",None) is not None:
+        try:
+            self.runtime_installer.stop()
+        except Exception:
+            pass
+    return result
+App.request_mode_stop=_enhanced_request_mode_stop
+_original_review_run=ReviewController.run
+def _enhanced_review_run(self):
+    app=self.app
+    app.require_ai_runtime()
+    game=app.require_game()
+    app.store.sample_write_barrier()
+    with app.store.lock:
+        rows=app.store.db.execute("SELECT thumbnail FROM samples WHERE game_id=? AND thumbnail IS NOT NULL ORDER BY created",(str(game["id"]),)).fetchall()
+    grays=[]
+    for row in rows:
+        try:
+            grays.append(bounded_decompress(row["thumbnail"],PIXELS*2))
+        except Exception:
+            pass
+    app.set_status("复习阶段：正在GPU离线训练神经视觉编码器")
+    manifest=app.vision_runtime.train(game["id"],grays,app.stop_event,app.set_progress)
+    app.store.record_vision_model(game["id"],manifest)
+    app.set_status("复习阶段：正在用新AI视觉模型升级全部样本特征")
+    app.store.reencode_samples(game["id"],app.vision_runtime,app.stop_event,app.set_progress)
+    return _original_review_run(self)
+ReviewController.run=_enhanced_review_run
+def _open_ocr_teaching_dialog(self,parent,game,buffer,frame,on_close=None):
+    self.require_ai_runtime()
+    return OCRTeachingDialog(self,parent,game,buffer,frame,on_close)
+App.open_ocr_teaching_dialog=_open_ocr_teaching_dialog
+_original_start_learning=App.start_learning
+def _enhanced_start_learning(self):
+    try:
+        self.require_ai_runtime()
+    except Exception as error:
+        self.show_error(str(error))
+        return
+    return _original_start_learning(self)
+App.start_learning=_enhanced_start_learning
+_original_start_review=App.start_review
+def _enhanced_start_review(self):
+    try:
+        self.require_ai_runtime()
+    except Exception as error:
+        self.show_error(str(error))
+        return
+    return _original_start_review(self)
+App.start_review=_enhanced_start_review
+_original_start_training=App.start_training
+def _enhanced_start_training(self):
+    try:
+        self.require_ai_runtime()
+    except Exception as error:
+        self.show_error(str(error))
+        return
+    return _original_start_training(self)
+App.start_training=_enhanced_start_training
+_original_start_ask=App.start_ask
+def _enhanced_start_ask(self):
+    try:
+        self.require_ai_runtime()
+    except Exception as error:
+        self.show_error(str(error))
+        return
+    return _original_start_ask(self)
+App.start_ask=_enhanced_start_ask
+def ocr_can_authorize_action(text,action):
+    return False
 def main():
     multiprocessing.freeze_support()
     if "--self-test" in sys.argv:
@@ -9620,9 +11066,16 @@ def main():
     if "--acceptance-test" in sys.argv:
         raise SystemExit(run_acceptance_test())
     enable_dpi_awareness()
+    root=tk.Tk()
+    selected=startup_select_data_directory(root)
+    if selected is None:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        return
     holder={"app":None}
     install_global_hooks(holder)
-    root=tk.Tk()
     try:
         holder["app"]=App(root)
     except Exception:
