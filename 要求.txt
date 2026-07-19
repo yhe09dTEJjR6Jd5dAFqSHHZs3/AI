@@ -1,4 +1,6 @@
-在已安装Python的Windows 11 x64操作系统上实现通用游戏AI。
+实现通用游戏AI。
+
+操作系统：Windows 11 x64（已安装Python）
 
 在一开始，只有main.py（无注释或具有注释功能的文本）
 
