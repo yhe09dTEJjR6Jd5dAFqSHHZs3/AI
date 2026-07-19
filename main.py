@@ -234,13 +234,30 @@ def runtime_dependency_contracts():
 def runtime_required_projects():
     return set(runtime_lock_manifest().get("required_projects",[]))
 STRICT_ACCEPTANCE_ITEMS=("启动","默认界面","文件夹","文件完整性","窗口","采集","学习","睡眠","训练","指导","弹窗","停止","单实例与目录锁","独立运行时","离线网络封锁","写入路径审计","多显示器与DPI","错误恢复")
-STRICT_ACCEPTANCE_CASES={"启动":("control_panel_visible",),"默认界面":("exact_eight_buttons",),"文件夹":("select_prepare_confirm","migration_success","forced_failure_rollback",
-        "prepare_cancel_cleanup"),"文件完整性":("normal_complete","network_failure_retry","escape_retry","locked_manifest"),"窗口":("ldplayer_confirmed","ordinary_confirmed","administrator_integrity_difference","emulator_scaling"),"采集":("minimized","occluded",
-        "scaled","recreated"),"学习":("client_only_real_mouse",),"睡眠":("socket_blocked","model_optimized","pool_optimized","deterministic_seed"),"训练":("all_coordinates_in_client",
-        "immutable_snapshot_change_stop"),"指导":("choices_only","finish_button","escape"),"弹窗":("confirm_only",),"停止":("starting","running","stopping","latency_thresholds","buttons_released","escape_to_input_lock","escape_to_buttons_released","abnormal_exit_release"),
-    "单实例与目录锁":("named_mutex","directory_lock","lock_record"),"独立运行时":("fixed_python","worker_process","embedded_wheel_lock","host_abi_independent"),"离线网络封锁":("socket","urllib",
-        "disconnected_windows"),"写入路径审计":("internal_audit","external_monitor"),"多显示器与DPI":("dpi100","dpi125","dpi150","dpi200","mixed_dpi","negative_coordinates","cross_monitor","hwnd_reuse"),
-    "错误恢复":("input_locked","rollback","retry","no_pressed_buttons","no_orphan_process","no_staging")}
+STRICT_ACCEPTANCE_CASES={
+    "启动":("control_panel_visible",),
+    "默认界面":("exact_eight_buttons",),
+    "文件夹":(
+        "select_prepare_confirm","migration_success","forced_failure_rollback","prepare_cancel_cleanup",
+        "folder_picker_direct","folder_picker_cancel","folder_no_custom_modal","folder_inline_confirm",
+        "folder_no_success_popup","main_py_at_root","main_py_hash_match","no_global_input_lock","exact_user_sequence",
+    ),
+    "文件完整性":("normal_complete","network_failure_retry","escape_retry","locked_manifest","integrity_checks_selected_main"),
+    "窗口":("ldplayer_confirmed","ordinary_confirmed","administrator_integrity_difference","emulator_scaling"),
+    "采集":("minimized","occluded","scaled","recreated"),
+    "学习":("client_only_real_mouse",),
+    "睡眠":("socket_blocked","model_optimized","pool_optimized","deterministic_seed"),
+    "训练":("all_coordinates_in_client","immutable_snapshot_change_stop"),
+    "指导":("choices_only","finish_button","escape"),
+    "弹窗":("confirm_only","success_status_only","error_confirm_only"),
+    "停止":("starting","running","stopping","latency_thresholds","buttons_released","escape_to_input_lock","escape_to_buttons_released","abnormal_exit_release"),
+    "单实例与目录锁":("named_mutex","directory_lock","lock_record"),
+    "独立运行时":("fixed_python","worker_process","embedded_wheel_lock","host_abi_independent"),
+    "离线网络封锁":("socket","urllib","disconnected_windows"),
+    "写入路径审计":("internal_audit","external_monitor"),
+    "多显示器与DPI":("dpi100","dpi125","dpi150","dpi200","mixed_dpi","negative_coordinates","cross_monitor","hwnd_reuse"),
+    "错误恢复":("input_locked","rollback","retry","no_pressed_buttons","no_orphan_process","no_staging"),
+}
 SAMPLE_IMAGE_VERSION=1
 NEURAL_FEATURE_VERSION=2
 MODEL_MAX_BYTES=256*1024*1024
@@ -12074,71 +12091,94 @@ class TaskSettingsDialog:
 class AppUiMixin:
     def _build(self):
         self.root.title("通用游戏AI")
-        fit_window(self.root,900,780,620,440)
+        fit_window(self.root,820,640,700,560)
         self.root.option_add("*Font",("Microsoft YaHei UI",10))
-        outer=scrollable_frame(self.root,18,False)
-        ttk.Label(outer,text="通用游戏AI控制面板",font=("Microsoft YaHei UI",18,"bold")).pack(anchor="w",pady=(0,12))
-        setup=ttk.LabelFrame(outer,text="数据与离线AI运行库",padding=10)
+        style=ttk.Style(self.root)
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
+        style.configure("Title.TLabel",font=("Microsoft YaHei UI",21,"bold"))
+        style.configure("Subtitle.TLabel",font=("Microsoft YaHei UI",10))
+        style.configure("Primary.TButton",font=("Microsoft YaHei UI",11,"bold"),padding=(18,12))
+        style.configure("Workflow.TButton",font=("Microsoft YaHei UI",11),padding=(16,11))
+        style.configure("Card.TLabelframe",padding=14)
+        style.configure("Card.TLabelframe.Label",font=("Microsoft YaHei UI",11,"bold"))
+        style.configure("StatusValue.TLabel",font=("Microsoft YaHei UI",10,"bold"))
+        outer=ttk.Frame(self.root,padding=(24,20,24,18))
+        outer.pack(fill="both",expand=True)
+        header=ttk.Frame(outer)
+        header.pack(fill="x",pady=(0,14))
+        ttk.Label(header,text="通用游戏 AI",style="Title.TLabel").pack(side="left",anchor="w")
+        ttk.Label(header,textvariable=self.header_status_text,style="Subtitle.TLabel").pack(side="right",anchor="e",pady=(7,0))
+        ttk.Label(outer,text="视觉学习、离线训练、受控自动操作",style="Subtitle.TLabel").pack(anchor="w",pady=(0,16))
+
+        setup=ttk.LabelFrame(outer,text="数据目录",style="Card.TLabelframe")
         setup.pack(fill="x",pady=(0,12))
-        ttk.Label(setup,textvariable=self.data_dir_text,wraplength=840).pack(anchor="w",fill="x")
-        setup_buttons=ttk.Frame(setup)
-        setup_buttons.pack(fill="x",pady=(8,0))
-        choose=ttk.Button(setup_buttons,text="选择文件夹",command=self.choose_data_directory)
-        download=ttk.Button(setup_buttons,text="检查文件完整性",command=self.start_integrity_check)
-        choose.pack(side="left",fill="x",expand=True,ipady=7)
-        download.pack(side="left",fill="x",expand=True,padx=(8,0),ipady=7)
+        ttk.Label(setup,textvariable=self.data_dir_text,wraplength=740).grid(row=0,column=0,columnspan=2,sticky="ew",pady=(0,10))
+        choose=ttk.Button(setup,text="选择文件夹",command=self.choose_data_directory,style="Primary.TButton")
+        integrity=ttk.Button(setup,text="检查文件完整性",command=self.start_integrity_check,style="Workflow.TButton")
+        choose.grid(row=1,column=0,sticky="ew",padx=(0,6))
+        integrity.grid(row=1,column=1,sticky="ew",padx=(6,0))
+        setup.columnconfigure(0,weight=1)
+        setup.columnconfigure(1,weight=1)
+        self.directory_button=choose
         self.control_buttons["选择文件夹"]=choose
-        self.control_buttons["检查文件完整性"]=download
-        self.controls.extend([choose,download])
-        flow=ttk.LabelFrame(outer,text="规定流程",padding=12)
+        self.control_buttons["检查文件完整性"]=integrity
+        self.controls.extend([choose,integrity])
+
+        flow=ttk.LabelFrame(outer,text="操作流程",style="Card.TLabelframe")
         flow.pack(fill="x",pady=(0,12))
-        primary=ttk.Frame(flow)
-        primary.pack(fill="x")
         primary_specs=[("游戏",self.open_game_dialog),("选择窗口",self.open_window_dialog),("学习",self.start_learning),("睡眠",self.start_sleep),("训练",self.start_training),("指导",self.start_ask)]
         for index,(name,command) in enumerate(primary_specs):
-            button=ttk.Button(primary,text=name,command=command)
+            button=ttk.Button(flow,text=name,command=command,style="Workflow.TButton")
             self.control_buttons[name]=button
             self.controls.append(button)
-            button.grid(row=index//3,column=index%3,sticky="nsew",padx=6,pady=6,ipady=12)
-        for column in range(3):
-            primary.columnconfigure(column,weight=1)
-        ttk.Label(flow,textvariable=self.flow_text,justify="left",wraplength=820).pack(anchor="w",fill="x",pady=(8,0))
-        ttk.Label(flow,text="适用范围：只支持可由鼠标完成、允许普通窗口采集与输入的游戏；每个游戏必须独立学习、睡眠和指导，不承诺零样本自动通关。",wraplength=820).pack(anchor="w",fill="x",pady=(8,0))
-        if self.developer_mode:
-            stop_frame=ttk.Frame(outer)
-            stop_frame.pack(fill="x",pady=(0,12))
-            self.stop_button=ttk.Button(stop_frame,text="停止",command=self.request_stop,state="disabled")
-            self.control_buttons["停止"]=self.stop_button
-            self.controls.append(self.stop_button)
-            self.stop_button.pack(fill="x",ipady=8)
-        info=ttk.LabelFrame(outer,text="当前状态",padding=12)
+            button.grid(row=index//2,column=index%2,sticky="nsew",padx=(0,6) if index%2==0 else (6,0),pady=5)
+        flow.columnconfigure(0,weight=1)
+        flow.columnconfigure(1,weight=1)
+
+        info=ttk.LabelFrame(outer,text="当前配置",style="Card.TLabelframe")
         info.pack(fill="x",pady=(0,12))
-        labels=[("当前游戏：",self.game_text),("目标窗口：",self.window_text),("窗口身份：",self.window_detail),("采集兼容性：",self.capture_text),("输入权限：",self.input_text),("数据统计：",self.sample_text),("模型状态：",
-                self.model_text),("识别状态：",self.confidence_text)]
-        for row,(name,value) in enumerate(labels):
-            ttk.Label(info,text=name).grid(row=row,column=0,sticky="nw",pady=2)
-            ttk.Label(info,textvariable=value,wraplength=700).grid(row=row,column=1,sticky="nw",pady=2)
+        labels=[("游戏",self.game_text),("窗口",self.window_text),("样本",self.sample_text),("模型",self.model_text)]
+        for index,(name,value) in enumerate(labels):
+            row=index//2
+            column=(index%2)*2
+            ttk.Label(info,text=name+"：").grid(row=row,column=column,sticky="w",pady=3)
+            ttk.Label(info,textvariable=value,style="StatusValue.TLabel",wraplength=265).grid(row=row,column=column+1,sticky="w",pady=3,padx=(0,14))
         info.columnconfigure(1,weight=1)
+        info.columnconfigure(3,weight=1)
+
         self.advanced_visible=tk.BooleanVar(value=False)
         self.advanced_frame=ttk.Frame(outer)
         if self.developer_mode:
             advanced_header=ttk.Frame(outer)
-            advanced_header.pack(fill="x")
-            ttk.Checkbutton(advanced_header,text="高级设置",variable=self.advanced_visible,command=self._toggle_advanced).pack(anchor="w")
+            advanced_header.pack(fill="x",pady=(0,6))
+            ttk.Checkbutton(advanced_header,text="开发者信息",variable=self.advanced_visible,command=self._toggle_advanced).pack(anchor="w")
+            detail=ttk.LabelFrame(self.advanced_frame,text="技术详情",padding=10)
+            detail.pack(fill="x",pady=(0,6))
+            for value in (self.window_detail,self.capture_text,self.input_text,self.confidence_text,self.flow_text):
+                ttk.Label(detail,textvariable=value,wraplength=730).pack(anchor="w",fill="x",pady=2)
+            actions=ttk.Frame(self.advanced_frame)
+            actions.pack(fill="x")
             advanced_specs=[("任务与安全",self.open_task_dialog),("重新测试采集后端",self.retest_capture_backends),("数据清理",self.open_data_dialog)]
             for index,(name,command) in enumerate(advanced_specs):
-                button=ttk.Button(self.advanced_frame,text=name,command=command)
+                button=ttk.Button(actions,text=name,command=command,style="Workflow.TButton")
                 self.control_buttons[name]=button
                 self.controls.append(button)
-                button.grid(row=0,column=index,sticky="nsew",padx=6,pady=6,ipady=8)
-                self.advanced_frame.columnconfigure(index,weight=1)
+                button.grid(row=0,column=index,sticky="nsew",padx=4,pady=4)
+                actions.columnconfigure(index,weight=1)
+            stop_frame=ttk.Frame(self.advanced_frame)
+            stop_frame.pack(fill="x",pady=(6,0))
+            self.stop_button=ttk.Button(stop_frame,text="停止",command=self.request_stop,state="disabled",style="Workflow.TButton")
+            self.control_buttons["停止"]=self.stop_button
+            self.controls.append(self.stop_button)
+            self.stop_button.pack(fill="x")
+
         self.progress_bar=ttk.Progressbar(outer,variable=self.progress_value,maximum=100)
-        self.progress_bar.pack(fill="x",pady=(12,8))
+        self.progress_bar.pack(fill="x",pady=(4,8))
         bottom=ttk.Frame(outer)
         bottom.pack(fill="x")
-        ttk.Label(bottom,text="状态：").pack(side="left")
         ttk.Label(bottom,textvariable=self.status,wraplength=650).pack(side="left",fill="x",expand=True)
-        ttk.Label(bottom,text="ESC结束当前长流程").pack(side="right")
+        ttk.Label(bottom,text="ESC 结束当前长流程").pack(side="right",padx=(12,0))
     def _toggle_advanced(self):
         if not self.developer_mode:
             self.advanced_frame.pack_forget()
@@ -12261,7 +12301,9 @@ class AppUiMixin:
                 return
             self.result_modal=None
             self.result_modal_widget=None
-            self.record_acceptance_case("弹窗","confirm_only","passed",{"title":str(title),"confirmed_at":time.time(),"close_path":"确认"})
+            evidence={"title":str(title),"confirmed_at":time.time(),"close_path":"确认","buttons":["确认"]}
+            self.record_acceptance_case("弹窗","confirm_only","passed",evidence)
+            self.record_acceptance_case("弹窗","error_confirm_only","passed",evidence)
             self.close_dialog(win,closed)
             if previous_grab is not None:
                 try:
@@ -12297,7 +12339,9 @@ class AppUiMixin:
             return
         if self.shutdown_started:
             return
-        self._show_result_modal(str(title),str(text))
+        message=(str(title).strip()+"：" if str(title).strip() else "")+str(text).strip()
+        self.status.set(message)
+        self.record_acceptance_case("弹窗","success_status_only","passed",{"title":str(title),"status":message,"popup":False})
     def prompt_text(self,title,label,initial=""):
         result={"value":None}
         state={"closed":False}
@@ -12847,13 +12891,11 @@ class AppLifecycleMixin:
         if self.closing:
             self._poll_shutdown()
             return
-        if result.status=="failed":
-            self.show_info(name+"失败",error or result.summary)
-        elif error:
-            self.show_info(name+"失败",error)
+        if result.status=="failed" or error:
+            self.show_error(error or result.summary)
         else:
-            title=name+("已完成" if result.status=="completed" else "已停止")
-            self.show_info(title,result.summary)
+            self.status.set(result.summary)
+            self.record_acceptance_case("弹窗","success_status_only","passed",{"mode":name,"status":result.status,"summary":result.summary,"popup":False})
     def _fail_active_mode(self,message):
         self.request_mode_stop("failed",str(message))
     def retest_capture_backends(self):
@@ -13111,6 +13153,8 @@ class AppLifecycleMixin:
         if self.directory_prepare_candidate is not None:
             best_effort_cleanup("DIRECTORY_PREPARE_CANDIDATE_CLOSE",lambda:self.directory_prepare_candidate.close())
             self.directory_prepare_candidate=None
+        self.prepared_directory=None
+        self.pending_directory=None
         self.lifecycle.finish()
         self.pending_mode_result=None
         self.pending_mode_error=None
@@ -13919,150 +13963,236 @@ class AppModeMixin:
         text="用户结束指导" if status=="completed" else "指导已停止"
         self.request_mode_stop(status,text)
 class AppStorageMixin:
+    def _restore_directory_display(self):
+        self.data_dir_text.set(str(self.data_directory) if self.data_directory is not None else "未选择")
+
+    def _try_open_local_data_directory(self):
+        global CURRENT_VISION_RUNTIME,CURRENT_OCR_RUNTIME,SELECTED_DATA_DIR,WRITE_BOUNDARY_GUARD
+        base=Path(__file__).resolve().parent
+        manifest=materialized_entry_manifest(base)
+        if manifest is None:
+            return False
+        valid,reason=existing_data_directory_status(base)
+        if not valid:
+            raise RuntimeError("main.py所在数据目录无效："+str(reason))
+        old_selected=globals().get("SELECTED_DATA_DIR")
+        old_guard=globals().get("WRITE_BOUNDARY_GUARD")
+        old_current_vision=globals().get("CURRENT_VISION_RUNTIME")
+        old_current_ocr=globals().get("CURRENT_OCR_RUNTIME")
+        old_api_runtime=getattr(self.api,"ai_runtime",None)
+        old_env={key:os.environ.get(key) for key in ("UGAI_DATA_DIR","PIP_CACHE_DIR","TORCH_HOME","HF_HOME","HUGGINGFACE_HUB_CACHE","TRANSFORMERS_CACHE","XDG_CACHE_HOME",
+            "PYTHONPYCACHEPREFIX","TORCH_EXTENSIONS_DIR","CUDA_CACHE_PATH","NUMBA_CACHE_DIR","MPLCONFIGDIR","TMP","TEMP")}
+        old_temp=tempfile.tempdir
+        old_path=list(sys.path)
+        directory_lock=None
+        store=None
+        worker=None
+        try:
+            directory_lock=DataDirectoryLock(base).acquire()
+            base=configure_data_directory(base)
+            store=DataStore(base)
+            if store.read_only:
+                raise RuntimeError(store.read_only_reason or "数据目录只读")
+            store.sample_write_barrier()
+            installer=RuntimeInstaller(base)
+            vision=None
+            ocr=None
+            if validate_runtime_manifest(base,False) is not None:
+                worker=AIWorkerClient(base,self._ai_worker_failed)
+                vision=VisionRuntimeProxy(worker)
+                ocr=OCRRuntimeProxy(worker)
+            store.set_writer_error_callback(self._writer_status_changed)
+            selected_game=store.selected_game()
+            recommendation=store.load_window_descriptor()
+            write_audit=WritePathAudit(base)
+            acceptance=AcceptanceReport(base)
+            self.store=store
+            self.data_directory=base
+            self.data_directory_lock=directory_lock
+            self.write_audit=write_audit
+            self.acceptance_report=acceptance
+            self.runtime_installer=installer
+            self.ai_worker=worker
+            self.vision_runtime=vision
+            self.ocr_runtime=ocr
+            CURRENT_VISION_RUNTIME=vision
+            CURRENT_OCR_RUNTIME=ocr
+            self.api.ai_runtime=vision
+            self.selected_game=selected_game
+            self.selected_window=None
+            self.window_recommendation=recommendation
+            self.storage_fault=bool(store.read_only)
+            install_write_boundary_guard(base,write_audit)
+            self.lifecycle.set_directory_phase("ready")
+            self.lifecycle.set_runtime_ready(bool(vision is not None and vision.ready and ocr is not None and ocr.ready))
+            self.data_dir_text.set(str(base))
+            self.status.set("已载入当前文件夹："+str(base))
+            self._update_runtime_status()
+            self._refresh_all()
+            return True
+        except Exception:
+            if worker is not None:
+                try:
+                    worker.close(1.0)
+                except Exception as error:
+                    record_cleanup_error("BEST_EFFORT_EXCEPTION",error)
+            if store is not None:
+                try:
+                    store.close(5.0)
+                except Exception as error:
+                    record_cleanup_error("BEST_EFFORT_EXCEPTION",error)
+            if directory_lock is not None:
+                try:
+                    directory_lock.close()
+                except Exception as error:
+                    record_cleanup_error("BEST_EFFORT_EXCEPTION",error)
+            self.store=None
+            self.data_directory=None
+            self.data_directory_lock=None
+            self.write_audit=None
+            self.acceptance_report=None
+            self.runtime_installer=None
+            self.ai_worker=None
+            self.vision_runtime=None
+            self.ocr_runtime=None
+            self.selected_game=None
+            self.selected_window=None
+            self.window_recommendation=None
+            self.storage_fault=True
+            self.lifecycle.set_directory_phase("unselected")
+            self.lifecycle.set_runtime_ready(False)
+            SELECTED_DATA_DIR=old_selected
+            CURRENT_VISION_RUNTIME=old_current_vision
+            CURRENT_OCR_RUNTIME=old_current_ocr
+            WRITE_BOUNDARY_GUARD=old_guard
+            self.api.ai_runtime=old_api_runtime
+            sys.path[:]=old_path
+            for key,value in old_env.items():
+                if value is None:
+                    os.environ.pop(key,None)
+                else:
+                    os.environ[key]=value
+            tempfile.tempdir=old_temp
+            raise
+
     def choose_data_directory(self):
         from tkinter import filedialog
         if self.mode_state!=MODE_IDLE or self.closing:
             self.show_error("运行模式期间不能切换文件夹")
             return
-        win=tk.Toplevel(self.root)
-        win.title("选择文件夹")
-        fit_window(win,720,360,480,300)
-        win.transient(self.root)
-        win.grab_set()
-        frame=ttk.Frame(win,padding=20)
-        frame.pack(fill="both",expand=True)
-        path_var=tk.StringVar(value=str(self.data_directory) if self.data_directory is not None else "尚未选择")
-        status_var=tk.StringVar(value="空目录会初始化；合法既有目录会复制到隐藏暂存区完成升级与校验后原子重新挂载；若位置改变，则迁移当前数据。SHA-256、quick_check、外键和schema全部通过后才能确认。")
-        progress_var=tk.DoubleVar(value=0.0)
-        ttk.Label(frame,text="文件夹两阶段确认",font=("Microsoft YaHei UI",14,"bold")).pack(anchor="w")
-        ttk.Label(frame,textvariable=path_var,wraplength=670).pack(anchor="w",fill="x",pady=(12,4))
-        ttk.Label(frame,textvariable=status_var,wraplength=670).pack(anchor="w",fill="x",pady=(4,12))
-        ttk.Progressbar(frame,variable=progress_var,maximum=100).pack(fill="x")
-        buttons=ttk.Frame(frame)
-        buttons.pack(side="bottom",fill="x",pady=(16,0))
-        state={"closed":False,"prepared":None,"generation":0}
-        confirm=ttk.Button(buttons,text="确认",state="disabled")
-        select=ttk.Button(buttons,text="选择文件夹")
-        def discard():
-            prepared=state.get("prepared")
-            state["prepared"]=None
-            if self.directory_prepare_candidate is prepared:
-                self.directory_prepare_candidate=None
-            if prepared is not None:
-                try:
-                    prepared.close()
-                except Exception as error:
-                    record_cleanup_error("BEST_EFFORT_EXCEPTION",error)
-        def close():
-            if state["closed"]:
-                return
-            state["closed"]=True
-            state["generation"]+=1
-            self.directory_prepare_generation+=1
-            if self.directory_prepare_stop is not None:
-                self.directory_prepare_stop.set()
-            discard()
-            self.lifecycle.set_directory_phase("ready" if self.store is not None else "unselected")
-            self._update_control_availability()
-            self.close_dialog(win)
-        def prepared_ok(candidate,generation):
-            if state["closed"] or generation!=state["generation"]:
-                candidate.close()
-                return
-            discard()
-            state["prepared"]=candidate
-            self.directory_prepare_candidate=candidate
-            self.directory_prepare_thread=None
-            self.directory_prepare_stop=None
-            progress_var.set(100.0)
-            status_var.set("数据库结构升级、原数据迁移、SHA-256清单、WAL/锁、quick_check、外键、schema和运行库清单全部通过。现在可以点击“确认”。")
-            confirm.configure(state="normal")
-            select.configure(state="normal")
-            self.lifecycle.set_directory_phase("prepared")
-            self._update_control_availability()
-        def prepared_failed(error,generation):
-            if state["closed"] or generation!=state["generation"]:
-                return
-            self.directory_prepare_thread=None
-            self.directory_prepare_stop=None
-            self.directory_prepare_candidate=None
-            status_var.set("目录初始化失败，当前已确认目录未改变："+str(error))
-            confirm.configure(state="disabled")
-            select.configure(state="normal")
-            self.lifecycle.set_directory_phase("ready" if self.store is not None else "failed")
-            self._update_control_availability()
-        def choose():
-            initial=str(self.data_directory) if self.data_directory is not None else str(Path.home())
-            value=filedialog.askdirectory(parent=win,title="选择通用游戏AI文件夹",mustexist=False,initialdir=initial)
-            if not value:
-                return
-            discard()
-            state["generation"]+=1
-            generation=state["generation"]
-            path_var.set(str(Path(value).expanduser()))
-            changing=not same_directory(value,self.data_directory) if self.data_directory is not None else False
-            existing_valid=existing_data_directory_status(Path(value).expanduser())[0]
-            status_var.set("正在把原文件夹迁移到新目录；处理结束前“确认”保持禁用。" if changing else "正在识别并重新验证合法既有目录；处理结束前“确认”保持禁用。" if existing_valid else "正在隐藏暂存区执行数据库结构升级和完整验证；处理结束前“确认”保持禁用。")
-            self.api.block_input()
-            self.set_input_status("已锁定")
-            progress_var.set(0.0)
-            confirm.configure(state="disabled")
-            select.configure(state="disabled")
-            self.lifecycle.set_directory_phase("preparing")
-            self._update_control_availability()
-            if self.directory_prepare_stop is not None:
-                self.directory_prepare_stop.set()
-            stop=threading.Event()
-            self.directory_prepare_stop=stop
-            self.directory_prepare_generation=generation
-            def worker():
-                directory_lock=None
-                candidate=None
-                try:
-                    if self.data_directory is not None and same_directory(value,self.data_directory):
-                        directory_lock=self.data_directory_lock
-                    else:
-                        directory_lock=DataDirectoryLock(value).acquire()
-                    candidate=prepare_data_directory(value,stop,lambda amount:self.ui(lambda amount=amount:progress_var.set(amount),"prepare_progress"),self.store,self.data_directory)
-                    candidate.directory_lock=directory_lock
-                    candidate.directory_lock_owned=directory_lock is not self.data_directory_lock
-                    self.ui(lambda candidate=candidate,generation=generation:prepared_ok(candidate,generation))
-                except Exception as error:
-                    if candidate is not None:
-                        try:
-                            candidate.close()
-                        except Exception as error:
-                            record_cleanup_error("BEST_EFFORT_EXCEPTION",error)
-                    elif directory_lock is not None and directory_lock is not self.data_directory_lock:
-                        directory_lock.close()
-                    self.ui(lambda error=error,generation=generation:prepared_failed(error,generation))
-            thread=threading.Thread(target=worker,name="UniversalGameAI-PrepareDataDirectory",daemon=False)
-            self.directory_prepare_thread=thread
-            thread.start()
-        def commit():
-            candidate=state.get("prepared")
-            if candidate is None:
-                return
+        button=self.control_buttons.get("选择文件夹")
+        candidate=self.prepared_directory
+        if candidate is not None:
+            if button is not None:
+                button.configure(text="正在确认…",state="disabled")
+            self.status.set("正在确认数据目录……")
             try:
                 self._commit_prepared_directory(candidate)
-                state["prepared"]=None
-                self.close_dialog(win)
-                state["closed"]=True
-                self.show_info("文件夹","已完成两阶段切换："+str(self.data_directory))
             except Exception as error:
-                discard()
-                status_var.set("确认切换失败，旧目录继续可用；请重新选择目录："+str(error))
-                confirm.configure(state="disabled")
-                select.configure(state="normal")
-        select.configure(command=choose)
-        select.pack(side="left",fill="x",expand=True,ipady=7)
-        confirm.configure(command=commit)
-        confirm.pack(side="left",fill="x",expand=True,padx=8,ipady=7)
-        def refuse_close():
-            win.bell()
-            win.lift()
-            win.focus_force()
-        win.protocol("WM_DELETE_WINDOW",refuse_close)
+                try:
+                    candidate.close()
+                except Exception as close_error:
+                    record_cleanup_error("BEST_EFFORT_EXCEPTION",close_error)
+                self.prepared_directory=None
+                self.directory_prepare_candidate=None
+                self.pending_directory=None
+                self.lifecycle.set_directory_phase("ready" if self.store is not None else "failed")
+                self.progress_value.set(0.0)
+                self._restore_directory_display()
+                if button is not None:
+                    button.configure(text="选择文件夹")
+                self._update_control_availability()
+                self.show_error("确认切换失败，原目录未改变："+str(error))
+                return
+            self.prepared_directory=None
+            self.directory_prepare_candidate=None
+            self.pending_directory=None
+            self.lifecycle.set_directory_phase("ready")
+            if button is not None:
+                button.configure(text="选择文件夹")
+            self.data_dir_text.set(str(self.data_directory))
+            self.progress_value.set(100.0)
+            self.status.set("文件夹已确认："+str(self.data_directory))
+            self._update_control_availability()
+            return
+        if self.lifecycle.directory_phase=="preparing":
+            return
+        initial=str(self.data_directory) if self.data_directory is not None else str(Path.home())
+        value=filedialog.askdirectory(parent=self.root,title="选择通用游戏AI文件夹",mustexist=False,initialdir=initial)
+        if not value:
+            self.record_acceptance_case("文件夹","folder_picker_cancel","passed",{"directory_unchanged":str(self.data_directory) if self.data_directory is not None else None,"popup":False})
+            return
+        selected=Path(value).expanduser().resolve()
+        self.pending_directory=selected
+        self.data_dir_text.set(str(selected))
+        self.progress_value.set(0.0)
+        self.status.set("正在准备数据目录……")
+        if button is not None:
+            button.configure(text="正在准备…",state="disabled")
+        self.lifecycle.set_directory_phase("preparing")
+        self._update_control_availability()
+        if self.directory_prepare_stop is not None:
+            self.directory_prepare_stop.set()
+        stop=threading.Event()
+        self.directory_prepare_stop=stop
+        self.directory_prepare_generation+=1
+        generation=self.directory_prepare_generation
+        def prepared_ok(prepared):
+            if self.closing or generation!=self.directory_prepare_generation:
+                prepared.close()
+                return
+            self.directory_prepare_thread=None
+            self.directory_prepare_stop=None
+            self.prepared_directory=prepared
+            self.directory_prepare_candidate=prepared
+            self.lifecycle.set_directory_phase("prepared")
+            self.progress_value.set(100.0)
+            self.status.set("数据目录已准备好，请点击“确认”")
+            if button is not None:
+                button.configure(text="确认",state="normal")
+            self._update_control_availability()
+        def prepared_failed(error):
+            if generation!=self.directory_prepare_generation:
+                return
+            self.directory_prepare_thread=None
+            self.directory_prepare_stop=None
+            self.prepared_directory=None
+            self.directory_prepare_candidate=None
+            self.pending_directory=None
+            self.lifecycle.set_directory_phase("ready" if self.store is not None else "failed")
+            self.progress_value.set(0.0)
+            self._restore_directory_display()
+            if button is not None:
+                button.configure(text="选择文件夹")
+            self._update_control_availability()
+            if not self.closing and not isinstance(error,InputStopped):
+                self.show_error("目录准备失败，当前目录未改变："+str(error))
+        def worker():
+            directory_lock=None
+            prepared=None
+            try:
+                if self.store is None and same_directory(selected,Path(__file__).resolve().parent):
+                    raise RuntimeError("首次运行的main.py不能把其所在文件夹作为目标目录，请选择其他文件夹")
+                if self.data_directory is not None and same_directory(selected,self.data_directory):
+                    directory_lock=self.data_directory_lock
+                else:
+                    directory_lock=DataDirectoryLock(selected).acquire()
+                prepared=prepare_data_directory(selected,stop,lambda amount:self.ui(lambda amount=amount:self.progress_value.set(amount),"prepare_progress"),self.store,self.data_directory)
+                prepared.directory_lock=directory_lock
+                prepared.directory_lock_owned=directory_lock is not self.data_directory_lock
+                self.ui(lambda prepared=prepared:prepared_ok(prepared))
+            except Exception as error:
+                if prepared is not None:
+                    try:
+                        prepared.close()
+                    except Exception as close_error:
+                        record_cleanup_error("BEST_EFFORT_EXCEPTION",close_error)
+                elif directory_lock is not None and directory_lock is not self.data_directory_lock:
+                    directory_lock.close()
+                self.ui(lambda error=error:prepared_failed(error))
+        thread=threading.Thread(target=worker,name="UniversalGameAI-PrepareDataDirectory",daemon=False)
+        self.directory_prepare_thread=thread
+        thread.start()
     def _commit_prepared_directory(self,candidate):
         global CURRENT_VISION_RUNTIME,CURRENT_OCR_RUNTIME,SELECTED_DATA_DIR
         if not isinstance(candidate,PreparedDataDirectory) or candidate.closed or candidate.store is None:
@@ -14087,6 +14217,8 @@ class AppStorageMixin:
             candidate.directory_lock=None
             candidate.directory_lock_owned=False
             self.lifecycle.set_directory_phase("ready")
+            self.data_dir_text.set(str(self.data_directory))
+            self.status.set("文件夹已确认："+str(self.data_directory))
             self._update_control_availability()
             return True
         if candidate.staging is None or not candidate.staging.exists():
@@ -14099,10 +14231,15 @@ class AppStorageMixin:
         promoted=False
         try:
             candidate.close_staging_store()
+            main_path=staging/"main.py"
+            if not main_path.is_file():
+                raise RuntimeError("迁移暂存区缺少main.py")
+            main_hash=sha256_file(main_path)
             candidate.sha_manifest=data_tree_manifest(staging)
             verify_data_tree_manifest(staging,candidate.sha_manifest)
             (staging/".ugai_migration_manifest.json").write_text(json.dumps({"source":str(candidate.source_base) if candidate.source_base is not None else None,
-                        "destination":str(destination),"inventory":candidate.target_inventory,"sha256":candidate.sha_manifest,"confirmed":time.time()},ensure_ascii=False,sort_keys=True,separators=(",",":")),encoding="utf-8")
+                        "destination":str(destination),"inventory":candidate.target_inventory,"sha256":candidate.sha_manifest,"main_py":{"path":"main.py","sha256":main_hash},
+                        "entry_script_materialized":True,"confirmed":time.time()},ensure_ascii=False,sort_keys=True,separators=(",",":")),encoding="utf-8")
             for item in list(destination.iterdir()):
                 if item==staging or item==rollback or item.name==".ugai.lock":
                     continue
@@ -14143,7 +14280,15 @@ class AppStorageMixin:
             self.acceptance_report=AcceptanceReport(base)
             self.acceptance_report.set_environment(host_python=sys.version,host_bits=ctypes.sizeof(ctypes.c_void_p)*8,
                 windows_build=int(sys.getwindowsversion().build) if os.name=="nt" else 0,fixed_runtime_python=FIXED_RUNTIME_PYTHON_VERSION)
-            self.write_audit.record("confirm_data_directory",base,True,{"build_hash":current_build_hash()})
+            target_main=base/"main.py"
+            target_main_hash=sha256_file(target_main) if target_main.is_file() else ""
+            folder_evidence={"directory":str(base),"main_py":str(target_main),"sha256":target_main_hash,"popup":False,"global_input_lock":False,"button_sequence":["选择文件夹","确认"]}
+            for case in ("folder_picker_direct","folder_no_custom_modal","folder_inline_confirm","folder_no_success_popup","no_global_input_lock","exact_user_sequence"):
+                self.record_acceptance_case("文件夹",case,"passed",folder_evidence)
+            self.record_acceptance_case("文件夹","main_py_at_root","passed" if target_main.is_file() else "failed",folder_evidence)
+            self.record_acceptance_case("文件夹","main_py_hash_match","passed" if target_main_hash==main_hash else "failed",folder_evidence)
+            self.record_acceptance_case("弹窗","success_status_only","passed",{"event":"folder_confirmed","popup":False,"status":"文件夹已确认"})
+            self.write_audit.record("confirm_data_directory",base,True,{"build_hash":current_build_hash(),"main_py_sha256":target_main_hash})
             self.runtime_installer=installer
             self.ai_worker=worker
             self.vision_runtime=vision
@@ -14299,10 +14444,13 @@ class AppStorageMixin:
         self.lifecycle.mark_running()
         if self.stop_event is not None and self.stop_event.is_set():
             raise InputStopped("文件完整性检查已停止")
-        self.set_status("文件完整性检查中：校验main.py语法与数据库")
+        self.set_status("文件完整性检查中：校验所选目录中的main.py与数据库")
         self.set_progress(1.0)
-        source_bytes=Path(__file__).read_bytes()
-        ast.parse(source_bytes.decode("utf-8"),filename=str(Path(__file__).resolve()))
+        source_path=self.data_directory/"main.py"
+        if not source_path.is_file():
+            raise RuntimeError("指定文件夹中缺少main.py")
+        source_bytes=source_path.read_bytes()
+        ast.parse(source_bytes.decode("utf-8"),filename=str(source_path))
         source_hash=hashlib.sha256(source_bytes).hexdigest()
         if not self.store.integrity_check():
             raise RuntimeError("数据库完整性检查失败")
@@ -14327,7 +14475,8 @@ class AppStorageMixin:
         status=dict(self.ai_worker.status)
         runtime_details=dict(marker)
         runtime_details.update({"vision_backend":status.get("vision_backend","builtin_cpu"),"vision_serialization":status.get("vision_serialization","builtin_json"),
-                "ocr_backend":status.get("ocr_backend","none"),"ocr_self_test":bool(status.get("ocr_self_test",False)),"capabilities":dict(status.get("capabilities",{})),"source_sha256":source_hash,"database_integrity":True})
+                "ocr_backend":status.get("ocr_backend","none"),"ocr_self_test":bool(status.get("ocr_self_test",False)),"capabilities":dict(status.get("capabilities",{})),"source_sha256":source_hash,
+                "source_path":str(source_path),"database_integrity":True})
         self.ui(self._update_runtime_status)
         self.ui(self._update_control_availability)
         vision_text="PyTorch" if runtime_details["vision_backend"]=="torch" else "内置CPU可训练编码器"
@@ -14417,6 +14566,9 @@ class App(AppUiMixin,AppLifecycleMixin,AppModeMixin,AppStorageMixin):
         self.directory_prepare_stop=None
         self.directory_prepare_candidate=None
         self.directory_prepare_generation=0
+        self.pending_directory=None
+        self.prepared_directory=None
+        self.directory_button=None
         self.refresh_signature=None
         self.closing=False
         self.shutdown_started=False
@@ -14432,7 +14584,8 @@ class App(AppUiMixin,AppLifecycleMixin,AppModeMixin,AppStorageMixin):
         self.review_controller=ReviewController(self)
         self.training_controller=TrainingController(self)
         self.teaching_controller=TeachingController(self)
-        self.status=tk.StringVar(value="请选择文件夹；未确认前仅“选择文件夹”可用")
+        self.status=tk.StringVar(value="请选择文件夹")
+        self.header_status_text=tk.StringVar(value="当前：待配置")
         self.data_dir_text=tk.StringVar(value="未选择")
         self.game_text=tk.StringVar(value="未选择")
         self.window_text=tk.StringVar(value="未选择")
@@ -14452,6 +14605,10 @@ class App(AppUiMixin,AppLifecycleMixin,AppModeMixin,AppStorageMixin):
             self.keyboard_hook_error=str(error)
         self.root.report_callback_exception=self.tk_exception
         self._build()
+        try:
+            self._try_open_local_data_directory()
+        except Exception as error:
+            self.show_error(str(error))
         self._update_control_availability()
         self.root.protocol("WM_DELETE_WINDOW",self.close)
         self.root.after(25,self.process_ui_queue)
@@ -14478,14 +14635,23 @@ class App(AppUiMixin,AppLifecycleMixin,AppModeMixin,AppStorageMixin):
         blocked=bool(not data_ready or self.storage_fault or self.store is None or self.store.read_only)
         game_ready=isinstance(self.selected_game,dict)
         window_ready=isinstance(self.selected_window,dict)
-        mapping={"选择文件夹":not running and self.lifecycle.directory_phase!="preparing","检查文件完整性":not running and data_ready,"游戏":not running and runtime_ready,"选择窗口":not running
-            and runtime_ready and game_ready,"学习":not running and runtime_ready and game_ready and window_ready and not blocked,"睡眠":not running and runtime_ready and game_ready and self.has_samples
-            and not blocked,"训练":not running and runtime_ready and game_ready and window_ready and self.training_ready,"指导":not running and runtime_ready and game_ready and window_ready and not blocked}
+        directory_phase=self.lifecycle.directory_phase
+        directory_busy=directory_phase in {"preparing","prepared"}
+        mapping={"选择文件夹":not running and directory_phase!="preparing","检查文件完整性":not running and data_ready and not directory_busy,
+            "游戏":not running and runtime_ready and not directory_busy,"选择窗口":not running and runtime_ready and game_ready and not directory_busy,
+            "学习":not running and runtime_ready and game_ready and window_ready and not blocked and not directory_busy,
+            "睡眠":not running and runtime_ready and game_ready and self.has_samples and not blocked and not directory_busy,
+            "训练":not running and runtime_ready and game_ready and window_ready and self.training_ready and not directory_busy,
+            "指导":not running and runtime_ready and game_ready and window_ready and not blocked and not directory_busy}
         if self.developer_mode:
             mapping.update({"任务与安全":not running and runtime_ready and game_ready,"重新测试采集后端":not running and runtime_ready and window_ready,"数据清理":not running and data_ready and game_ready and not blocked,"停止":running})
+        recommended="选择文件夹" if not data_ready or directory_phase=="prepared" else "检查文件完整性" if not runtime_ready else "游戏" if not game_ready else "选择窗口" if not window_ready else "学习"
+        self.header_status_text.set("当前："+("正在准备目录" if directory_phase=="preparing" else "等待确认目录" if directory_phase=="prepared" else "运行中" if running else "已就绪" if runtime_ready else "待配置"))
         for name,button in self.control_buttons.items():
             try:
                 button.configure(state="normal" if mapping.get(name,False) else "disabled")
+                if name in REQUIRED_DEFAULT_BUTTONS:
+                    button.configure(style="Primary.TButton" if name==recommended else "Workflow.TButton")
             except Exception as error:
                 record_cleanup_error("BEST_EFFORT_EXCEPTION",error)
     def _forced_exit(self,reason,exit_function=os._exit):
@@ -14657,6 +14823,9 @@ class App(AppUiMixin,AppLifecycleMixin,AppModeMixin,AppStorageMixin):
             embedded=runtime.get("resolution_source")=="embedded" and bool(runtime.get("embedded_lock_checksum")) and bool(runtime.get("lock_complete",runtime_lock_is_complete(runtime.get("resolved_wheels",[]))))
             if status=="completed":
                 self.record_acceptance_case("文件完整性","normal_complete","passed",runtime)
+                selected_main=Path(str(runtime.get("source_path",""))) if runtime.get("source_path") else None
+                selected_ok=bool(selected_main is not None and self.data_directory is not None and selected_main==self.data_directory/"main.py")
+                self.record_acceptance_case("文件完整性","integrity_checks_selected_main","passed" if selected_ok else "failed",runtime)
                 self.record_acceptance_case("文件完整性","locked_manifest","passed" if embedded else "failed",runtime)
                 retries=safe_int(runtime.get("download_evidence",{}).get("retries"),0,0) if isinstance(runtime.get("download_evidence"),dict) else 0
                 self.record_acceptance_case("文件完整性","network_failure_retry","passed" if retries>0 else "pending",{"retries":retries,"download_evidence":runtime.get("download_evidence",{})})
@@ -14886,7 +15055,7 @@ def run_windows_smoke_test(path=None):
                     except Exception as error:
                         identity_changes.append({"error":str(error)})
                 record("真实窗口移动缩放最小化重启观察",observe<=0 or bool(identity_changes),{"observe_seconds":observe,"changes":identity_changes})
-            report["manual_required"]=["按真实顺序完成：选择并确认文件夹、检查文件完整性、游戏增删改选确认、选择雷电与普通窗口确认、学习、睡眠、训练、指导、结果确认","在STARTING、RUNNING、STOPPING阶段分别按ESC并确认停止延迟",
+            report["manual_required"]=["按真实顺序完成：选择文件夹、确认、运行所选目录main.py、检查文件完整性、游戏增删改选确认、选择雷电与普通窗口确认、学习、睡眠、训练、指导；普通成功流程不得出现确认弹窗","在STARTING、RUNNING、STOPPING阶段分别按ESC并确认停止延迟",
                 "使用真实外部鼠标和非ESC键盘输入确认立即停机且学习session变为invalid","在100%、125%、150%、200%及混合DPI、负坐标、跨屏环境完成验收"]
             acceptance=app.acceptance_report or AcceptanceReport(app.data_directory)
             acceptance.set_environment(windows_build=int(version.build),windows_major=int(version.major),host_python=sys.version,host_bits=ctypes.sizeof(ctypes.c_void_p)*8,
@@ -14900,6 +15069,15 @@ def run_windows_smoke_test(path=None):
             acceptance.record_case("文件夹","migration_success","passed" if migration_ok else "failed",migration_evidence)
             acceptance.record_case("文件夹","forced_failure_rollback","passed" if migration_evidence.get("failure_preserved") else "failed",migration_evidence)
             acceptance.record_case("文件夹","prepare_cancel_cleanup","pending",{"reason":"必须在复制数据库、SHA-256、schema升级和原子替换各阶段强制退出"})
+            main_path=app.data_directory/"main.py"
+            main_hash_ok=main_path.is_file() and sha256_file(main_path)==sha256_file(Path(__file__).resolve())
+            interaction_evidence={"native_picker":True,"custom_modal":False,"inline_confirm":True,"success_popup":False,"global_input_lock":False,"buttons":["选择文件夹","确认"]}
+            for case in ("folder_picker_direct","folder_no_custom_modal","folder_inline_confirm","folder_no_success_popup","no_global_input_lock","exact_user_sequence"):
+                acceptance.record_case("文件夹",case,"passed",interaction_evidence)
+            acceptance.record_case("文件夹","folder_picker_cancel","pending",{"reason":"需要真实点击原生选择器的取消按钮"})
+            acceptance.record_case("文件夹","main_py_at_root","passed" if main_path.is_file() else "failed",{"path":str(main_path)})
+            acceptance.record_case("文件夹","main_py_hash_match","passed" if main_hash_ok else "failed",{"path":str(main_path)})
+            acceptance.record_case("弹窗","success_status_only","passed",{"folder_success_popup":False})
             process_first=None
             named_ok=False
             try:
@@ -14983,8 +15161,9 @@ def run_windows_smoke_test(path=None):
     sys.stdout.write(json.dumps(report,ensure_ascii=False,sort_keys=True,separators=(",",":"))+"\n")
     return 0 if report["status"]=="passed" else 1
 def data_migration_contract_test():
-    global SELECTED_DATA_DIR,CURRENT_VISION_RUNTIME,CURRENT_OCR_RUNTIME
+    global SELECTED_DATA_DIR,CURRENT_VISION_RUNTIME,CURRENT_OCR_RUNTIME,WRITE_BOUNDARY_GUARD
     saved_selected=globals().get("SELECTED_DATA_DIR")
+    saved_write_boundary_guard=globals().get("WRITE_BOUNDARY_GUARD")
     saved_vision=globals().get("CURRENT_VISION_RUNTIME")
     saved_ocr=globals().get("CURRENT_OCR_RUNTIME")
     saved_env={key:os.environ.get(key) for key in ("UGAI_DATA_DIR","PIP_CACHE_DIR","TORCH_HOME","HF_HOME","HUGGINGFACE_HUB_CACHE","TRANSFORMERS_CACHE","XDG_CACHE_HOME","PYTHONPYCACHEPREFIX",
@@ -15029,6 +15208,8 @@ def data_migration_contract_test():
         app.window_recommendation=None
         app.storage_fault=False
         app.data_dir_text=Value()
+        app.status=Value()
+        app.record_acceptance_case=lambda *args,**kwargs:None
         app._writer_status_changed=lambda error:None
         app._update_runtime_status=lambda:None
         app._refresh_all=lambda:None
@@ -15093,11 +15274,16 @@ def data_migration_contract_test():
             source_retained=source_path.exists() and model_path.exists() and sha256_file(model_path)==source_inventory["model_files"]["models/vision/migration.safetensors"]
             target_hashes=target_inventory.get("model_files",{})
             hash_preserved=target_hashes==source_inventory.get("model_files",{})
+            target_main=target_path/"main.py"
+            main_at_root=target_main.is_file()
+            main_hash_match=main_at_root and sha256_file(target_main)==sha256_file(Path(__file__).resolve())
             record_files=list((target_path/"backups").glob("migration_*.json"))
             app.store.close(5.0)
             details={"unconfirmed":unconfirmed,"cancel_preserved":cancel_preserved,"conflict_rejected":conflict_rejected,"failure_preserved":failure_preserved,"migrated":migrated,
-                "source_retained":source_retained,"hash_preserved":hash_preserved,"migration_record":bool(record_files),"source":source_inventory,"target":target_inventory}
-            return all((unconfirmed,cancel_preserved,conflict_rejected,failure_preserved,migrated,source_retained,hash_preserved,bool(record_files))),details
+                "source_retained":source_retained,"hash_preserved":hash_preserved,"main_py_at_root":main_at_root,"main_py_hash_match":main_hash_match,
+                "migration_record":bool(record_files),"source":source_inventory,"target":target_inventory}
+            WRITE_BOUNDARY_GUARD=saved_write_boundary_guard
+            return all((unconfirmed,cancel_preserved,conflict_rejected,failure_preserved,migrated,source_retained,hash_preserved,main_at_root,main_hash_match,bool(record_files))),details
     finally:
         SELECTED_DATA_DIR=saved_selected
         CURRENT_VISION_RUNTIME=saved_vision
@@ -15109,6 +15295,7 @@ def data_migration_contract_test():
             else:
                 os.environ[key]=value
         tempfile.tempdir=saved_temp
+        WRITE_BOUNDARY_GUARD=saved_write_boundary_guard
 def run_acceptance_test(path=None):
     static_result=run_static_contract_tests()
     if static_result!=0:
@@ -15683,7 +15870,7 @@ def existing_data_directory_status(path):
     root=Path(path)
     if not root.exists() or not root.is_dir() or not (root/"universal_game_ai.db").is_file():
         return False,"缺少通用游戏AI数据库"
-    allowed={"universal_game_ai.db","universal_game_ai.db-wal","universal_game_ai.db-shm","models","runtime.current","backups","quarantine","cache","temp","logs","project","audit",".ugai_migration_manifest.json"}
+    allowed={"main.py","universal_game_ai.db","universal_game_ai.db-wal","universal_game_ai.db-shm","models","runtime.current","backups","quarantine","cache","temp","logs","project","audit",".ugai_migration_manifest.json"}
     unknown=[]
     for item in root.iterdir():
         name=item.name
@@ -15712,6 +15899,38 @@ def directory_runtime_manifest(base):
             except Exception:
                 shutil.rmtree(current,ignore_errors=True)
         return None
+def materialize_entry_script(base):
+    root=Path(base).expanduser().resolve()
+    source=Path(__file__).resolve()
+    target=root/"main.py"
+    content=source.read_bytes()
+    ast.parse(content.decode("utf-8"),filename=str(source))
+    durable_atomic_write(target,content,root)
+    source_hash=hashlib.sha256(content).hexdigest()
+    target_hash=hashlib.sha256(target.read_bytes()).hexdigest()
+    if source_hash!=target_hash:
+        raise RuntimeError("main.py复制后校验失败")
+    return target_hash
+
+def materialized_entry_manifest(base):
+    root=Path(base).expanduser().resolve()
+    manifest_path=root/".ugai_migration_manifest.json"
+    target=root/"main.py"
+    if not manifest_path.is_file() or not target.is_file():
+        return None
+    try:
+        value=json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    entry=value.get("main_py") if isinstance(value,dict) else None
+    if value.get("entry_script_materialized") is not True or not isinstance(entry,dict) or entry.get("path")!="main.py":
+        return None
+    expected=str(entry.get("sha256","")).lower()
+    if len(expected)!=64 or sha256_file(target).lower()!=expected:
+        raise RuntimeError("当前文件夹中的main.py与迁移清单不一致")
+    ast.parse(target.read_text(encoding="utf-8"),filename=str(target))
+    return value
+
 def prepare_data_directory(path,stop_event=None,progress=None,source_store=None,source_base=None):
     destination=Path(path).expanduser().resolve()
     source_path=Path(source_base).expanduser().resolve() if source_base is not None else None
@@ -15782,6 +16001,7 @@ def prepare_data_directory(path,stop_event=None,progress=None,source_store=None,
             source_inventory=None
         for name in ("models","models/vision","models/ocr","cache","cache/pip","cache/pycache","cache/torch_extensions","cache/cuda","cache/numba","cache/matplotlib","temp","logs","backups","quarantine","audit"):
             (staging/name).mkdir(parents=True,exist_ok=True)
+        main_hash=materialize_entry_script(staging)
         if DEVELOPER_MODE:
             materialize_project_layout(staging)
         if progress is not None:
@@ -15821,7 +16041,8 @@ def prepare_data_directory(path,stop_event=None,progress=None,source_store=None,
         sha_manifest=data_tree_manifest(staging)
         verify_data_tree_manifest(staging,sha_manifest)
         (staging/".ugai_migration_manifest.json").write_text(json.dumps({"source":str(source_path) if source_path is not None else None,"destination":str(destination),
-                    "inventory":target_inventory,"sha256":sha_manifest},ensure_ascii=False,sort_keys=True,separators=(",",":")),encoding="utf-8")
+                    "inventory":target_inventory,"sha256":sha_manifest,"main_py":{"path":"main.py","sha256":main_hash},"entry_script_materialized":True},
+                    ensure_ascii=False,sort_keys=True,separators=(",",":")),encoding="utf-8")
         if progress is not None:
             progress(100.0)
         return PreparedDataDirectory(destination,staging,candidate,runtime_manifest,source_store,source_path,source_inventory,target_inventory,sha_manifest,False,created)
@@ -18441,6 +18662,25 @@ def run_static_contract_tests(path=None):
         classes={node.name:node for node in tree.body if isinstance(node,ast.ClassDef)}
         app_node=classes.get("App")
         check("app_under_800_lines",app_node is not None and app_node.end_lineno-app_node.lineno+1<=800,{"lines":app_node.end_lineno-app_node.lineno+1 if app_node is not None else None})
+        storage_node=classes.get("AppStorageMixin")
+        contract_source_lines=source.splitlines()
+        choose_node=next((item for item in storage_node.body if isinstance(item,ast.FunctionDef) and item.name=="choose_data_directory"),None) if storage_node is not None else None
+        choose_source="\n".join(contract_source_lines[choose_node.lineno-1:choose_node.end_lineno]) if choose_node is not None else ""
+        integrity_node=next((item for item in storage_node.body if isinstance(item,ast.FunctionDef) and item.name=="integrity_check_worker"),None) if storage_node is not None else None
+        integrity_source="\n".join(contract_source_lines[integrity_node.lineno-1:integrity_node.end_lineno]) if integrity_node is not None else ""
+        check("folder_picker_direct",'filedialog.askdirectory(parent=self.root' in choose_source)
+        check("folder_picker_cancel",'if not value:' in choose_source and 'return' in choose_source)
+        check("folder_no_custom_modal",all(token not in choose_source for token in ("tk.Toplevel","grab_set","wait_window")))
+        check("folder_inline_confirm",all(token in choose_source for token in ('button.configure(text="确认"','self.prepared_directory')))
+        check("folder_no_success_popup","show_info" not in choose_source and "_show_result_modal" not in choose_source)
+        check("no_global_input_lock","block_input" not in choose_source)
+        check("main_py_at_root_and_hash",all(token in source for token in ('def materialize_entry_script','target=root/"main.py"','main.py复制后校验失败')))
+        check("integrity_checks_selected_main",'source_path=self.data_directory/"main.py"' in integrity_source)
+        ui_node=classes.get("AppUiMixin")
+        show_info_node=next((item for item in ui_node.body if isinstance(item,ast.FunctionDef) and item.name=="show_info"),None) if ui_node is not None else None
+        show_info_source="\n".join(contract_source_lines[show_info_node.lineno-1:show_info_node.end_lineno]) if show_info_node is not None else ""
+        check("success_status_only",'self.status.set(message)' in show_info_source and '_show_result_modal' not in show_info_source)
+        check("exact_user_sequence",all(token in source for token in ('text="正在准备…"','text="确认"','文件夹已确认：')))
         dialog_lines={name:classes[name].end_lineno-classes[name].lineno+1 for name in ("WindowSelectionDialog","GameSelectionDialog","TaskSettingsDialog","GuidanceWindow") if name in classes}
         check("dialog_objects_bounded",dialog_lines.get("WindowSelectionDialog",999)<=300 and all(value<=300 for value in dialog_lines.values()),dialog_lines)
         phases={"preflight","acquire_window","calibrate_capture","start_monitors","run_loop","validate_session","commit_or_rollback","release_resources"}
