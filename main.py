@@ -4022,24 +4022,36 @@ def _sync_parent_directory(path):
         create=kernel.CreateFileW
         create.argtypes=[wintypes.LPCWSTR,wintypes.DWORD,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,wintypes.DWORD,wintypes.HANDLE]
         create.restype=wintypes.HANDLE
-        handle=create(str(directory),0x80000000,0x00000001|0x00000002,None,3,0x02000000,None)
+        kernel.FlushFileBuffers.argtypes=[wintypes.HANDLE]
+        kernel.FlushFileBuffers.restype=wintypes.BOOL
+        kernel.CloseHandle.argtypes=[wintypes.HANDLE]
+        kernel.CloseHandle.restype=wintypes.BOOL
+        unsupported={1,5,6,32,50,87}
+        handle=create(str(directory),0x40000000,0x00000001|0x00000002|0x00000004,None,3,0x02000000,None)
         invalid=wintypes.HANDLE(-1).value
         if handle==invalid:
-            raise OSError(ctypes.get_last_error(),"无法打开目录进行持久化同步")
+            error=ctypes.get_last_error()
+            if error in unsupported:
+                RUNTIME_METRICS.increment("directory_sync_unsupported")
+                return False
+            raise OSError(error,"无法打开目录进行持久化同步")
         try:
             if not kernel.FlushFileBuffers(handle):
                 error=ctypes.get_last_error()
-                if error not in {1,6,87}:
-                    raise OSError(error,"目录FlushFileBuffers失败")
+                if error in unsupported:
+                    RUNTIME_METRICS.increment("directory_sync_unsupported")
+                    return False
+                raise OSError(error,"目录FlushFileBuffers失败")
         finally:
             kernel.CloseHandle(handle)
-        return
+        return True
     flags=os.O_RDONLY|getattr(os,"O_DIRECTORY",0)
     descriptor=os.open(str(directory),flags)
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    return True
 
 def durable_atomic_write(path,data,root=None):
     target=Path(path)
@@ -12279,22 +12291,29 @@ class AppUiMixin:
         win=tk.Toplevel(self.root)
         self.result_modal=win
         win.title(str(title))
-        fit_window(win,720,420,460,320)
-        win.minsize(520,320)
+        fit_window(win,720,460,460,340)
+        win.minsize(520,340)
         win.transient(self.root)
         frame=ttk.Frame(win,padding=14)
         frame.pack(fill="both",expand=True)
-        ttk.Label(frame,text=str(title),font=("Microsoft YaHei UI",14,"bold")).pack(anchor="w",pady=(0,8))
+        frame.columnconfigure(0,weight=1)
+        frame.rowconfigure(1,weight=1)
+        ttk.Label(frame,text=str(title),font=("Microsoft YaHei UI",14,"bold")).grid(row=0,column=0,sticky="w",pady=(0,8))
         body=ttk.Frame(frame)
-        body.pack(fill="both",expand=True)
+        body.grid(row=1,column=0,sticky="nsew")
+        body.columnconfigure(0,weight=1)
+        body.rowconfigure(0,weight=1)
         widget=tk.Text(body,wrap="word",font=("Microsoft YaHei UI",10),relief="solid",borderwidth=1)
         self.result_modal_widget=widget
         scroll=ttk.Scrollbar(body,orient="vertical",command=widget.yview)
         widget.configure(yscrollcommand=scroll.set)
-        widget.pack(side="left",fill="both",expand=True)
-        scroll.pack(side="right",fill="y")
+        widget.grid(row=0,column=0,sticky="nsew")
+        scroll.grid(row=0,column=1,sticky="ns")
         widget.insert("1.0",str(text))
         widget.configure(state="disabled")
+        footer=ttk.Frame(frame)
+        footer.grid(row=2,column=0,sticky="ew",pady=(12,0))
+        footer.columnconfigure(0,weight=1)
         closed={"closed":False}
         def confirm():
             if closed["closed"]:
@@ -12315,10 +12334,14 @@ class AppUiMixin:
             win.bell()
             win.lift()
             win.focus_force()
-        ttk.Button(frame,text="确认",command=confirm).pack(pady=(12,0),ipadx=28)
+        confirm_button=ttk.Button(footer,text="确认",command=confirm,width=14)
+        confirm_button.grid(row=0,column=0,ipadx=28,ipady=4)
         win.protocol("WM_DELETE_WINDOW",refuse_close)
+        win.bind("<Return>",lambda event:confirm())
         win.wait_visibility()
+        win.update_idletasks()
         win.grab_set()
+        confirm_button.focus_set()
         win.focus_force()
         win.wait_window()
     def show_error(self,text):
