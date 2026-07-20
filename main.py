@@ -15,6 +15,7 @@ import traceback
 import statistics
 import sqlite3
 import zlib
+import pickle
 import base64
 import io
 import tokenize
@@ -122,9 +123,39 @@ AI_WORKER_PROTOCOL_VERSION=4
 RUNTIME_INSTALL_PROTOCOL_VERSION=2
 REVIEW_PROCESS_PROTOCOL_VERSION=2
 TEST_WORKER_PROTOCOL_VERSION=2
-STATIC_CONTRACT_VERSION=6
-MODE_SPECS={"学习":{"requires":("runtime","game","window"),"runner":"learning"},"睡眠":{"requires":("runtime","game","samples"),"runner":"sleep"},"训练":{"requires":("runtime","game","window",
-            "model"),"runner":"training"},"指导":{"requires":("runtime","game","window"),"runner":"guidance"}}
+STATIC_CONTRACT_VERSION=7
+class ModeId(str,Enum):
+    COLLECT="collect"
+    UPGRADE="upgrade"
+    AI="ai"
+    QUIZ="quiz"
+MODE_LABELS={ModeId.COLLECT:"收集数据",ModeId.UPGRADE:"升级",ModeId.AI:"AI",ModeId.QUIZ:"做题"}
+MODE_BY_LABEL={label:mode.value for mode,label in MODE_LABELS.items()}
+def normalize_mode_id(value):
+    if isinstance(value,ModeId):
+        return value.value
+    text=str(value or "")
+    if text in MODE_BY_LABEL:
+        return MODE_BY_LABEL[text]
+    if text in {mode.value for mode in ModeId}:
+        return text
+    return text
+def mode_label(value):
+    normalized=normalize_mode_id(value)
+    try:
+        return MODE_LABELS[ModeId(normalized)]
+    except ValueError:
+        return str(value or "模式")
+MODE_SPECS={
+    ModeId.COLLECT.value:{"requires":("runtime","game","window"),"runner":"collect"},
+    ModeId.UPGRADE.value:{"requires":("runtime","game","samples"),"runner":"upgrade"},
+    ModeId.AI.value:{"requires":("runtime","game","window","model"),"runner":"ai"},
+    ModeId.QUIZ.value:{"requires":("runtime","game","window"),"runner":"quiz"},
+}
+WRITER_BATCH_SIZE=64
+MAX_PENDING_SAMPLES=512
+MAX_VISION_TRAINING_SAMPLES=6000
+TRAINING_METADATA_MULTIPLIER=4
 ASK_CANVAS_W=672
 ASK_CANVAS_H=378
 ASK_PREVIEW_W=640
@@ -237,7 +268,7 @@ def runtime_dependency_contracts():
     return result
 def runtime_required_projects():
     return set(runtime_lock_manifest().get("required_projects",[]))
-STRICT_ACCEPTANCE_ITEMS=("启动","默认界面","文件夹","文件完整性","窗口","采集","学习","睡眠","训练","指导","弹窗","停止","单实例与目录锁","独立运行时","离线网络封锁","写入路径审计","多显示器与DPI","错误恢复")
+STRICT_ACCEPTANCE_ITEMS=("启动","默认界面","文件夹","文件完整性","窗口","采集","收集数据","升级","AI","做题","弹窗","停止","单实例与目录锁","独立运行时","离线网络封锁","写入路径审计","多显示器与DPI","错误恢复")
 STRICT_ACCEPTANCE_CASES={
     "启动":("control_panel_visible",),
     "默认界面":("exact_eight_buttons",),
@@ -249,10 +280,10 @@ STRICT_ACCEPTANCE_CASES={
     "文件完整性":("normal_complete","network_failure_retry","escape_retry","locked_manifest","integrity_checks_selected_main"),
     "窗口":("ldplayer_confirmed","ordinary_confirmed","administrator_integrity_difference","emulator_scaling"),
     "采集":("minimized","occluded","scaled","recreated"),
-    "学习":("client_only_real_mouse",),
-    "睡眠":("socket_blocked","model_optimized","pool_optimized","deterministic_seed"),
-    "训练":("all_coordinates_in_client","immutable_snapshot_change_stop"),
-    "指导":("choices_only","finish_button","escape"),
+    "收集数据":("client_only_real_mouse",),
+    "升级":("socket_blocked","model_optimized","pool_optimized","deterministic_seed"),
+    "AI":("all_coordinates_in_client","immutable_snapshot_change_stop"),
+    "做题":("choices_only","submit_required","finish_button","escape"),
     "弹窗":("confirm_only","success_status_only","error_confirm_only"),
     "停止":("starting","running","stopping","latency_thresholds","buttons_released","escape_to_input_lock","escape_to_buttons_released","abnormal_exit_release"),
     "单实例与目录锁":("named_mutex","directory_lock","lock_record"),
@@ -265,7 +296,7 @@ STRICT_ACCEPTANCE_CASES={
 SAMPLE_IMAGE_VERSION=1
 NEURAL_FEATURE_VERSION=2
 MODEL_MAX_BYTES=256*1024*1024
-REQUIRED_DEFAULT_BUTTONS={"选择文件夹","检查文件完整性","游戏","选择窗口","学习","睡眠","训练","指导"}
+REQUIRED_DEFAULT_BUTTONS={"选择文件夹","检查文件完整性","游戏名称","选择窗口","收集数据","升级","AI","做题"}
 AUTHORITATIVE_DATA_PATHS=("universal_game_ai.db","models/vision","models/ocr","runtime.current","backups","quarantine","project","audit")
 RUNTIME_PYPI_INDEX="https://pypi.org/simple"
 RUNTIME_TORCH_CPU_INDEX="https://download.pytorch.org/whl/cpu"
@@ -836,9 +867,7 @@ class ThreadLocalSQLite:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=3000")
         if not self.read_only:
-            connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=NORMAL")
-            connection.execute("PRAGMA temp_store=MEMORY")
         return connection
     def current(self):
         connection=getattr(self.local,"connection",None)
@@ -983,11 +1012,17 @@ class ErrorCode(str,Enum):
     RESOURCE_CLOSE_FAILED="RESOURCE_CLOSE_FAILED"
     PROTOCOL_ERROR="PROTOCOL_ERROR"
 
-class ModeName(str,Enum):
-    LEARNING="学习"
-    SLEEP="睡眠"
-    TRAINING="训练"
-    GUIDANCE="指导"
+ModeName=ModeId
+@dataclass(slots=True,frozen=True)
+class TrainingSampleMeta:
+    row_id:int
+    created:float
+    task_id:str
+    skill_id:str
+    outcome:str
+    ood:str
+    session_id:str
+    checksum:str
 @dataclass(frozen=True)
 class WindowIdentity:
     hwnd:int
@@ -1087,12 +1122,13 @@ class ControlStateMachine:
         with self.lock:
             if self.state!=MODE_IDLE:
                 raise RuntimeError("当前已有操作正在运行，请先停止")
-            if str(name)!="检查文件完整性" and not self.data_ready:
+            normalized=normalize_mode_id(name)
+            if normalized!="检查文件完整性" and not self.data_ready:
                 raise RuntimeError("请先选择并确认文件夹")
-            if str(name)!="检查文件完整性" and not self.runtime_ready:
+            if normalized!="检查文件完整性" and not self.runtime_ready:
                 raise RuntimeError("请先完成文件完整性检查")
             self.state=MODE_STARTING
-            self.name=str(name)
+            self.name=normalized
             self.shared_stop_event.clear()
             self.stop_event=self.shared_stop_event
             self.requested_status="completed"
@@ -6495,9 +6531,45 @@ def window_descriptor_score(descriptor,candidate):
     if safe_int(descriptor.get("integrity",-1),-1)>=0 and safe_int(descriptor.get("integrity",-1),-1)==safe_int(candidate.get("integrity",-2),-2):
         score+=1
     return score
+def read_training_sample_bundle(bundle,base):
+    value=dict(bundle) if isinstance(bundle,dict) else {}
+    target=Path(str(value.get("path",""))).expanduser().resolve()
+    root=Path(base).expanduser().resolve()
+    if not target.is_file() or not target.is_relative_to(root):
+        raise RuntimeError("升级样本包路径无效")
+    digest=hashlib.sha256()
+    with target.open("rb") as stream:
+        while True:
+            chunk=stream.read(1024*1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    if digest.hexdigest()!=str(value.get("sha256","")):
+        raise RuntimeError("升级样本包SHA-256校验失败")
+    samples=[]
+    with target.open("rb") as stream:
+        if stream.read(8)!=b"UGAITB1\n":
+            raise RuntimeError("升级样本包格式无效")
+        while True:
+            length=int.from_bytes(stream.read(8),"big")
+            if length==0:
+                break
+            if length<0 or length>64*1024*1024:
+                raise RuntimeError("升级样本包批次长度无效")
+            packed=stream.read(length)
+            if len(packed)!=length:
+                raise RuntimeError("升级样本包被截断")
+            batch=pickle.loads(bounded_decompress(packed,128*1024*1024))
+            if not isinstance(batch,list) or any(not isinstance(item,dict) for item in batch):
+                raise RuntimeError("升级样本包批次内容无效")
+            samples.extend(batch)
+            if len(samples)>MAX_TRAINING_SAMPLES:
+                raise RuntimeError("升级样本包超过训练上限")
+    return samples
 class ReviewProcessStore:
     def __init__(self,payload):
-        self.samples=list(payload.get("samples",[]))
+        bundle=payload.get("sample_bundle")
+        self.samples=read_training_sample_bundle(bundle,payload.get("base")) if isinstance(bundle,dict) else list(payload.get("samples",[]))
         self.stats=dict(payload.get("stats",{}))
         self.rejections=list(payload.get("rejections",[]))
         self.ocr_events=list(payload.get("ocr_events",[]))
@@ -6507,6 +6579,10 @@ class ReviewProcessStore:
         return dict(self.profile)
     def load_samples(self,gid):
         return list(self.samples),dict(self.stats)
+    def load_training_samples(self,gid,limit=MAX_TRAINING_SAMPLES,payload="policy"):
+        maximum=safe_int(limit,len(self.samples),1,MAX_TRAINING_SAMPLES)
+        selected=self.samples if maximum>=len(self.samples) else self.samples[:maximum]
+        return selected,dict(self.stats)
     def load_rejections(self,gid,limit=500):
         return list(self.rejections[:int(limit)])
     def load_ocr_experience_events(self,gid,limit=5000):
@@ -6518,7 +6594,7 @@ class ReviewProcessLifecycle:
     def __init__(self,stop_event):
         self.lock=threading.RLock()
         self.state=MODE_STARTING
-        self.name="睡眠"
+        self.name=ModeId.UPGRADE.value
         self.stop_event=stop_event
         self.requested_status="completed"
         self.reason=""
@@ -6719,14 +6795,14 @@ class PhaseRunner:
         best_effort_cleanup("MODE_RELEASE_ALL_BUTTONS",lambda:self.context.api.release_all_buttons())
 class LearningRunner(PhaseRunner):
     def prepare_session(self):
-        return {"started":time.monotonic(),"resources":[],"mode":ModeName.LEARNING.value}
+        return {"started":time.monotonic(),"resources":[],"mode":ModeId.COLLECT.value}
     def preflight(self,phase=None):
         super().preflight(phase)
         phase["game"]=self.host.require_game()
     def acquire_window(self,phase):
         return self.host.require_window(False)
     def calibrate_capture(self,phase):
-        return self.host.ensure_capture_calibration(phase["window"],ModeName.LEARNING.value)
+        return self.host.ensure_capture_calibration(phase["window"],ModeId.COLLECT.value)
     def run_loop(self,prepared):
         return self.controller._run_impl(prepared)
     def finalize(self,result,prepared):
@@ -6737,7 +6813,7 @@ class ReviewRunner(PhaseRunner):
         super().__init__(context,controller,host)
         self.offline=bool(offline)
     def prepare_session(self):
-        return {"started":time.monotonic(),"resources":[],"mode":ModeName.SLEEP.value,"offline":self.offline}
+        return {"started":time.monotonic(),"resources":[],"mode":ModeId.UPGRADE.value,"offline":self.offline}
     def preflight(self,phase=None):
         super().preflight(phase)
         phase["game"]=self.host.require_game()
@@ -6751,14 +6827,14 @@ class ReviewRunner(PhaseRunner):
             best_effort_cleanup("SLEEP_ROLLBACK_RESUME_WRITES",lambda:self.context.store.resume_sample_writes())
 class TrainingRunner(PhaseRunner):
     def prepare_session(self):
-        return {"started":time.monotonic(),"resources":[],"mode":ModeName.TRAINING.value}
+        return {"started":time.monotonic(),"resources":[],"mode":ModeId.AI.value}
     def preflight(self,phase=None):
         super().preflight(phase)
         phase["game"]=self.host.require_game()
     def acquire_window(self,phase):
         return self.host.require_window(False)
     def calibrate_capture(self,phase):
-        return self.host.ensure_capture_calibration(phase["window"],ModeName.TRAINING.value)
+        return self.host.ensure_capture_calibration(phase["window"],ModeId.AI.value)
     def run_loop(self,prepared):
         return self.controller._run_impl(prepared)
     def finalize(self,result,prepared):
@@ -6885,7 +6961,7 @@ class LearningExecution:
         self.keyboard_enabled=self.capability.authorize("keyboard")
         self.semantic_keymap=dict(self.capability.semantic_keymap)
         self.target=self.phase.get("window") or self.host.require_window(False)
-        self.calibration=self.phase.get("calibration") or self.host.ensure_capture_calibration(self.target,"学习")
+        self.calibration=self.phase.get("calibration") or self.host.ensure_capture_calibration(self.target,MODE_LABELS[ModeId.COLLECT])
         self.capability_result=self.capability.require_training_support({"capture_fps":self.calibration.get("fps",0.0),"available_action_frequency":1.0/max(0.01,safe_float(self.calibration.get("input_delay",0.25),0.25)),
             "semantic_size":HYBRID_GLOBAL_SIZE})
         self.session_id="learn|"+uuid.uuid4().hex
@@ -7630,17 +7706,18 @@ class ReviewController:
     def run_offline(self):
         return ReviewRunner(ModeContext.from_host(self.host),self,self.host,True).run()
     def _pipeline_impl(self,phase=None):
-        host=self.host; phase=phase if isinstance(phase,dict) else {}; host.require_ai_runtime(); game=phase.get("game") or host.require_game(); host.store.pause_sample_writes("睡眠期间冻结样本写入")
+        host=self.host; phase=phase if isinstance(phase,dict) else {}; host.require_ai_runtime(); game=phase.get("game") or host.require_game(); host.store.pause_sample_writes("升级期间冻结样本写入")
         try:
-            host.set_status("睡眠1/5：数据完整性、谱系隔离、泄漏和重复检查"); samples,stats=host.store.load_training_samples(game["id"],MAX_TRAINING_SAMPLES)
-            if stats.get("invalid",0): host.set_status("睡眠1/5：发现无效样本并已隔离，继续使用有效分层数据")
+            host.set_status("升级1/5：读取轻量元数据并完成分层抽样"); samples,stats=host.store.load_training_samples(game["id"],MAX_VISION_TRAINING_SAMPLES,"vision")
+            if stats.get("invalid",0): host.set_status("升级1/5：发现无效样本并已隔离，继续使用有效分层数据")
             rgb_samples=[item for item in samples if sample_rgb_valid(item.get("rgb"))]; sleep_seed,sleep_seed_evidence=deterministic_sleep_seed(game["id"],rgb_samples); host.sleep_seed=sleep_seed; host.sleep_seed_evidence=sleep_seed_evidence
-            host.set_status("睡眠2/5：训练对象模型、视觉适配器与终止检测器"); manifest=host.vision_runtime.train(game["id"],rgb_samples,host.stop_event,host.set_progress,sleep_seed,len(samples)); host.store.record_vision_model(game["id"],manifest)
+            host.set_status("升级2/5：使用受限RGB样本训练对象模型、视觉适配器与终止检测器"); manifest=host.vision_runtime.train(game["id"],rgb_samples,host.stop_event,host.set_progress,sleep_seed,len(samples)); host.store.record_vision_model(game["id"],manifest)
             host.store.reencode_samples(game["id"],host.vision_runtime,host.stop_event,host.set_progress)
-            host.set_status("睡眠3/5：训练目标条件行为克隆、保守离线价值与独立风险模型")
+            del rgb_samples,samples
+            host.set_status("升级3/5：按固定批次加载策略特征，训练目标条件行为克隆、保守离线价值与独立风险模型")
             result=host._run_review_process()
-            host.set_status("睡眠4/5：校准概率、OOD阈值和危险动作零误放阈值")
-            host.set_status("睡眠5/5：按游戏、任务、分辨率、UI变体和session分组验收")
+            host.set_status("升级4/5：校准概率、OOD阈值和危险动作零误放阈值")
+            host.set_status("升级5/5：按游戏、任务、分辨率、UI变体和session分组验收")
             return result
         finally: host.store.resume_sample_writes()
     def _run_impl(self,phase=None):
@@ -8615,7 +8692,7 @@ class TrainingExecution:
         if not self.prototypes:
             raise RuntimeError("当前模型与任务白名单没有共同的已授权动作")
         self.allowed_backends={method for proto in self.prototypes for method in proto.get("capture_methods",[])} or set(self.model.get("capture_backends",[]))
-        self.calibration=self.phase.get("calibration") or self.host.ensure_capture_calibration(self.target,"训练")
+        self.calibration=self.phase.get("calibration") or self.host.ensure_capture_calibration(self.target,MODE_LABELS[ModeId.AI])
         self.capability=CapabilityProfile(base_profile)
         self.capability_result=self.capability.require_training_support({"capture_fps":self.calibration.get("fps",0.0),"available_action_frequency":1.0/max(0.01,safe_float(self.calibration.get("input_delay",0.25),0.25)),
             "semantic_size":HYBRID_GLOBAL_SIZE})
@@ -9134,7 +9211,7 @@ class GuidanceWindow:
         app=self.app
         created=prepared.get("created")
         try:
-            if app.mode!="指导" or app.stop_event is None or app.stop_event.is_set() or app.closing:
+            if app.mode!=ModeId.QUIZ.value or app.stop_event is None or app.stop_event.is_set() or app.closing:
                 return
             buffer=prepared["buffer"]
             producer=prepared["producer"]
@@ -9142,10 +9219,10 @@ class GuidanceWindow:
             app.lifecycle.mark_running()
             app.api.block_input()
             app.set_input_status("已锁定")
-            app.status.set("指导已开始：只允许A/B/C/D或E跳过；点击“结束指导”或按ESC结束")
+            app.status.set("做题已开始：先选择A/B/C/D或E，再点击“提交”；点击“结束做题”或按ESC结束")
             win=tk.Toplevel(app.root)
             app.ask_window=win
-            win.title("指导选择题")
+            win.title("做题")
             fit_window(win,780,720,560,420)
             win.transient(app.root)
             win.bind("<Unmap>",lambda event:buffer.set_preview_active(False))
@@ -9154,7 +9231,7 @@ class GuidanceWindow:
             win.bind("<FocusIn>",lambda event:buffer.set_preview_active(True))
             frame=scrollable_frame(win,16,True)
             ttk.Label(frame,text="请选择当前画面中AI应该执行的鼠标动作",font=("Microsoft YaHei UI",14,"bold")).pack(anchor="w")
-            ttk.Label(frame,text="主流程严格为选择题：A / B / C / D / E（跳过并记录为未标注）；点击“结束指导”或按ESC结束。",wraplength=730).pack(anchor="w",pady=(4,10))
+            ttk.Label(frame,text="主流程严格为选择题：先选择 A / B / C / D / E（跳过并记录为未标注），再点击“提交”；点击“结束做题”或按ESC结束。",wraplength=730).pack(anchor="w",pady=(4,10))
             canvas=tk.Canvas(frame,width=ASK_CANVAS_W,height=ASK_CANVAS_H,bg="black",highlightthickness=1,highlightbackground="#777777")
             canvas.pack()
             preview_info=tk.StringVar(value="等待彩色教学预览")
@@ -9162,7 +9239,7 @@ class GuidanceWindow:
             choice_frame=ttk.Frame(frame)
             choice_frame.pack(fill="both",expand=True,pady=(10,0))
             answer_buttons=[]
-            state={"frame":None,"choices":[],"candidates":[],"guidance_trigger":[],"image":None,"locked":False,"recent_actions":deque(["<START>","<START>"],maxlen=32),"state_since":time.monotonic(),"waiting":False}
+            state={"frame":None,"choices":[],"candidates":[],"guidance_trigger":[],"image":None,"locked":False,"selected":None,"recent_actions":deque(["<START>","<START>"],maxlen=32),"state_since":time.monotonic(),"waiting":False}
             def schedule(delay,callback):
                 if app.ask_window is None:
                     return
@@ -9178,6 +9255,7 @@ class GuidanceWindow:
                 for index,button in enumerate(answer_buttons):
                     button.configure(state="normal" if not value and index<len(state["choices"]) else "disabled")
                 skip_button.configure(state="disabled" if value else "normal")
+                submit_button.configure(state="normal" if not value and state.get("selected") is not None else "disabled")
             def render(packet):
                 question_frame=packet["frame"]
                 choices=packet["choices"][:4]
@@ -9224,12 +9302,14 @@ class GuidanceWindow:
                 state["choices"]=packet["choices"][:4]
                 state["candidates"]=list(packet.get("candidates",[]))
                 state["guidance_trigger"]=list(packet.get("guidance_trigger",[]))
+                state["selected"]=None
                 render(packet)
                 for index,button in enumerate(answer_buttons):
                     if index<len(state["choices"]):
                         button.configure(text=chr(65+index)+". "+str(state["choices"][index].get("guidance_label") or app.action_text(state["choices"][index]["a"])))
                     else:
                         button.configure(text=chr(65+index)+". 无可用答案")
+                skip_button.configure(text="E. 跳过（未标注）")
                 set_locked(False)
             def poll_question():
                 if app.ask_window is None or app.stop_event is None or app.stop_event.is_set():
@@ -9239,7 +9319,7 @@ class GuidanceWindow:
                     schedule(45,poll_question)
                     return
                 if packet.get("error"):
-                    app.status.set("指导等待可用画面："+str(packet["error"]))
+                    app.status.set("做题等待可用画面："+str(packet["error"]))
                     producer.request(state["recent_actions"],state["state_since"])
                     schedule(160,poll_question)
                     return
@@ -9261,26 +9341,48 @@ class GuidanceWindow:
                     state["recent_actions"].append(semantic_action_signature(result["action"]))
                     state["state_since"]=time.monotonic()
                 counts=app.ask_counts or {}
-                app.status.set("指导中：已保存"+str(counts.get("saved",0))+"，重复未保存"+str(counts.get("duplicates",0))+"，跳过"+str(counts.get("skipped",0))+"；模型需要睡眠")
+                app.status.set("做题中：已保存"+str(counts.get("saved",0))+"，重复未保存"+str(counts.get("duplicates",0))+"，跳过"+str(counts.get("skipped",0))+"；模型需要睡眠")
                 schedule(100,request_question)
             def queue_answer(kind,entry=None):
                 if state["locked"] or app.ask_answer_queue is None:
                     return
                 set_locked(True)
+                state["selected"]=None
                 app.ask_answer_queue.put({"kind":kind,"frame":state["frame"],"entry":entry or {},"candidates":list(state["candidates"]),"guidance_trigger":list(state["guidance_trigger"]),"recent_actions":list(state["recent_actions"]),"state_since":state["state_since"],"callback":finish_answer})
+            def select_answer(kind,entry=None,index=None):
+                if state["locked"]:
+                    return
+                state["selected"]={"kind":kind,"entry":entry or {},"index":index}
+                for position,button in enumerate(answer_buttons):
+                    if position<len(state["choices"]):
+                        label=chr(65+position)+". "+str(state["choices"][position].get("guidance_label") or app.action_text(state["choices"][position]["a"]))
+                        button.configure(text=("✓ " if index==position else "")+label)
+                skip_button.configure(text=("✓ " if kind=="skip" else "")+"E. 跳过（未标注）")
+                submit_button.configure(state="normal")
+                app.status.set("做题中：已选择"+("E" if kind=="skip" else chr(65+int(index)))+"，请点击“提交”")
+            def submit_answer():
+                selected=state.get("selected")
+                if selected is None:
+                    win.bell()
+                    app.status.set("请先选择A/B/C/D或E，再点击“提交”")
+                    return
+                queue_answer(selected["kind"],selected.get("entry"))
             def choose(index):
                 if index<len(state["choices"]):
-                    queue_answer("choose",state["choices"][index])
+                    select_answer("choose",state["choices"][index],index)
             for index in range(4):
                 button=ttk.Button(choice_frame,text=chr(65+index),command=lambda position=index:choose(position))
                 button.pack(fill="x",pady=3,ipady=6)
                 answer_buttons.append(button)
             tools=ttk.Frame(frame)
             tools.pack(fill="x",pady=(8,0))
-            skip_button=ttk.Button(tools,text="E. 跳过（未标注）",command=lambda:queue_answer("skip"))
+            skip_button=ttk.Button(tools,text="E. 跳过（未标注）",command=lambda:select_answer("skip"))
             skip_button.pack(side="left",fill="x",expand=True,ipady=6)
-            end_button=ttk.Button(tools,text="结束指导",command=lambda:app.close_ask(reason="completed"))
+            submit_button=ttk.Button(tools,text="提交",command=submit_answer,state="disabled")
+            submit_button.pack(side="left",padx=(8,0),ipadx=24,ipady=6)
+            end_button=ttk.Button(tools,text="结束做题",command=lambda:app.close_ask(reason="completed"))
             end_button.pack(side="left",padx=(8,0),ipadx=18,ipady=6)
+            win.bind("<Return>",lambda event:submit_answer())
             def refuse_close():
                 win.bell()
                 win.lift()
@@ -9302,7 +9404,7 @@ class GuidanceWindow:
             win.wait_visibility()
             win.focus_force()
         except Exception as error:
-            app._fail_active_mode("指导界面创建失败："+str(error))
+            app._fail_active_mode("做题界面创建失败："+str(error))
         finally:
             if created is not None:
                 created.set()
@@ -9323,13 +9425,13 @@ class TeachingController:
         historical=[]
         for index,item in enumerate(samples):
             if index%64==0 and app.should_stop():
-                raise InputStopped("指导初始化已停止")
+                raise InputStopped("做题初始化已停止")
             action=normalize_action(item.get("a")); semantic=sample_semantic_action(item)
             if feature_valid(item.get("f")) and action and semantic:
                 historical.append({"id":str(item.get("checksum",uuid.uuid4().hex)),"f":item["f"],"neural_f":item.get("neural_f"),"coarse":item.get("coarse") if isinstance(item.get("coarse"),(bytes,
                     bytearray)) and len(item.get("coarse"))==COARSE_LEN else coarse_feature(item["f"]),"a":action,"semantic_action":semantic,"cluster_id":"history|"+semantic_action_signature(semantic),
                     "canonical_action_signature":semantic_action_signature(semantic),"repeat_policy":str(item.get("repeat_policy","one_shot")),"source":"sample"})
-        calibration=app.ensure_capture_calibration(target,"指导")
+        calibration=app.ensure_capture_calibration(target,MODE_LABELS[ModeId.QUIZ])
         session_id="teach|"+uuid.uuid4().hex
         app.store.begin_learning_session(game["id"],session_id)
         sources=[]
@@ -9365,17 +9467,17 @@ class TeachingController:
                 if packet and not packet.get("error") and packet.get("frame") is not None:
                     initial=packet
                 elif packet and packet.get("error"):
-                    app.set_status("指导初始化等待画面："+str(packet["error"]))
+                    app.set_status("做题初始化等待画面："+str(packet["error"]))
                     producer.request(deque(["<START>","<START>"],maxlen=4),time.monotonic())
             if app.should_stop():
-                raise InputStopped("指导初始化已停止")
+                raise InputStopped("做题初始化已停止")
             if initial is None:
-                raise CaptureUnavailable("指导初始化未在限定时间内生成第一道题")
+                raise CaptureUnavailable("做题初始化未在限定时间内生成第一道题")
             created=threading.Event()
             app.ui(lambda:app._create_ask_window({"game":game,"target":target,"buffer":buffer,"producer":producer,"packet":initial,"created":created}))
             while not created.wait(0.05):
                 if app.should_stop():
-                    raise InputStopped("指导初始化已停止")
+                    raise InputStopped("做题初始化已停止")
             while not app.should_stop():
                 try:
                     command=answer_queue.get(timeout=0.05)
@@ -9398,18 +9500,18 @@ class TeachingController:
                         result={"saved":False,"action":None}
                     else:
                         if not frame.get("usable_for_teaching"):
-                            raise CaptureUnavailable("当前画面不可用于指导")
+                            raise CaptureUnavailable("当前画面不可用于做题")
                         temporal=app.build_temporal_context(buffer,frame,recent_actions,state_since)
                         temporal["previous_action_changed_frame"]=True
                         policy=str(entry.get("repeat_policy","one_shot"))
                         context=app.sample_context(recent_actions[-1] if recent_actions else "",0,True,frame.get("motion_valid",False),session_id,frame.get("method","unknown"),policy,temporal)
                         context.update({"episode_id":session_id,"step_id":safe_int(app.ask_counts.get("saved"),0),"action_delay":None,"human_override":True,"trajectory_schema_version":2})
                         if kind!="choose":
-                            raise RuntimeError("指导主流程仅接受A/B/C/D或E跳过")
+                            raise RuntimeError("做题主流程仅接受A/B/C/D或E跳过，并要求点击提交")
                         semantic=normalize_semantic_action(entry.get("a")) or semantic_action_from_interaction(entry.get("coordinate_action") or entry.get("a"),frame.get("semantic_targets",[]))
                         action=normalize_action(entry.get("coordinate_action")) or normalize_action(semantic)
                         if not semantic or not action:
-                            raise RuntimeError("指导动作无效")
+                            raise RuntimeError("做题动作无效")
                         context.update(semantic_context_payload(frame,semantic))
                         active_learning_label=str(entry.get("active_learning_label", ""))
                         context.update({"semantic_action":semantic,"grounded_action":action,"task_phase":str(frame.get("task_phase","unknown")),"guidance_trigger":guidance_trigger,
@@ -9428,7 +9530,7 @@ class TeachingController:
                     if callback:
                         app.ui(lambda callback=callback,result=result:callback(result,None))
                 except Exception as error:
-                    message="指导数据库或题目处理失败："+str(error)
+                    message="做题数据库或题目处理失败："+str(error)
                     if callback:
                         app.ui(lambda callback=callback,message=message:callback(None,message))
                     app.request_mode_stop("failed",message)
@@ -9439,13 +9541,13 @@ class TeachingController:
         else:
             app.store.validate_learning_session(game["id"],session_id)
         counts=app.ask_counts if isinstance(app.ask_counts,dict) else {"saved":0,"duplicates":0,"skipped":0}
-        summary="指导已结束：已保存"+str(counts.get("saved",0))+"，重复未保存"+str(counts.get("duplicates",0))+"，跳过"+str(counts.get("skipped",0))+"；模型需要睡眠"
+        summary="做题已结束：已保存"+str(counts.get("saved",0))+"，重复未保存"+str(counts.get("duplicates",0))+"，跳过"+str(counts.get("skipped",0))+"；模型需要睡眠"
         if status=="failed":
             return ModeResult("failed",app.lifecycle.snapshot()[4] or summary)
         final_status=status if status in {"completed","stopped"} else "stopped"
         reason=str(app.lifecycle.snapshot()[4] or "")
-        return ModeResult(final_status,summary,{"samples":stats.get("valid",0),"choices_only":True,"finish_button":final_status=="completed" and "ESC" not in reason.upper(),
-                "escape_used":final_status=="stopped" and bool(app.escape_metrics.get("pressed")),"question_options":["A","B","C","D","E跳过"]})
+        return ModeResult(final_status,summary,{"samples":stats.get("valid",0),"choices_only":True,"submit_required":True,"finish_button":final_status=="completed" and "ESC" not in reason.upper(),
+                "escape_used":final_status=="stopped" and bool(app.escape_metrics.get("pressed")),"question_options":["A","B","C","D","E跳过"],"submission_flow":["select","submit"]})
     def create_window(self,prepared):
         return GuidanceWindow(self.app).open(prepared)
 
@@ -9578,6 +9680,9 @@ class DataStore:
         self.writer_db=None
         self.db=ThreadLocalSQLite(self.db_path,False)
         try:
+            wal_mode=str(self.db.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
+            if wal_mode!="wal":
+                raise RuntimeError("文件系统不支持SQLite WAL，实际模式为"+wal_mode)
             result=self.db.execute("PRAGMA quick_check").fetchone()
             if not result or str(result[0]).lower()!="ok":
                 raise RuntimeError(str(result[0]) if result else "quick_check无结果")
@@ -9891,19 +9996,21 @@ class DataStore:
                     "source":"sleep_reconstruction","observation_schema_version":OBSERVATION_SCHEMA_VERSION,"skill_schema_version":SKILL_SCHEMA_VERSION}
                 self.db.execute("INSERT INTO episodes(game_id,episode_id,task_id,started,finished,terminal_state,total_reward,human_override_count,model_version,metadata) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (game_id,episode_id,task_id,started,finished,terminal,round(total_reward,6),override_count,version,encode(metadata,65536)))
+                step_rows=[]
                 for position,item in enumerate(ordered):
                     step_id=safe_int(item.get("step_id",position),position,0)
-                    self.db.execute(
+                    step_rows.append((game_id,episode_id,task_id,step_id,encode(item.get("observation_t",{})),encode(item.get("semantic_action",{}),262144),encode(item.get("grounded_action",{}),262144),
+                        str(item.get("skill_id",""))[:200],str(item.get("subgoal_id",""))[:200],encode(item.get("observation_t+1",{})),safe_float(item.get("action_start_time",item.get("created_t",0.0)),0.0),
+                        safe_float(item.get("action_end_time",item.get("created_t",0.0)),0.0),safe_float(item.get("environment_response_time",0.0),0.0,0.0,3600.0),
+                        safe_float(item.get("reward_t",item.get("reward",0.0)),0.0),safe_float(item.get("reward_confidence",0.0),0.0,0.0,1.0),encode(item.get("reward_components",{}),262144),
+                        str(item.get("terminal_state","neutral"))[:64],1 if item.get("human_override") else 0,str(item.get("model_version") or version)[:200],
+                        safe_float(item.get("policy_confidence",0.0),0.0,0.0,1.0),encode(item.get("safety_decision",{}),262144),str(item.get("source_sample_checksum",""))[:128]))
+                if step_rows:
+                    self.db.executemany(
                         "INSERT INTO episode_steps(game_id,episode_id,task_id,step_id,before_observation,semantic_action,grounded_action,skill_id,subgoal_id,after_observation,"
                         "action_start_time,action_end_time,environment_response_time,reward,reward_confidence,reward_components,terminal_state,human_override,model_version,policy_confidence,safety_decision,source_sample_checksum) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (game_id,episode_id,task_id,step_id,encode(item.get("observation_t",{})),encode(item.get("semantic_action",{}),262144),encode(item.get("grounded_action",{}),262144),
-                            str(item.get("skill_id",""))[:200],str(item.get("subgoal_id",""))[:200],encode(item.get("observation_t+1",{})),safe_float(item.get("action_start_time",item.get("created_t",0.0)),0.0),
-                            safe_float(item.get("action_end_time",item.get("created_t",0.0)),0.0),safe_float(item.get("environment_response_time",0.0),0.0,0.0,3600.0),
-                            safe_float(item.get("reward_t",item.get("reward",0.0)),0.0),safe_float(item.get("reward_confidence",0.0),0.0,0.0,1.0),encode(item.get("reward_components",{}),262144),
-                            str(item.get("terminal_state","neutral"))[:64],1 if item.get("human_override") else 0,str(item.get("model_version") or version)[:200],
-                            safe_float(item.get("policy_confidence",0.0),0.0,0.0,1.0),encode(item.get("safety_decision",{}),262144),str(item.get("source_sample_checksum",""))[:128]))
-                    inserted_steps+=1
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",step_rows)
+                    inserted_steps+=len(step_rows)
         return {"episodes":len(grouped),"steps":inserted_steps}
     def load_episode_trajectories(self,gid,task_id=None,limit=200):
         clauses=["game_id=?"]; values=[str(gid)]
@@ -9977,10 +10084,13 @@ class DataStore:
                 self.pending_event.clear()
                 self.writer_condition.notify_all()
                 return 0
-            batch=self.pending_samples
-            self.pending_samples=[]
+            batch=self.pending_samples[:WRITER_BATCH_SIZE]
+            del self.pending_samples[:len(batch)]
             self.writer_inflight+=1
-            self.pending_event.clear()
+            if self.pending_samples:
+                self.pending_event.set()
+            else:
+                self.pending_event.clear()
             review_games=sorted({item["gid"] for item in batch if item.get("mark_review")})
         last_error=None
         success=False
@@ -10084,7 +10194,6 @@ class DataStore:
         connection=sqlite3.connect(str(self.db_path),timeout=3.0,check_same_thread=True)
         connection.row_factory=sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
         connection.execute("PRAGMA busy_timeout=3000")
         self.writer_db=connection
@@ -10843,6 +10952,19 @@ class DataStore:
                 raise RuntimeError("游戏或session正在作废，拒绝接收样本")
             if (game_id,fingerprint) in self.pending_fingerprints:
                 return False
+            queued_total=sum(safe_int(counts.get("total"),0,0) for counts in self.pending_counts_by_game.values())
+            if queued_total>=MAX_PENDING_SAMPLES:
+                drop_index=next((index for index,value in enumerate(self.pending_samples) if value.get("kind")=="no_op"),None)
+                if drop_index is not None:
+                    dropped=self.pending_samples.pop(drop_index)
+                    self._pending_index_remove_locked(dropped)
+                    self.logger.write("SAMPLE_QUEUE_DROPPED_NO_OP",details={"game_id":str(dropped.get("gid")),"queue_depth":queued_total,"limit":MAX_PENDING_SAMPLES})
+                elif kind in {"no_op","hover","move"}:
+                    self.logger.write("SAMPLE_QUEUE_LOW_PRIORITY_REJECTED",details={"game_id":game_id,"kind":kind,"queue_depth":queued_total,"limit":MAX_PENDING_SAMPLES})
+                    return False
+                else:
+                    self.pending_event.set()
+                    raise RuntimeError("样本写入队列达到安全上限"+str(MAX_PENDING_SAMPLES)+"，已停止收集以避免内存无限增长")
             self.pending_samples.append(item)
             self._pending_index_add_locked(item)
             queue_depth=int(self.pending_counts_by_game[game_id]["total"])
@@ -10920,47 +11042,76 @@ class DataStore:
                         6)) if neural is not None else None,sqlite3.Binary(zlib.compress(rgb,6)),VISION_PREPROCESS_HASH,None,json.dumps(candidate_data,ensure_ascii=False,separators=(",",":")),str(source),
                     str(context.get("session_id") or "unspecified"),str(context.get("capture_method") or "unknown")))
             self.db.execute("UPDATE games SET needs_review=1 WHERE id=?",(gid,))
-    def _decode_sample_row(self,row,gid):
-        feature=upgrade_feature(bounded_decompress(row["feature"],FEATURE_LEN*2),row["feature_algorithm_version"])
+    def _sample_select_columns(self,payload="full"):
+        mode=str(payload or "full")
+        common=(
+            "s.id,s.created,s.feature_algorithm_version,s.action_algorithm_version,"
+            "s.preprocess_signature,s.action,s.source,s.session_id,s.capture_method,s.context,"
+            "s.weight,s.fingerprint,s.repeat_policy"
+        )
+        if mode=="vision":
+            return common+",NULL AS feature,NULL AS coarse,NULL AS neural_feature,s.rgb_thumbnail,s.thumbnail"
+        if mode=="policy":
+            return common+",s.feature,s.coarse,NULL AS neural_feature,NULL AS rgb_thumbnail,NULL AS thumbnail"
+        return common+",s.feature,s.coarse,s.neural_feature,s.rgb_thumbnail,s.thumbnail"
+    def _decode_sample_row(self,row,gid,payload="full"):
+        mode=str(payload or "full")
         action_payload=json.loads(row["action"])
         action=normalize_action(action_payload)
-        coarse=bytes(row["coarse"]) if row["coarse"] is not None and len(row["coarse"])==COARSE_LEN else coarse_feature(feature)
-        if not feature_valid(feature) or len(coarse)!=COARSE_LEN or not action:
-            raise ValueError("样本特征、粗特征或动作无效")
-        rgb=upgrade_sample_rgb(bounded_decompress(row["rgb_thumbnail"],PIXELS*3+16)) if row["rgb_thumbnail"] is not None else None
-        if rgb is None and row["thumbnail"] is not None:
-            rgb=upgrade_sample_rgb(bounded_decompress(row["thumbnail"],PIXELS*4))
-        neural=upgrade_feature(bounded_decompress(row["neural_feature"],FEATURE_LEN*2),FEATURE_ALGORITHM_VERSION) if row["neural_feature"] is not None else None
+        if not action:
+            raise ValueError("样本动作无效")
         context=json.loads(row["context"])
         if not isinstance(context,dict):
             raise ValueError("样本上下文必须是字典")
+        feature=None
+        coarse=None
+        rgb=None
+        neural=None
+        if mode!="vision":
+            if row["feature"] is None:
+                raise ValueError("样本特征缺失")
+            feature=upgrade_feature(bounded_decompress(row["feature"],FEATURE_LEN*2),row["feature_algorithm_version"])
+            coarse=bytes(row["coarse"]) if row["coarse"] is not None and len(row["coarse"])==COARSE_LEN else coarse_feature(feature)
+            if not feature_valid(feature) or len(coarse)!=COARSE_LEN:
+                raise ValueError("样本特征或粗特征无效")
+        if mode!="policy":
+            rgb=upgrade_sample_rgb(bounded_decompress(row["rgb_thumbnail"],PIXELS*3+16)) if row["rgb_thumbnail"] is not None else None
+            if rgb is None and row["thumbnail"] is not None:
+                rgb=upgrade_sample_rgb(bounded_decompress(row["thumbnail"],PIXELS*4))
+        if mode=="full" and row["neural_feature"] is not None:
+            neural=upgrade_feature(bounded_decompress(row["neural_feature"],FEATURE_LEN*2),FEATURE_ALGORITHM_VERSION)
         context.update({"session_id":row["session_id"],"capture_method":row["capture_method"],"repeat_policy":row["repeat_policy"]})
-        mask=context.get("modality_mask",{}) if isinstance(context.get("modality_mask"),dict) else {}; context["modality_mask"]={"rgb":rgb is not None,"manual_vision":True,"neural_vision":neural is not None,"ocr":bool(mask.get("ocr",
-            False)),"motion":bool(mask.get("motion",context.get("motion_channel_valid",False))),"keyboard":bool(mask.get("keyboard",False)),"audio":bool(mask.get("audio",False)),"gamepad":bool(mask.get("gamepad",False))}
-        if not isinstance(context.get("data_lineage"),dict): context["data_lineage"]={"schema_version":DATA_LINEAGE_SCHEMA_VERSION,"lineage_id":str(row["fingerprint"]),"game_id":str(gid),"session_id":str(row["session_id"]),"capture_backend":str(row["capture_method"]),"legacy_backfill":True}
+        existing_mask=context.get("modality_mask",{}) if isinstance(context.get("modality_mask"),dict) else {}
+        stored_rgb=bool(row["rgb_thumbnail"] is not None or row["thumbnail"] is not None)
+        stored_neural=bool(row["neural_feature"] is not None)
+        context["modality_mask"]={"rgb":stored_rgb,"manual_vision":True,"neural_vision":stored_neural,"ocr":bool(existing_mask.get("ocr",False)),
+            "motion":bool(existing_mask.get("motion",context.get("motion_channel_valid",False))),"keyboard":bool(existing_mask.get("keyboard",False)),
+            "audio":bool(existing_mask.get("audio",False)),"gamepad":bool(existing_mask.get("gamepad",False))}
+        if not isinstance(context.get("data_lineage"),dict):
+            context["data_lineage"]={"schema_version":DATA_LINEAGE_SCHEMA_VERSION,"lineage_id":str(row["fingerprint"]),"game_id":str(gid),
+                "session_id":str(row["session_id"]),"capture_backend":str(row["capture_method"]),"legacy_backfill":True}
         semantic=normalize_semantic_action(action_payload) or normalize_semantic_action(context.get("semantic_action")) or semantic_action_from_coordinate(action)
         context["semantic_action"]=semantic
         return {"format_version":FORMAT_VERSION,"feature_width":FEATURE_W,"feature_height":FEATURE_H,"feature_algorithm_version":FEATURE_ALGORITHM_VERSION,
             "action_algorithm_version":ACTION_ALGORITHM_VERSION,"created":row["created"],"game_id":gid,"f":feature,"raw_f":feature,"neural_f":neural,"coarse":coarse,
-            "a":action,"semantic_action":semantic,"semantic_family":semantic_action_family_key(semantic),"source":row["source"],"session_id":row["session_id"],"capture_method":row["capture_method"],"repeat_policy":row["repeat_policy"],
-            "context":context,"rgb":rgb,"thumbnail":rgb,"preprocess_signature":str(row["preprocess_signature"] or ""),"weight":row["weight"],"checksum":row["fingerprint"]}
-    def iter_samples(self,gid,limit=MAX_SAMPLES,batch_size=256,stats=None):
+            "a":action,"semantic_action":semantic,"semantic_family":semantic_action_family_key(semantic),"source":row["source"],"session_id":row["session_id"],
+            "capture_method":row["capture_method"],"repeat_policy":row["repeat_policy"],"context":context,"rgb":rgb,"thumbnail":rgb,
+            "preprocess_signature":str(row["preprocess_signature"] or ""),"weight":row["weight"],"checksum":row["fingerprint"]}
+    def iter_samples(self,gid,limit=MAX_SAMPLES,batch_size=256,stats=None,payload="full"):
         self.sample_write_barrier()
         game_id=str(gid)
         maximum=safe_int(limit,MAX_SAMPLES,1,MAX_TRAINING_SAMPLES)
         chunk=safe_int(batch_size,256,16,1024)
         counters=stats if isinstance(stats,dict) else {}
-        counters.update({"valid":0,"invalid":0,"total":0})
+        counters.update({"valid":0,"invalid":0,"total":0,"payload":str(payload)})
         corrupt=[]
         connection=sqlite3.connect("file:"+self.db_path.as_posix()+"?mode=ro",uri=True,timeout=3.0,check_same_thread=True)
         connection.row_factory=sqlite3.Row
         try:
+            columns=self._sample_select_columns(payload)
             query=(
                 "SELECT * FROM ("
-                "SELECT s.id,s.created,s.feature_algorithm_version,s.action_algorithm_version,"
-                "s.feature,s.coarse,s.neural_feature,s.rgb_thumbnail,s.preprocess_signature,"
-                "s.action,s.source,s.session_id,s.capture_method,s.context,s.thumbnail,s.weight,"
-                "s.fingerprint,s.repeat_policy FROM samples s JOIN learning_sessions ls "
+                "SELECT "+columns+" FROM samples s JOIN learning_sessions ls "
                 "ON ls.game_id=s.game_id AND ls.session_id=s.session_id "
                 "WHERE s.game_id=? AND ls.status='valid' "
                 "ORDER BY s.created DESC,s.id DESC LIMIT ?"
@@ -10974,7 +11125,7 @@ class DataStore:
                 for row in rows:
                     counters["total"]+=1
                     try:
-                        item=self._decode_sample_row(row,game_id)
+                        item=self._decode_sample_row(row,game_id,payload)
                     except (zlib.error,json.JSONDecodeError,UnicodeDecodeError,ValueError,TypeError,OverflowError) as error:
                         counters["invalid"]+=1
                         corrupt.append((row["id"],row["fingerprint"],error))
@@ -10988,26 +11139,146 @@ class DataStore:
             self.invalid_rows[game_id]=max(self.invalid_rows.get(game_id,0),counters["invalid"])
     def load_samples(self,gid,limit=MAX_SAMPLES):
         stats={}
-        result=list(self.iter_samples(gid,limit,256,stats))
+        result=list(self.iter_samples(gid,limit,256,stats,"full"))
         return result,stats
-    def load_training_samples(self,gid,limit=MAX_TRAINING_SAMPLES):
-        stats={}; source=list(self.iter_samples(gid,limit,512,stats)); groups=defaultdict(list)
-        for item in source:
-            context=item.get("context",{}) if isinstance(item.get("context"),dict) else {}; semantic=item.get("semantic_action") or context.get("semantic_action")
-            skill=semantic_skill(semantic).skill_id if semantic else "unknown"; outcome=str(context.get("terminal") or "failure" if context.get("failure_recovery") else "success" if context.get("subgoal_completed") else "neutral")
-            ood="ood" if context.get("ood_expected") else "id"; task=normalized_identifier(context.get("task_id"),"default",96); groups[(task,skill,outcome,ood,str(item.get("session_id","")))].append(item)
-        selected=[]; rng=random.Random(int(hashlib.sha256((str(gid)+"|stratified|"+str(len(source))).encode()).hexdigest()[:16],16)); keys=sorted(groups,key=lambda value:canonical_bytes(value))
-        while keys and len(selected)<limit:
+    def select_stratified_sample_ids(self,gid,limit=MAX_TRAINING_SAMPLES):
+        self.sample_write_barrier()
+        game_id=str(gid)
+        maximum=safe_int(limit,MAX_TRAINING_SAMPLES,1,MAX_TRAINING_SAMPLES)
+        candidate_limit=min(MAX_TRAINING_SAMPLES*TRAINING_METADATA_MULTIPLIER,max(maximum,maximum*TRAINING_METADATA_MULTIPLIER))
+        connection=sqlite3.connect("file:"+self.db_path.as_posix()+"?mode=ro",uri=True,timeout=3.0,check_same_thread=True)
+        connection.row_factory=sqlite3.Row
+        groups=defaultdict(list)
+        invalid=[]
+        metadata_total=0
+        try:
+            query=(
+                "SELECT * FROM ("
+                "SELECT s.id,s.created,s.action,s.context,s.session_id,s.fingerprint "
+                "FROM samples s JOIN learning_sessions ls ON ls.game_id=s.game_id AND ls.session_id=s.session_id "
+                "WHERE s.game_id=? AND ls.status='valid' "
+                "ORDER BY s.created DESC,s.id DESC LIMIT ?"
+                ") recent ORDER BY created ASC,id ASC"
+            )
+            for row in connection.execute(query,(game_id,candidate_limit)):
+                metadata_total+=1
+                try:
+                    context=json.loads(row["context"])
+                    action_payload=json.loads(row["action"])
+                    if not isinstance(context,dict):
+                        raise ValueError("样本上下文必须是字典")
+                    semantic=normalize_semantic_action(action_payload) or normalize_semantic_action(context.get("semantic_action"))
+                    skill=semantic_skill(semantic).skill_id if semantic else "unknown"
+                    terminal=str(context.get("terminal") or "")
+                    outcome=terminal if terminal else "failure" if context.get("failure_recovery") else "success" if context.get("subgoal_completed") else "neutral"
+                    meta=TrainingSampleMeta(int(row["id"]),safe_float(row["created"],0.0),normalized_identifier(context.get("task_id"),"default",96),
+                        str(skill),str(outcome),"ood" if context.get("ood_expected") else "id",str(row["session_id"]),str(row["fingerprint"]))
+                    groups[(meta.task_id,meta.skill_id,meta.outcome,meta.ood,meta.session_id)].append(meta)
+                except (json.JSONDecodeError,ValueError,TypeError,KeyError,OverflowError) as error:
+                    invalid.append((int(row["id"]),str(row["fingerprint"]),error))
+        finally:
+            connection.close()
+        for row_id,fingerprint,error in invalid:
+            self.quarantine_corrupt_row("samples",row_id,game_id,error,fingerprint)
+        group_count=len(groups)
+        seed=int(hashlib.sha256((game_id+"|stratified-metadata|"+str(metadata_total)).encode()).hexdigest()[:16],16)
+        rng=random.Random(seed)
+        for bucket in groups.values():
+            rng.shuffle(bucket)
+        keys=sorted(groups,key=lambda value:canonical_bytes(value))
+        selected=[]
+        while keys and len(selected)<maximum:
             next_keys=[]
             for key in keys:
                 bucket=groups[key]
                 if bucket:
-                    index=rng.randrange(len(bucket)); selected.append(bucket.pop(index))
-                    if bucket: next_keys.append(key)
-                    if len(selected)>=limit: break
+                    selected.append(bucket.pop())
+                    if bucket:
+                        next_keys.append(key)
+                    if len(selected)>=maximum:
+                        break
             keys=next_keys
-        selected.sort(key=lambda item:safe_float(item.get("created"),0.0)); stats.update({"stratified":True,"group_count":len(groups),"training_limit":limit,"selected":len(selected),"online_prototype_limit":MAX_PROTOTYPES})
-        return selected,stats
+        selected.sort(key=lambda item:(item.created,item.row_id))
+        stats={"stratified":True,"group_count":group_count,"training_limit":maximum,"candidate_limit":candidate_limit,
+            "metadata_total":metadata_total,"metadata_invalid":len(invalid),"selected":len(selected),"selection_seed":seed,
+            "online_prototype_limit":MAX_PROTOTYPES,"two_phase_loading":True}
+        return [item.row_id for item in selected],stats
+    def iter_training_sample_batches(self,gid,selected_ids,batch_size=256,payload="policy",stats=None):
+        game_id=str(gid)
+        identifiers=[safe_int(value,0,1) for value in selected_ids if safe_int(value,0,0)>0]
+        chunk=safe_int(batch_size,256,16,512)
+        counters=stats if isinstance(stats,dict) else {}
+        counters.setdefault("valid",0)
+        counters.setdefault("invalid",0)
+        counters.setdefault("total",0)
+        counters["payload"]=str(payload)
+        corrupt=[]
+        connection=sqlite3.connect("file:"+self.db_path.as_posix()+"?mode=ro",uri=True,timeout=3.0,check_same_thread=True)
+        connection.row_factory=sqlite3.Row
+        try:
+            columns=self._sample_select_columns(payload)
+            for offset in range(0,len(identifiers),chunk):
+                batch_ids=identifiers[offset:offset+chunk]
+                order={row_id:index for index,row_id in enumerate(batch_ids)}
+                placeholders=",".join("?" for _ in batch_ids)
+                rows=connection.execute("SELECT "+columns+" FROM samples s JOIN learning_sessions ls ON ls.session_id=s.session_id AND ls.game_id=s.game_id WHERE s.game_id=? AND ls.status='valid' AND s.id IN ("+placeholders+")",(game_id,*batch_ids)).fetchall()
+                decoded=[]
+                for row in sorted(rows,key=lambda value:order.get(int(value["id"]),len(order))):
+                    counters["total"]+=1
+                    try:
+                        decoded.append(self._decode_sample_row(row,game_id,payload))
+                    except (zlib.error,json.JSONDecodeError,UnicodeDecodeError,ValueError,TypeError,OverflowError) as error:
+                        counters["invalid"]+=1
+                        corrupt.append((row["id"],row["fingerprint"],error))
+                        continue
+                    counters["valid"]+=1
+                if decoded:
+                    yield decoded
+        finally:
+            connection.close()
+            for row_id,fingerprint,error in corrupt:
+                self.quarantine_corrupt_row("samples",row_id,game_id,error,fingerprint)
+            self.invalid_rows[game_id]=max(self.invalid_rows.get(game_id,0),safe_int(counters.get("invalid"),0,0))
+    def load_training_samples(self,gid,limit=MAX_TRAINING_SAMPLES,payload="policy"):
+        selected_ids,selection_stats=self.select_stratified_sample_ids(gid,limit)
+        stats=dict(selection_stats)
+        samples=[]
+        for batch in self.iter_training_sample_batches(gid,selected_ids,256,payload,stats):
+            samples.extend(batch)
+        stats["selected"]=len(samples)
+        stats["decoded_in_fixed_batches"]=True
+        return samples,stats
+    def write_training_sample_bundle(self,gid,limit=MAX_TRAINING_SAMPLES,payload="policy"):
+        selected_ids,selection_stats=self.select_stratified_sample_ids(gid,limit)
+        stats=dict(selection_stats)
+        folder=self.base/"cache"/"review_samples"
+        folder.mkdir(parents=True,exist_ok=True)
+        target=folder/("training_"+uuid.uuid4().hex+".ugb")
+        try:
+            with target.open("xb") as stream:
+                stream.write(b"UGAITB1\n")
+                for batch in self.iter_training_sample_batches(gid,selected_ids,256,payload,stats):
+                    raw=pickle.dumps(batch,protocol=5)
+                    packed=zlib.compress(raw,3)
+                    stream.write(len(packed).to_bytes(8,"big"))
+                    stream.write(packed)
+                stream.write((0).to_bytes(8,"big"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            digest=hashlib.sha256()
+            with target.open("rb") as stream:
+                while True:
+                    chunk=stream.read(1024*1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            stats["selected"]=safe_int(stats.get("valid"),0,0)
+            stats["decoded_in_fixed_batches"]=True
+            stats["disk_backed_worker_transfer"]=True
+            return {"path":str(target),"sha256":digest.hexdigest(),"format":"UGAITB1","count":stats["selected"]},stats
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
     def load_rejections(self,gid,limit=500):
         with self.lock:
             rows=self.db.execute("SELECT id,created,feature_algorithm_version,feature,coarse,neural_feature,rgb_thumbnail,preprocess_signature,thumbnail,candidates,source,session_id,capture_method FROM rejections WHERE game_id=? ORDER BY created DESC,id DESC LIMIT ?",
@@ -11876,7 +12147,7 @@ class GameSelectionDialog:
         working_selected=original_selected
         deleted_stack=[]
         win=tk.Toplevel(app.root)
-        win.title("游戏")
+        win.title("游戏名称")
         fit_window(win,540,450,420,340)
         win.transient(app.root)
         win.grab_set()
@@ -12576,7 +12847,7 @@ class AppUiMixin:
 
         flow=ttk.LabelFrame(outer,text="操作流程",style="Card.TLabelframe")
         flow.pack(fill="x",pady=(0,12))
-        primary_specs=[("游戏",self.open_game_dialog),("选择窗口",self.open_window_dialog),("学习",self.start_learning),("睡眠",self.start_sleep),("训练",self.start_training),("指导",self.start_ask)]
+        primary_specs=[("游戏名称",self.open_game_dialog),("选择窗口",self.open_window_dialog),(MODE_LABELS[ModeId.COLLECT],self.start_learning),(MODE_LABELS[ModeId.UPGRADE],self.start_sleep),(MODE_LABELS[ModeId.AI],self.start_training),(MODE_LABELS[ModeId.QUIZ],self.start_ask)]
         for index,(name,command) in enumerate(primary_specs):
             button=ttk.Button(flow,text=name,command=command,style="Workflow.TButton")
             self.control_buttons[name]=button
@@ -12587,7 +12858,7 @@ class AppUiMixin:
 
         info=ttk.LabelFrame(outer,text="当前配置",style="Card.TLabelframe")
         info.pack(fill="x",pady=(0,12))
-        labels=[("游戏",self.game_text),("窗口",self.window_text),("样本",self.sample_text),("模型",self.model_text)]
+        labels=[("游戏名称",self.game_text),("窗口",self.window_text),("样本",self.sample_text),("模型",self.model_text)]
         for index,(name,value) in enumerate(labels):
             row=index//2
             column=(index%2)*2
@@ -13271,21 +13542,21 @@ class AppLifecycleMixin:
         if self.mode_state==MODE_IDLE or self.shutdown_started or self.closing and self.mode_state==MODE_IDLE:
             return
         if result is None:
-            result=ModeResult("failed",str(self.mode or "模式")+"失败")
+            result=ModeResult("failed",mode_label(self.mode)+"失败")
         priority={"completed":0,"stopped":1,"failed":2}
         _,_,_,requested,reason=self.lifecycle.snapshot()
         effective=result.status
         if priority.get(requested,1)>priority.get(effective,0):
             effective=requested
         if effective!=result.status:
-            summary=reason or (str(self.mode or "模式")+("失败" if effective=="failed" else "已停止"))
+            summary=reason or (mode_label(self.mode)+("失败" if effective=="failed" else "已停止"))
             result=ModeResult(effective,summary,dict(result.details))
         self.pending_mode_result=result
         self.pending_mode_error=error
         self.request_mode_stop(result.status,result.summary if result.status=="failed" else reason or result.summary)
         self.mode_shutdown_deadline=time.monotonic()+5.0
         self.mode_shutdown_coordinator=self._make_shutdown_coordinator("模式关闭",5.0,False)
-        self.status.set(str(self.mode or "模式")+"正在停止资源，控制按钮保持禁用")
+        self.status.set(mode_label(self.mode)+"正在停止资源，控制按钮保持禁用")
         if not self.mode_shutdown_polling:
             self.mode_shutdown_polling=True
             self.root.after(25,self._poll_mode_shutdown)
@@ -13312,9 +13583,9 @@ class AppLifecycleMixin:
             self.status.set("STOPPING：等待资源退出："+"、".join(state.get("pending",[]))+suffix)
             self.root.after(50,self._poll_mode_shutdown)
             return
-        result=self.pending_mode_result or ModeResult("failed",str(self.mode or "模式")+"失败")
+        result=self.pending_mode_result or ModeResult("failed",mode_label(self.mode)+"失败")
         error=self.pending_mode_error
-        name=str(self.mode or "模式")
+        name=mode_label(self.mode)
         if self.mode_shutdown_forced:
             result.details["forced_processes"]=list(dict.fromkeys(self.mode_shutdown_forced))
             result.summary+="；已强制停止："+"、".join(result.details["forced_processes"])
@@ -13421,7 +13692,7 @@ class AppLifecycleMixin:
         try:
             if require_game:
                 self.require_game()
-            if self.storage_fault and name in {"学习","睡眠","指导"}:
+            if self.storage_fault and normalize_mode_id(name) in {ModeId.COLLECT.value,ModeId.UPGRADE.value,ModeId.QUIZ.value}:
                 raise RuntimeError(self.store.read_only_reason or self.store.writer_error or "样本存储故障，相关模式已锁定")
             if needs_window:
                 self.require_window(False)
@@ -13438,8 +13709,8 @@ class AppLifecycleMixin:
             self.set_input_status("已锁定")
             self.set_controls(True)
             self.progress_value.set(0)
-            self.status.set(str(status_text or (str(name)+"正在初始化，按ESC可立即中止")))
-            thread=threading.Thread(target=self.worker_entry,args=(name,target),name="UniversalGameAI-"+str(name),daemon=True)
+            self.status.set(str(status_text or (mode_label(name)+"正在初始化，按ESC可立即中止")))
+            thread=threading.Thread(target=self.worker_entry,args=(name,target),name="UniversalGameAI-"+normalize_mode_id(name),daemon=True)
             self.mode_thread=thread
             thread.start()
             return True
@@ -13477,19 +13748,19 @@ class AppLifecycleMixin:
                 stopped=bool(self.stop_event and self.stop_event.is_set())
                 requested=self.lifecycle.snapshot()[3]
                 status=requested if stopped and requested in {"completed","stopped","failed"} else "completed"
-                result=ModeResult(status,str(value if value is not None else name+"已结束"))
+                result=ModeResult(status,str(value if value is not None else mode_label(name)+"已结束"))
         except InputStopped as stopped_error:
             requested=self.lifecycle.snapshot()[3]
             status=requested if requested in {"failed","stopped"} else "stopped"
-            result=ModeResult(status,name+("失败" if status=="failed" else "已停止"),{"reason":str(stopped_error)})
+            result=ModeResult(status,mode_label(name)+("失败" if status=="failed" else "已停止"),{"reason":str(stopped_error)})
         except (TargetUnavailable,CaptureUnavailable) as stopped_error:
-            result=ModeResult("stopped",name+"已停止：目标窗口或安全采集条件不可用",{"reason":str(stopped_error)})
+            result=ModeResult("stopped",mode_label(name)+"已停止：目标窗口或安全采集条件不可用",{"reason":str(stopped_error)})
         except Exception as worker_error:
             error=traceback.format_exc()
             game_id=str(self.selected_game.get("id","")) if isinstance(self.selected_game,dict) else ""
             window_identity={key:self.selected_window.get(key) for key in ("hwnd","pid","class","process_path","process_created") if isinstance(self.selected_window,dict) and key in self.selected_window}
             self.store.log_error("MODE_WORKER_FAILED",worker_error,mode=name,game_id=game_id,window_identity=window_identity)
-            result=ModeResult("failed",name+"失败")
+            result=ModeResult("failed",mode_label(name)+"失败")
         finally:
             self.api.block_input()
             self.set_input_status("已锁定")
@@ -13632,7 +13903,7 @@ class AppModeMixin:
         except Exception as error:
             self.show_error(str(error))
             return
-        self.start_worker("学习",self.learning_controller.run,True)
+        self.start_worker(ModeId.COLLECT.value,self.learning_controller.run,True)
     def learning_worker(self):
         return self.learning_controller.run()
     def _learning_worker_impl(self):
@@ -13640,15 +13911,17 @@ class AppModeMixin:
     def _run_review_process(self):
         game=self.require_game()
         self.store.sample_write_barrier()
-        samples,stats=self.store.load_training_samples(game["id"],MAX_TRAINING_SAMPLES)
-        rejections=self.store.load_rejections(game["id"],500)
-        ocr_events=self.store.load_ocr_experience_events(game["id"],5000)
-        sleep_seed=safe_int(getattr(self,"sleep_seed",0),0,0,2**63-1)
-        worker=ReviewProcessWorker({"base":str(self.store.base),"game":game,"samples":samples,"stats":stats,"rejections":rejections,"ocr_events":ocr_events,
-                "profile":self.store.load_game_profile(game["id"]),"sleep_seed":sleep_seed,"sleep_seed_evidence":dict(getattr(self,"sleep_seed_evidence",{})),"cache_capacity":50000})
-        self.review_process=worker
-        packet=None
+        sample_bundle=None
+        worker=None
         try:
+            sample_bundle,stats=self.store.write_training_sample_bundle(game["id"],MAX_TRAINING_SAMPLES,"policy")
+            rejections=self.store.load_rejections(game["id"],500)
+            ocr_events=self.store.load_ocr_experience_events(game["id"],5000)
+            sleep_seed=safe_int(getattr(self,"sleep_seed",0),0,0,2**63-1)
+            worker=ReviewProcessWorker({"base":str(self.store.base),"game":game,"sample_bundle":sample_bundle,"stats":stats,"rejections":rejections,"ocr_events":ocr_events,
+                    "profile":self.store.load_game_profile(game["id"]),"sleep_seed":sleep_seed,"sleep_seed_evidence":dict(getattr(self,"sleep_seed_evidence",{})),"cache_capacity":50000})
+            self.review_process=worker
+            packet=None
             while True:
                 if self.should_stop():
                     worker.request_stop()
@@ -13694,8 +13967,8 @@ class AppModeMixin:
                 pool_validation_completed=bool(commit["pool"].get("pool_validation_completed"))
                 pool_changed=bool(pool_deleted or pool_merged or pool_downweighted)
                 seed_evidence=dict(details.get("sleep_seed_evidence",getattr(self,"sleep_seed_evidence",{})))
-                expected_seed,expected_evidence=deterministic_sleep_seed(game["id"],[item for item in samples if sample_rgb_valid(item.get("rgb"))])
-                deterministic_seed=bool(sleep_seed==expected_seed and seed_evidence.get("material_hash")==expected_evidence.get("material_hash"))
+                expected_evidence=dict(getattr(self,"sleep_seed_evidence",{}))
+                deterministic_seed=bool(sleep_seed>0 and seed_evidence.get("material_hash") and seed_evidence.get("material_hash")==expected_evidence.get("material_hash"))
                 offline_evidence=dict(details.get("offline_network_evidence",{}))
                 details.update({"sleep_seed":sleep_seed,"sleep_seed_evidence":seed_evidence,"deterministic_seed":deterministic_seed,
                         "offline_network_blocked":bool(offline_evidence.get("blocked")),"model_optimized":model_optimized,"model_optimization_checked":True,"pool_optimized":bool(pool_changed
@@ -13711,9 +13984,15 @@ class AppModeMixin:
                 self.store.save_model(model_gid,model,complete)
             return ModeResult(status,payload.get("summary","睡眠结束"),details)
         finally:
-            worker.request_stop()
-            worker.close(0.2)
-            if self.review_process is worker:
+            if worker is not None:
+                worker.request_stop()
+                worker.close(0.2)
+            if isinstance(sample_bundle,dict):
+                try:
+                    Path(str(sample_bundle.get("path",""))).unlink(missing_ok=True)
+                except OSError as error:
+                    record_cleanup_error("REVIEW_SAMPLE_BUNDLE_CLEANUP_FAILED",error)
+            if worker is not None and self.review_process is worker:
                 self.review_process=None
     def _prototype_medoid(self,members):
         if len(members)==1:
@@ -14214,7 +14493,7 @@ class AppModeMixin:
         except Exception as error:
             self.show_error(str(error))
             return
-        self.start_worker("睡眠",self.review_controller.run,False)
+        self.start_worker(ModeId.UPGRADE.value,self.review_controller.run,False)
     def _limit_prototypes(self,prototypes,limit):
         return information_balanced_prototype_limit(prototypes,limit)
     def _split_review_samples(self,valid):
@@ -14408,7 +14687,7 @@ class AppModeMixin:
         except Exception as error:
             self.show_error(str(error))
             return
-        self.start_worker("训练",self.training_controller.run,True)
+        self.start_worker(ModeId.AI.value,self.training_controller.run,True)
     def training_worker(self):
         return self.training_controller.run()
     def _training_worker_impl(self):
@@ -14428,14 +14707,14 @@ class AppModeMixin:
         except Exception as error:
             self.show_error(str(error))
             return
-        self.start_worker("指导",self.teaching_controller.run,True)
+        self.start_worker(ModeId.QUIZ.value,self.teaching_controller.run,True)
     def _create_ask_window(self,prepared):
         return self.teaching_controller.create_window(prepared)
     def close_ask(self,show_summary=True,wait_buffer=True,reason="completed"):
-        if self.mode!="指导" and self.ask_window is None:
+        if self.mode!=ModeId.QUIZ.value and self.ask_window is None:
             return
         status="completed" if str(reason)=="completed" else "stopped"
-        text="用户结束指导" if status=="completed" else "指导已停止"
+        text="用户结束做题" if status=="completed" else "做题已停止"
         self.request_mode_stop(status,text)
 class AppStorageMixin:
     def _restore_directory_display(self):
@@ -15094,7 +15373,7 @@ class App(AppUiMixin,AppLifecycleMixin,AppModeMixin,AppStorageMixin):
             self.storage_fault=bool(error) or bool(self.store.read_only)
             if error:
                 self.status.set("样本写入失败，学习与指导已锁定："+str(error))
-                if self.mode in {"学习","指导"}:
+                if self.mode in {ModeId.COLLECT.value,ModeId.QUIZ.value}:
                     self.request_mode_stop("failed","样本写入失败")
             else:
                 self.status.set("样本写入线程已恢复")
@@ -15113,14 +15392,14 @@ class App(AppUiMixin,AppLifecycleMixin,AppModeMixin,AppStorageMixin):
         directory_phase=self.lifecycle.directory_phase
         directory_busy=directory_phase in {"preparing","prepared"}
         mapping={"选择文件夹":not running and directory_phase!="preparing","检查文件完整性":not running and data_ready and not directory_busy,
-            "游戏":not running and runtime_ready and not directory_busy,"选择窗口":not running and runtime_ready and game_ready and not directory_busy,
-            "学习":not running and runtime_ready and game_ready and window_ready and not blocked and not directory_busy,
-            "睡眠":not running and runtime_ready and game_ready and self.has_samples and not blocked and not directory_busy,
-            "训练":not running and runtime_ready and game_ready and window_ready and self.training_ready and not directory_busy,
-            "指导":not running and runtime_ready and game_ready and window_ready and not blocked and not directory_busy}
+            "游戏名称":not running and runtime_ready and not directory_busy,"选择窗口":not running and runtime_ready and game_ready and not directory_busy,
+            MODE_LABELS[ModeId.COLLECT]:not running and runtime_ready and game_ready and window_ready and not blocked and not directory_busy,
+            MODE_LABELS[ModeId.UPGRADE]:not running and runtime_ready and game_ready and self.has_samples and not blocked and not directory_busy,
+            MODE_LABELS[ModeId.AI]:not running and runtime_ready and game_ready and window_ready and self.training_ready and not directory_busy,
+            MODE_LABELS[ModeId.QUIZ]:not running and runtime_ready and game_ready and window_ready and not blocked and not directory_busy}
         if self.developer_mode:
             mapping.update({"任务与安全":not running and runtime_ready and game_ready,"重新测试采集后端":not running and runtime_ready and window_ready,"数据清理":not running and data_ready and game_ready and not blocked,"停止":running})
-        recommended="选择文件夹" if not data_ready or directory_phase=="prepared" else "检查文件完整性" if not runtime_ready else "游戏" if not game_ready else "选择窗口" if not window_ready else "学习"
+        recommended="选择文件夹" if not data_ready or directory_phase=="prepared" else "检查文件完整性" if not runtime_ready else "游戏名称" if not game_ready else "选择窗口" if not window_ready else MODE_LABELS[ModeId.COLLECT]
         self.header_status_text.set("当前："+("正在准备目录" if directory_phase=="preparing" else "等待确认目录" if directory_phase=="prepared" else "运行中" if running else "已就绪" if runtime_ready else "待配置"))
         for name,button in self.control_buttons.items():
             try:
@@ -15165,7 +15444,7 @@ class App(AppUiMixin,AppLifecycleMixin,AppModeMixin,AppStorageMixin):
         self.ui(lambda:self.progress_value.set(max(0.0,min(100.0,float(value)))),"progress")
     def require_game(self):
         if not self.selected_game:
-            raise RuntimeError("请先点击“游戏”按钮选择或新建游戏")
+            raise RuntimeError("请先点击“游戏名称”按钮选择或新建游戏")
         if self.vision_runtime is not None and self.vision_runtime.ready:
             self.vision_runtime.activate_game(self.selected_game["id"])
         return self.selected_game
@@ -15175,6 +15454,7 @@ class App(AppUiMixin,AppLifecycleMixin,AppModeMixin,AppStorageMixin):
         self.api.validate_target_identity(self.selected_window,foreground)
         return self.selected_window
     def ensure_capture_calibration(self,target,purpose):
+        purpose_label=mode_label(purpose)
         target_identity=self.api.target_identity(target)
         target.update(target_identity)
         if self.selected_window is target or self.selected_window and int(self.selected_window.get("hwnd",0))==int(target.get("hwnd",0)):
@@ -15186,9 +15466,9 @@ class App(AppUiMixin,AppLifecycleMixin,AppModeMixin,AppStorageMixin):
             if cached:
                 self.api.calibrations[int(target["hwnd"])]=cached
                 calibration=self.api.calibration_for(target)
-                self.set_status(str(purpose)+"开始前已载入校准缓存，正在重新验证窗口身份和采集后端")
+                self.set_status(purpose_label+"开始前已载入校准缓存，正在重新验证窗口身份和采集后端")
         duration=0.9 if calibration.get("cache_loaded") or identity_valid else 1.8
-        self.set_status(str(purpose)+"开始前正在验收采集后端；黑屏只暂停验收，合法静态画面允许通过")
+        self.set_status(purpose_label+"开始前正在验收采集后端；黑屏只暂停验收，合法静态画面允许通过")
         def progress(value):
             self.set_progress(max(0.0,min(8.0,float(value)*8.0)))
         while not self.should_stop():
@@ -15198,7 +15478,7 @@ class App(AppUiMixin,AppLifecycleMixin,AppModeMixin,AppStorageMixin):
                 scenario=result.get("acceptance_scenarios",{}) if isinstance(result.get("acceptance_scenarios"),dict) else {}
                 for case in ("minimized","occluded","scaled","recreated"):
                     if case in scenario:
-                        self.record_acceptance_case("采集",case,"passed" if scenario.get(case) else "failed",{"purpose":str(purpose),"calibration":result,"scenario":case})
+                        self.record_acceptance_case("采集",case,"passed" if scenario.get(case) else "failed",{"purpose_id":normalize_mode_id(purpose),"purpose_label":purpose_label,"calibration":result,"scenario":case})
                 return result
             except InputStopped:
                 raise
@@ -15207,7 +15487,7 @@ class App(AppUiMixin,AppLifecycleMixin,AppModeMixin,AppStorageMixin):
                 if "非黑帧" not in text and "黑帧" not in text:
                     raise
                 self.lock_input("检测到黑屏，等待画面恢复")
-                self.set_status(str(purpose)+"验收暂停："+text)
+                self.set_status(purpose_label+"验收暂停："+text)
                 if self.stop_event is not None and self.stop_event.wait(0.2):
                     raise InputStopped("采集验收已停止")
                 duration=3.0
@@ -15313,22 +15593,23 @@ class App(AppUiMixin,AppLifecycleMixin,AppModeMixin,AppStorageMixin):
                 partials=[str(item.relative_to(self.data_directory)) for item in download_cache.rglob("*.part")] if download_cache is not None and download_cache.exists() else []
                 staging=list(self.data_directory.glob("runtime.staging.*")) if self.data_directory else []
                 self.record_acceptance_case("文件完整性","escape_retry","passed" if not staging else "failed",{"partial_files":partials[:20],"staging":list(map(str,staging)),"resume_preserved":bool(partials)})
-        elif str(name)=="学习":
+        elif normalize_mode_id(name)==ModeId.COLLECT.value:
             passed=bool(details.get("client_only") and safe_int(details.get("real_mouse_events"),0,0)>0 and safe_int(details.get("outside_rejected"),0,0)>=0 and safe_int(details.get("keyboard_events"),0,0)==0)
-            self.record_acceptance_case("学习","client_only_real_mouse","passed" if passed else "failed" if status=="completed" else "pending",details)
-        elif str(name)=="睡眠":
-            self.record_acceptance_case("睡眠","socket_blocked","passed" if details.get("offline_network_blocked") else "failed",details)
-            self.record_acceptance_case("睡眠","model_optimized","passed" if details.get("model_optimized") and details.get("model_after_hash") else "failed",details)
-            self.record_acceptance_case("睡眠","pool_optimized","passed" if details.get("pool_optimized") and details.get("pool_after_hash") else "failed",details)
-            self.record_acceptance_case("睡眠","deterministic_seed","passed" if details.get("deterministic_seed") and safe_int(details.get("sleep_seed"),0)>0 else "failed",details)
-        elif str(name)=="训练":
+            self.record_acceptance_case(MODE_LABELS[ModeId.COLLECT],"client_only_real_mouse","passed" if passed else "failed" if status=="completed" else "pending",details)
+        elif normalize_mode_id(name)==ModeId.UPGRADE.value:
+            self.record_acceptance_case(MODE_LABELS[ModeId.UPGRADE],"socket_blocked","passed" if details.get("offline_network_blocked") else "failed",details)
+            self.record_acceptance_case(MODE_LABELS[ModeId.UPGRADE],"model_optimized","passed" if details.get("model_optimized") and details.get("model_after_hash") else "failed",details)
+            self.record_acceptance_case(MODE_LABELS[ModeId.UPGRADE],"pool_optimized","passed" if details.get("pool_optimized") and details.get("pool_after_hash") else "failed",details)
+            self.record_acceptance_case(MODE_LABELS[ModeId.UPGRADE],"deterministic_seed","passed" if details.get("deterministic_seed") and safe_int(details.get("sleep_seed"),0)>0 else "failed",details)
+        elif normalize_mode_id(name)==ModeId.AI.value:
             audit=details.get("coordinate_audit",{}) if isinstance(details.get("coordinate_audit"),dict) else {}
-            self.record_acceptance_case("训练","all_coordinates_in_client","passed" if safe_int(audit.get("outside"),1)==0 and safe_int(audit.get("sent"),0)>=0 else "failed",audit)
-            self.record_acceptance_case("训练","immutable_snapshot_change_stop","passed" if details.get("training_snapshot_checksum") and details.get("snapshot_guarded") else "failed",details)
-        elif str(name)=="指导":
-            self.record_acceptance_case("指导","choices_only","passed" if details.get("choices_only") else "failed",details)
-            self.record_acceptance_case("指导","finish_button","passed" if details.get("finish_button") else "pending",details)
-            self.record_acceptance_case("指导","escape","passed" if details.get("escape_used") else "pending",details)
+            self.record_acceptance_case(MODE_LABELS[ModeId.AI],"all_coordinates_in_client","passed" if safe_int(audit.get("outside"),1)==0 and safe_int(audit.get("sent"),0)>=0 else "failed",audit)
+            self.record_acceptance_case(MODE_LABELS[ModeId.AI],"immutable_snapshot_change_stop","passed" if details.get("training_snapshot_checksum") and details.get("snapshot_guarded") else "failed",details)
+        elif normalize_mode_id(name)==ModeId.QUIZ.value:
+            self.record_acceptance_case(MODE_LABELS[ModeId.QUIZ],"choices_only","passed" if details.get("choices_only") else "failed",details)
+            self.record_acceptance_case(MODE_LABELS[ModeId.QUIZ],"submit_required","passed" if details.get("submit_required") else "failed",details)
+            self.record_acceptance_case(MODE_LABELS[ModeId.QUIZ],"finish_button","passed" if details.get("finish_button") else "pending",details)
+            self.record_acceptance_case(MODE_LABELS[ModeId.QUIZ],"escape","passed" if details.get("escape_used") else "pending",details)
         if self.data_directory is not None:
             staging=list(self.data_directory.glob("runtime.staging.*"))+list(self.data_directory.glob(".ugai_prepare_*"))+list(self.data_directory.glob(".ugai_migration_*"))
             self.record_acceptance_case("错误恢复","no_staging","passed" if not staging else "failed",{"staging":list(map(str,staging))})
@@ -19171,8 +19452,17 @@ def run_static_contract_tests(path=None):
     except Exception as error:
         source=""
         check("syntax_compile",False,str(error))
-    check("exact_default_control_contract",REQUIRED_DEFAULT_BUTTONS=={"选择文件夹","检查文件完整性","游戏","选择窗口","学习","睡眠","训练","指导"} and len(REQUIRED_DEFAULT_BUTTONS)==8,sorted(REQUIRED_DEFAULT_BUTTONS))
-    check("mode_specs_contract",set(MODE_SPECS)=={"学习","睡眠","训练","指导"} and all(isinstance(value.get("requires"),tuple) and value.get("runner") for value in MODE_SPECS.values()),MODE_SPECS)
+    check("exact_default_control_contract",REQUIRED_DEFAULT_BUTTONS=={"选择文件夹","检查文件完整性","游戏名称","选择窗口","收集数据","升级","AI","做题"} and len(REQUIRED_DEFAULT_BUTTONS)==8,sorted(REQUIRED_DEFAULT_BUTTONS))
+    check("mode_specs_contract",set(MODE_SPECS)=={mode.value for mode in ModeId} and set(MODE_LABELS.values())=={"收集数据","升级","AI","做题"} and all(isinstance(value.get("requires"),tuple) and value.get("runner") for value in MODE_SPECS.values()),MODE_SPECS)
+    check("mode_id_label_separation",all(mode.value.isascii() and mode.value==mode.value.lower() for mode in ModeId) and not set(MODE_SPECS).intersection(MODE_LABELS.values()),{"ids":sorted(MODE_SPECS),"labels":sorted(MODE_LABELS.values())})
+    check("quiz_requires_explicit_submit",'text="提交"' in source and '"submission_flow":["select","submit"]' in source and '"submit_required":True' in source)
+    wal_pragma="PRAGMA journal_mode="+"WAL"
+    wal_assignments=source.count('execute("'+wal_pragma+'")')
+    check("bounded_sample_writer_contract",WRITER_BATCH_SIZE==64 and MAX_PENDING_SAMPLES==512 and wal_assignments==1 and "SAMPLE_QUEUE_DROPPED_NO_OP" in source,{"batch":WRITER_BATCH_SIZE,"pending":MAX_PENDING_SAMPLES,"wal_assignments":wal_assignments})
+    check("two_phase_training_loader_contract",all(value in source for value in ("select_stratified_sample_ids","iter_training_sample_batches","write_training_sample_bundle","disk_backed_worker_transfer","MAX_VISION_TRAINING_SAMPLES")))
+    main_position=source.rfind("\ndef main(argv=None):")
+    main_source=source[main_position:] if main_position>=0 else ""
+    check("normal_startup_parses_cli_before_developer_ast_checks",main_position>=0 and main_source.find("arguments=parse_cli(argv)")<main_source.find("validate_source_contracts_once()") and "assert_no_duplicate_top_level_symbols()" not in main_source)
     check("subprocess_protocol_contract",all(value>=2 for value in (AI_WORKER_PROTOCOL_VERSION,RUNTIME_INSTALL_PROTOCOL_VERSION,REVIEW_PROCESS_PROTOCOL_VERSION,
                 TEST_WORKER_PROTOCOL_VERSION)),{"ai":AI_WORKER_PROTOCOL_VERSION,"runtime":RUNTIME_INSTALL_PROTOCOL_VERSION,"sleep":REVIEW_PROCESS_PROTOCOL_VERSION,"test":TEST_WORKER_PROTOCOL_VERSION})
     try:
@@ -19240,7 +19530,7 @@ def run_static_contract_tests(path=None):
     )
     write_test=subprocess.run([sys.executable,"-c",write_code],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=90)
     check("write_boundary_guard_active_probe",write_test.returncode==0 and write_test.stdout.strip().endswith("True"),write_test.stderr[-4000:])
-    state=ControlStateMachine(); state.set_directory_phase("ready"); state.set_runtime_ready(True); event=state.begin("学习"); starting=state.snapshot()[0]==MODE_STARTING; state.mark_running(); running=state.snapshot()[0]==MODE_RUNNING; state.request_stop("stopped",
+    state=ControlStateMachine(); state.set_directory_phase("ready"); state.set_runtime_ready(True); event=state.begin(ModeId.COLLECT.value); starting=state.snapshot()[0]==MODE_STARTING; state.mark_running(); running=state.snapshot()[0]==MODE_RUNNING; state.request_stop("stopped",
         "contract"); stopping=state.snapshot()[0]==MODE_STOPPING and event.is_set(); state.finish()
     check("starting_running_stopping_state_machine",starting and running and stopping and state.snapshot()[0]==MODE_IDLE)
     with tempfile.TemporaryDirectory() as folder:
@@ -22895,6 +23185,15 @@ def assert_single_default_component_assignment(path=None):
     if invalid:
         raise AssertionError("默认组件必须且只能赋值一次："+json.dumps(invalid,ensure_ascii=False,sort_keys=True,separators=(",",":")))
     return True
+_SOURCE_CONTRACTS_VALIDATED=False
+def validate_source_contracts_once(path=None):
+    global _SOURCE_CONTRACTS_VALIDATED
+    if _SOURCE_CONTRACTS_VALIDATED:
+        return True
+    assert_no_duplicate_top_level_symbols(path)
+    assert_single_default_component_assignment(path)
+    _SOURCE_CONTRACTS_VALIDATED=True
+    return True
 
 
 def generalization_contract_suite():
@@ -23064,9 +23363,9 @@ def run_gui():
 def main(argv=None):
     multiprocessing.freeze_support()
     try:
-        assert_no_duplicate_top_level_symbols()
-        assert_single_default_component_assignment()
         arguments=parse_cli(argv)
+        if bool(getattr(arguments,"developer_mode",False)):
+            validate_source_contracts_once()
         result=dispatch_cli(arguments)
         if result is not None:
             return int(result)
