@@ -62,8 +62,8 @@ SQUARED_DIFF=tuple(value*value for value in range(-255,256))
 FEATURE_ALGORITHM_VERSION=4
 ACTION_ALGORITHM_VERSION=6
 DATABASE_SCHEMA_VERSION=12
-MODEL_SCHEMA_VERSION=4
-POLICY_MODEL_SCHEMA_VERSION=6
+MODEL_SCHEMA_VERSION=5
+POLICY_MODEL_SCHEMA_VERSION=7
 DEFAULT_POLICY_SCORE_WEIGHTS={"bc":60.0,"q":45.0,"success":35.0,"risk":45.0,"ood":55.0}
 DEFAULT_SAMPLE_BUDGET=1500
 MAX_SAMPLES=6000
@@ -73,14 +73,14 @@ DATA_LINEAGE_SCHEMA_VERSION=3
 MODALITY_MASK_SCHEMA_VERSION=2
 MAX_TRAINING_SAMPLES=24000
 POLICY_ENSEMBLE_SIZE=5
-POLICY_INPUT_SIZE=64
-POLICY_HIDDEN_SIZE=32
-LATENT_STATE_SIZE=32
-LATENT_ACTION_SIZE=16
-SEMANTIC_ENCODER_SCHEMA_VERSION=1
-SEMANTIC_EMBEDDING_SIZE=48
+POLICY_INPUT_SIZE=96
+POLICY_HIDDEN_SIZE=64
+LATENT_STATE_SIZE=64
+LATENT_ACTION_SIZE=24
+SEMANTIC_ENCODER_SCHEMA_VERSION=2
+SEMANTIC_EMBEDDING_SIZE=64
 SEMANTIC_VOCAB_LIMIT=4096
-LATENT_WORLD_ENSEMBLE_SIZE=3
+LATENT_WORLD_ENSEMBLE_SIZE=5
 ADAPTER_RANK=3
 SLEEP_PIPELINE_PHASES=("integrity_and_leakage","perception_and_termination","offline_policy_value_risk","calibration_and_ood","grouped_isolated_acceptance")
 SEMANTIC_DETECTOR_SCHEMA_VERSION=1
@@ -5887,6 +5887,14 @@ class FrameBuffer:
                     frame["frame_digest"]=frame_digest(frame)
                     if self.need_preview and frame.get("preview_rgb") is not None and SEMANTIC_EVENT_TRIGGER.should_process(frame,self.semantic_interval,1.2):
                         try:
+                            if runtime is not None and runtime.ready and runtime.active_game and hasattr(runtime,"encode_semantic"):
+                                semantic_payload=runtime.encode_semantic(frame["preview_rgb"],frame.get("preview_width",PREVIEW_W),frame.get("preview_height",PREVIEW_H))
+                                if isinstance(semantic_payload,dict):
+                                    frame["semantic_backbone_tokens"]=semantic_payload.get("tokens",[])
+                                    frame["semantic_backbone_backend"]=semantic_payload.get("backend","")
+                                    frame["semantic_backbone_quantized"]=bool(semantic_payload.get("quantized"))
+                                    frame["semantic_backbone_device"]=semantic_payload.get("device","")
+                                    frame["semantic_backbone_checksum"]=semantic_payload.get("checksum","")
                             self.semantic_targets=detect_semantic_targets(frame,24,DEFAULT_SEMANTIC_DETECTOR_VERSION)
                             self.semantic_last_time=stamp
                         except (RuntimeError,ValueError,TypeError,CaptureUnavailable) as error:
@@ -8045,7 +8053,7 @@ class ReviewExecution:
             "decision_calibration":decision_calibration,"episode_metrics":summarize_episode_metrics(experiences),
             "default_task_id":default_task_id,"task_ids":sorted({str(item.get("task_id",
             "default")) for item in tasks}),"task_definitions_checksum":task_definitions_checksum(tasks),"task_definitions":tasks,"skill_library":skill_library,"policy_score_weights":normalized_policy_score_weights(profile.get("policy_score_weights")),
-            "decision_architecture":"task_planner+reusable_skill_policy+value_model+risk_model+independent_safety_shield","state_architecture":"objectized_multiscale_observation+semantic_objects+ocr_values+gru32+task_and_action_history",
+            "decision_architecture":"task_planner+reusable_skill_policy+value_model+risk_model+independent_safety_shield","state_architecture":"64x36_fast_path+224x126_semantic_path+object_slots+scene_graph+12_frame_temporal_encoder+task_action_memory",
             "semantic_action_schema_version":SEMANTIC_ACTION_SCHEMA_VERSION,"observation_schema_version":OBSERVATION_SCHEMA_VERSION,"skill_schema_version":SKILL_SCHEMA_VERSION,"state_key_algorithm_version":STATE_KEY_ALGORITHM_VERSION,
             "model_hierarchy":{"shared_visual_encoder":True,"shared_semantic_action_space":True,"shared_skill_library":True,"game_adapter":"lightweight","task_policy_head":True,"atomic_action_as_skill_parameter":True},
             "model_binding":model_binding_from_samples(self.train),"safety_profile_checksum":profile_checksum(profile),"stopped":False}
@@ -8070,10 +8078,21 @@ class ReviewExecution:
         self.model["world_model"]["semantic_encoder"]=self.model.get("semantic_encoder",{})
         self.model["auditable_transition_model"]=self.model["world_model"].get("auditable_transition_model",{})
         self.model["learned_subgoal_planner"]=train_learned_subgoal_planner(training_experiences,self.model.get("task_definitions",[])); self.model["skill_contracts"]={key:dict(value) for key,value in SKILL_CONTRACTS.items()}
-        profile=self.host.store.load_game_profile(self.game["id"]); self.model["generalization_evaluation"]=GeneralizationEvaluator.evaluate(self.train,self.holdout,experiences,self.game["id"],str(profile.get("game_type","ui_game")))
+        profile=self.host.store.load_game_profile(self.game["id"])
+        fingerprint=model_evaluation_fingerprint(self.game["id"],self.train_checksums,self.model.get("decision_architecture",""))
+        benchmark=FixedGeneralizationBenchmark.load(self.host.store.base,fingerprint)
+        self.model["evaluation_model_fingerprint"]=fingerprint
+        self.model["generalization_benchmark"]={key:value for key,value in benchmark.items() if key!="rows"}
+        self.model["generalization_evaluation"]=GeneralizationEvaluator.evaluate(self.train,benchmark.get("rows",[]),[],self.game["id"],
+            str(profile.get("game_type","ui_game")),benchmark.get("manifest",{}),benchmark)
+        self.model["model_scope"]=generalization_model_scope(self.model["generalization_evaluation"])
+        self.model["validation"]["model_scope"]=self.model["model_scope"]
+        self.model["validation"]["generalization_benchmark_verified"]=bool(self.model["generalization_evaluation"].get("benchmark_verified"))
+        self.model["validation"]["generalization_level_3_4_passed"]=self.model["model_scope"]=="general_model"
+        self.model["validation"]["evaluation_model_fingerprint"]=fingerprint
         self.model["sleep_pipeline"]={"schema_version":2,"phases":list(SLEEP_PIPELINE_PHASES),"training_sample_limit":MAX_TRAINING_SAMPLES,"prototype_online_limit":MAX_PROTOTYPES,"stratified_sampling":True}
         self.model["decision_architecture"]="skill_generation+strict_offline_iql+cql+awr+risk_calibration+latent_rollout+hierarchical_predicate_planner+independent_safety_lease"
-        self.model["state_architecture"]="manual_fallback+read_only_shared_multiscale_backbone+low_rank_film_adapters+object_slots+tracked_relations+ocr_tokens+semantic_action_history+goal_embedding+persistent_memory"
+        self.model["state_architecture"]="64x36_auditable_fast_path+224x126_cnn_or_quantized_onnx_semantic_path+12_frame_temporal_tokens+object_slots+tracked_relations+high_resolution_ocr_crops+semantic_action_history+goal_embedding+persistent_memory+manual_safety_fallback"
         self.model["model_hierarchy"]={"shared_backbone":{"read_only":True,"updated_by_game_training":False},"game_type_adapter":{"kind":"low_rank_residual_film","rank":ADAPTER_RANK},
             "game_specific_adapter":{"kind":"low_rank_residual_film","rank":ADAPTER_RANK},"balanced_replay_required_for_shared_update":True,"distillation_required_for_shared_update":True,
             "parameter_change_constraint_required":True,"old_task_regression_required":True,"automatic_rollback_required":True}
@@ -8218,7 +8237,7 @@ class TrainingExecution:
         self.profile["temporal_termination_model"]=dict(self.model.get("temporal_termination_model",{})) if isinstance(self.model.get("temporal_termination_model"),dict) else {}
         self.profile["reward_hacking_guard"]=dict(self.model.get("reward_hacking_guard",{})) if isinstance(self.model.get("reward_hacking_guard"),dict) else {}
         self.task_definition=TaskDefinition.from_mapping(task or {**self.profile,"game_id":self.game["id"],"task_id":active_task_id},self.game["id"],active_task_id)
-        self.task_planner=DEFAULT_TASK_PLANNER
+        self.task_planner=HierarchicalTaskPlanner(self.model.get("learned_subgoal_planner",{}),self.model.get("world_model",{}),4)
         self.skill_policy=DEFAULT_SKILL_POLICY
         self.safety_shield=DEFAULT_SAFETY_SHIELD
         self.current_subgoal=Subgoal("advance_goal",self.task_definition.goal,{},(),0,0.0)
@@ -8441,6 +8460,7 @@ class TrainingExecution:
         observation=objectized_observation(captured,temporal,self.task_definition)
         self.current_subgoal=self.task_planner.propose_subgoal(observation,self.task_definition)
         temporal["subgoal_id"]=self.current_subgoal.subgoal_id
+        temporal["planner_plan"]=dict(getattr(self.task_planner,"last_plan",{}))
         temporal["observation_state_id"]=observation.state_id
         temporal["environment_id"]=observation.environment_id
         if not temporal_from_context({**temporal,"previous_action_changed_frame":self.significant}).get("complete"):
@@ -11956,7 +11976,7 @@ class TaskSettingsDialog:
         keyboard_enabled=tk.BooleanVar(value=bool(profile.get("keyboard_enabled",False)))
         sound_enabled=tk.BooleanVar(value=bool(profile.get("sound_enabled",False)))
         gamepad_enabled=tk.BooleanVar(value=bool(profile.get("gamepad_enabled",False)))
-        ttk.Label(safety,text="OCR能力级别0-4；键盘、声音、手柄均由下方独立开关授权").grid(row=2,column=0,columnspan=2,sticky="w",pady=(6,0))
+        ttk.Label(safety,text="能力层级：0仅鼠标；1加OCR；2加语义键盘；3加声音事件；4加手柄与连续控制。高层能力必须同时勾选对应授权。",wraplength=610).grid(row=2,column=0,columnspan=2,sticky="w",pady=(6,0))
         ttk.Spinbox(safety,from_=0,to=4,textvariable=capability_level,width=6).grid(row=2,column=2,sticky="w",pady=(6,0))
         ttk.Checkbutton(safety,text="启用语义键盘数据与动作权限",variable=keyboard_enabled).grid(row=3,column=0,columnspan=3,sticky="w",pady=(6,0))
         ttk.Checkbutton(safety,text="启用声音事件数据（不保存原始音频）",variable=sound_enabled).grid(row=4,column=0,columnspan=3,sticky="w",pady=(6,0))
@@ -12074,11 +12094,21 @@ class TaskSettingsDialog:
                     if action_family_key(restart_action) not in allowed:
                         raise RuntimeError("启用重新开始动作时，必须把“左键单击”加入白名单")
                 active_overlay=task_profile_overlay(profile,active_task)
+                selected_level=safe_int(capability_level.get(),0,0,4)
+                keyboard_permission=bool(keyboard_enabled.get())
+                sound_permission=bool(sound_enabled.get())
+                gamepad_permission=bool(gamepad_enabled.get())
+                expected_keyboard=selected_level>=2
+                expected_sound=selected_level>=3
+                expected_gamepad=selected_level>=4
+                if keyboard_permission!=expected_keyboard or sound_permission!=expected_sound or gamepad_permission!=expected_gamepad:
+                    raise RuntimeError("能力层级与显式授权不一致：Level 2必须授权语义键盘，Level 3还必须授权声音事件，Level 4还必须授权手柄；较低层级必须关闭对应授权")
                 value=dict(profile)
                 value.update({"default_task_id":state["task_id"],"goal":active_overlay.get("goal",""),"allowed_families":allowed,"max_consecutive_failures":safe_int(max_failures.get(),3,1,20),
-                        "exploration_enabled":bool(exploration.get()),"capability_level":safe_int(capability_level.get(),0,0,4),
-                        "keyboard_enabled":bool(keyboard_enabled.get()),"sound_enabled":bool(sound_enabled.get()),
-                        "gamepad_enabled":bool(gamepad_enabled.get()),"restart_action":restart_action,"success_states":active_overlay.get("success_states",[]),"failure_states":active_overlay.get("failure_states",[])})
+                        "exploration_enabled":bool(exploration.get()),"capability_level":selected_level,
+                        "keyboard_enabled":keyboard_permission,"sound_enabled":sound_permission,
+                        "gamepad_enabled":gamepad_permission,"restart_action":restart_action,"success_states":active_overlay.get("success_states",[]),"failure_states":active_overlay.get("failure_states",[])})
+                value.update(CapabilityProfile(value).to_dict())
                 app.store.save_game_profile(game["id"],value)
                 for task in tasks.values():
                     app.store.save_task(game["id"],task,False)
@@ -12450,7 +12480,7 @@ class AppUiMixin:
         game_ready=isinstance(game,dict)
         window_ready=False
         result={"unchanged":False,"signature":signature,"game_text":game.get("name","未选择") if game_ready else "未选择","window_text":"未选择","window_detail":"PID：-  类名：-  客户区：-  游戏区域：-",
-            "capture_text":"采集方式：未检测","sample_text":"样本：有效0  废弃0  session 0  数据0 KB","model_text":"模型：无  需要睡眠：否","training_ready":False,"flow_text":""}
+            "capture_text":"采集方式：未检测","sample_text":"样本：有效0  废弃0  session 0  数据0 KB","model_text":"单游戏模型：无  需要睡眠：否","training_ready":False,"flow_text":""}
         if isinstance(window,dict):
             result["window_text"]=window.get("title","未命名窗口")
             try:
@@ -12496,10 +12526,14 @@ class AppUiMixin:
                     authorized=sorted(str(value) for value in validation.get("authorized_families",[]) if str(value))
                     error_text="接受样本错误率无法计算（验证不足）" if accepted_error is None else "接受样本错误率"+str(round(float(accepted_error)*100,2))+"%"
                     detail="留出"+str(holdout)+" 接受"+str(accepted)+" 覆盖"+str(round(coverage*100,1))+"% 总体正确"+str(round(overall*100,1))+"% 95%上界"+str(round(error_upper*100,2))+"% 拒识"+str(round(reject_rate*100,1))+"%"
-                    model_kind="完整模型" if status=="passed" and metadata.get("slot")=="complete" else "基础安全模型" if status=="basic_safe" else "不可训练临时模型"
+                    general_claim=bool(validation.get("model_scope")=="general_model" and validation.get("generalization_benchmark_verified") and validation.get("generalization_level_3_4_passed"))
+                    scope_text="通用模型" if general_claim else "单游戏模型"
+                    model_kind=scope_text+"（完整模型）" if status=="passed" and metadata.get("slot")=="complete" else scope_text+"（基础安全模型）" if status=="basic_safe" else scope_text+"（不可训练临时模型）"
                     retained_status=str(trainable_validation.get("status",""))
                     retained_authorized=sorted(str(value) for value in trainable_validation.get("authorized_families",[]) if str(value))
-                    retained_text="" if trainable_metadata is None or trainable_metadata.get("saved")==metadata.get("saved") else "  已保留可训练模型："+retained_status+"，授权动作："+("、".join(retained_authorized) if retained_authorized else "已授权动作")
+                    retained_general=bool(trainable_validation.get("model_scope")=="general_model" and trainable_validation.get("generalization_benchmark_verified") and trainable_validation.get("generalization_level_3_4_passed"))
+                    retained_scope="通用模型" if retained_general else "单游戏模型"
+                    retained_text="" if trainable_metadata is None or trainable_metadata.get("saved")==metadata.get("saved") else "  已保留可训练"+retained_scope+"："+retained_status+"，授权动作："+("、".join(retained_authorized) if retained_authorized else "已授权动作")
                     result["model_text"]=model_kind+"："+str(metadata.get("prototype_count",
                             0))+"个原型  最近睡眠："+created+"  "+error_text+"  "+detail+"  授权动作："+("、".join(authorized) if authorized else "无")+"  需要睡眠："+("是" if needs else "否")+retained_text
                     result["training_ready"]=bool(trainable_metadata is not None and retained_status in {"passed","basic_safe"} and int(trainable_validation.get("authorized_prototypes",0) or 0)>0 and not needs)
@@ -12522,7 +12556,7 @@ class AppUiMixin:
                             left_count=safe_int(families.get("click|left",0),0,0)
                             missing.insert(0,"普通左键样本 "+str(max(0,VersionedThresholdConfig.basic_safe_min_positive-left_count))+" 个，或其他基础安全动作达到"+str(VersionedThresholdConfig.basic_safe_min_positive)+"个高一致样本")
                 else:
-                    result["model_text"]="模型：无  需要睡眠："+("是" if needs else "否")
+                    result["model_text"]="单游戏模型：无  需要睡眠："+("是" if needs else "否")
                     if valid<=0:
                         missing.append("有效学习样本")
                     else:
@@ -14615,7 +14649,7 @@ class App(AppUiMixin,AppLifecycleMixin,AppModeMixin,AppStorageMixin):
         self.window_detail=tk.StringVar(value="PID：-  类名：-  客户区：-")
         self.capture_text=tk.StringVar(value="采集方式：未检测")
         self.sample_text=tk.StringVar(value="样本：有效0  废弃0  数据0 KB")
-        self.model_text=tk.StringVar(value="模型：无  需要睡眠：否")
+        self.model_text=tk.StringVar(value="单游戏模型：无  需要睡眠：否")
         self.confidence_text=tk.StringVar(value="离线AI运行库：未检查")
         self.input_text=tk.StringVar(value="自动输入：已锁定")
         self.progress_value=tk.DoubleVar(value=0.0)
@@ -15398,6 +15432,13 @@ DEVELOPMENT_MODULE_ANCHORS=(
     ("src/learning/vision.py","OfflineVisionRuntime"),
     ("src/acceptance/windows_runtime.py","_acceptance_geometry_complete"),
     ("src/tests/contracts.py","logic_contract_suite"),
+    ("src/perception/hybrid.py","high_resolution_semantic_tokens"),
+    ("src/perception/encoder.py","ObjectCentricObservationEncoder"),
+    ("src/tasks/planner.py","HierarchicalTaskPlanner"),
+    ("src/world_model/transition.py","train_auditable_transition_model"),
+    ("src/benchmark/generalization.py","FixedGeneralizationBenchmark"),
+    ("src/learning/skills.py","AutomaticSkillDiscovery"),
+    ("src/tests/generalization.py","generalization_contract_suite"),
 )
 
 def _top_level_node_name(node):
@@ -15485,10 +15526,17 @@ def _single_file_builder_source(order):
 def _project_module_templates_base(source=None):
     source_text=str(source) if source is not None else Path(__file__).read_text(encoding="utf-8")
     modules=split_development_modules(source_text)
-    order=list(modules)
-    modules["src/module_order.json"]=json.dumps(order,ensure_ascii=False,indent=2)+"\n"
-    modules["dev_main.py"]=_development_loader_source(order)
-    modules["build_single_file.py"]=_single_file_builder_source(order)
+    source_order=list(modules)
+    runtime_order=[]
+    for relative in source_order:
+        target="uga/"+relative[4:] if relative.startswith("src/") else relative
+        modules[target]=modules[relative]
+        runtime_order.append(target)
+    modules["src/module_order.json"]=json.dumps(source_order,ensure_ascii=False,indent=2)+"\n"
+    modules["uga/module_order.json"]=json.dumps(runtime_order,ensure_ascii=False,indent=2)+"\n"
+    modules["uga/__init__.py"]="ARCHITECTURE='verified_shared_namespace_modules'\n"
+    modules["dev_main.py"]=_development_loader_source(runtime_order)
+    modules["build_single_file.py"]=_single_file_builder_source(runtime_order)
     modules["main.py"]="from dev_main import main\nif __name__=='__main__':\n    raise SystemExit(main())\n"
     modules["tests/__init__.py"]=""
     modules["tests/conftest.py"]=(
@@ -15528,16 +15576,22 @@ def _project_module_templates_base(source=None):
 
 def project_module_templates(source=None):
     modules=_project_module_templates_base(source); packages={"capture":"窗口与多后端采集、连续帧缓冲和高分辨率全局通道","perception":"共享视觉骨干、对象槽、运动编码和场景图","actions":"语义动作、技能和输入映射","tasks":"目标谓词和学习式子目标规划","policy":"目标条件离线策略集成和不确定性",
-        "world_model":"可审计转移模型和连续潜在动力学","safety":"独立安全进程和短时动作租约","storage":"数据谱系、分层回放和迁移","modes":"学习、五阶段睡眠、训练和指导","ui":"八按钮界面和确认弹窗"}
-    for name,description in packages.items(): modules["src/"+name+"/__init__.py"]="PACKAGE_DESCRIPTION="+repr(description)+"\n"
+        "world_model":"可审计转移模型和连续潜在动力学","benchmark":"固定真实泛化基准、哈希验证和模型晋升门禁","safety":"独立安全进程和短时动作租约","storage":"数据谱系、分层回放和迁移","modes":"学习、五阶段睡眠、训练和指导","ui":"八按钮界面和确认弹窗"}
+    for name,description in packages.items():
+        modules["src/"+name+"/__init__.py"]="PACKAGE_DESCRIPTION="+repr(description)+"\n"
+        modules["uga/"+name+"/__init__.py"]="PACKAGE_DESCRIPTION="+repr(description)+"\n"
     modules["tests/test_upgrade_architecture.py"]=(
         "from pathlib import Path\n"
         "def test_upgrade_architecture():\n"
         "    root=Path(__file__).resolve().parents[1]\n"
         "    source=(root/'dist'/'main.py').read_text(encoding='utf-8')\n"
-        "    for token in ('GeneralizationEvaluator','goal_conditioned_candidate_features','train_latent_world_model',\n"
+        "    for token in ('FixedGeneralizationBenchmark','GeneralizationEvaluator','high_resolution_semantic_tokens',\n"
+        "                  'goal_conditioned_candidate_features','train_latent_world_model','AutomaticSkillDiscovery',\n"
         "                  'low_rank_residual_film','SLEEP_PIPELINE_PHASES'):\n"
         "        assert token in source\n"
+        "    assert (root/'uga'/'perception'/'hybrid.py').is_file()\n"
+        "    assert (root/'uga'/'world_model'/'transition.py').is_file()\n"
+        "    assert (root/'uga'/'benchmark'/'generalization.py').is_file()\n"
     )
     return modules
 
@@ -15559,6 +15613,9 @@ def materialize_project_layout(base):
         "generated":time.time(),
     }
     _atomic_write(root/"manifest.json",json.dumps(manifest,ensure_ascii=False,sort_keys=True,separators=(",",":")))
+    contract_builder=globals().get("FixedGeneralizationBenchmark")
+    if contract_builder is not None:
+        contract_builder.materialize_contract(base)
     return root
 
 def configure_data_directory(path):
@@ -16726,6 +16783,9 @@ class OfflineVisionRuntime:
         self.error="尚未检查AI运行库"
         self.runtime_manifest=None
         self.builtin_state=None
+        self.semantic_onnx=None
+        self.semantic_onnx_metadata={}
+        self.semantic_onnx_error=""
         self._load_runtime()
     def _load_runtime(self):
         try:
@@ -16967,8 +17027,92 @@ class OfflineVisionRuntime:
         result=self._manifest_base(); manager=getattr(self,"adapter_hierarchy",None) or AdapterHierarchyManager(self.base); game_type=getattr(self,"active_game_type","ui_game")
         result["hierarchy"]={"shared_backbone":{"relative_path":result.get("shared_base_relative_path",""),"checksum":result.get("shared_base_checksum",""),"read_only":True,"game_training_writes":False},
             "game_type_adapter":manager.manifest_entry("type",game_type),"game_specific_adapter":manager.manifest_entry("game",self.active_game or "default")}
-        result["capabilities"].update({"high_resolution_global_channel":True,"dynamic_object_rois":True,"cross_frame_tracking":True,"scene_graph":True,"read_only_shared_backbone":True,"low_rank_film_adapters":True,"manual_feature_fallback":True})
+        result["capabilities"].update({"high_resolution_global_channel":True,"high_resolution_semantic_input":list(HYBRID_GLOBAL_SIZE),
+            "cpu_quantized_onnx":self._semantic_onnx_path().is_file(),"gpu_full_visual_model":bool(self.torch is not None and str(self.device).casefold().startswith("cuda")),
+            "dynamic_object_rois":True,"cross_frame_tracking":True,"scene_graph":True,"read_only_shared_backbone":True,"low_rank_film_adapters":True,"manual_feature_fallback":True})
         return result
+    def _semantic_onnx_path(self):
+        return self.model_dir/"semantic_backbone_int8.onnx"
+    def _load_semantic_onnx(self):
+        if self.semantic_onnx is not None:
+            return self.semantic_onnx
+        path=self._semantic_onnx_path()
+        metadata_path=Path(str(path)+".json")
+        if not path.is_file() or not metadata_path.is_file():
+            self.semantic_onnx_error="quantized_onnx_not_installed"
+            return None
+        try:
+            metadata=json.loads(metadata_path.read_text(encoding="utf-8"))
+            checksum=str(metadata.get("sha256","")).lower()
+            if checksum!=sha256_file(path,MODEL_MAX_BYTES):
+                raise RuntimeError("semantic ONNX checksum mismatch")
+            if safe_int(metadata.get("schema_version"),0)!=1 or metadata.get("quantized_int8") is not True:
+                raise RuntimeError("semantic ONNX metadata invalid")
+            import importlib
+            cv2=importlib.import_module("cv2")
+            net=cv2.dnn.readNetFromONNX(str(path))
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+            self.semantic_onnx=(cv2,net)
+            self.semantic_onnx_metadata=metadata
+            self.semantic_onnx_error=""
+            return self.semantic_onnx
+        except (OSError,ValueError,TypeError,RuntimeError,json.JSONDecodeError,ImportError) as error:
+            self.semantic_onnx_error=type(error).__name__+":"+str(error)
+            self.semantic_onnx=None
+            return None
+    def encode_semantic(self,rgb,width,height):
+        source=bytes(rgb) if isinstance(rgb,(bytes,bytearray,memoryview)) else b""
+        source_width=safe_int(width,0,1,8192)
+        source_height=safe_int(height,0,1,8192)
+        if len(source)!=source_width*source_height*3:
+            raise CaptureUnavailable("高分辨率语义视觉输入尺寸无效")
+        target_width,target_height=HYBRID_GLOBAL_SIZE
+        if self.torch is not None and self.np is not None and self.model is not None and str(self.device).casefold().startswith("cuda"):
+            array=self.np.frombuffer(source,dtype=self.np.uint8).reshape(source_height,source_width,3).copy()
+            tensor=self.torch.from_numpy(array).permute(2,0,1).unsqueeze(0).to(self.device,dtype=self.torch.float32)/255.0
+            tensor=self.torch.nn.functional.interpolate(tensor,size=(target_height,target_width),mode="bilinear",align_corners=False)
+            with self.lock,self.torch.inference_mode():
+                encoded=self.model(tensor)
+            pooled=self.torch.nn.functional.avg_pool2d(encoded,kernel_size=HYBRID_SEMANTIC_PATCH,stride=HYBRID_SEMANTIC_PATCH,ceil_mode=True)
+            values=pooled.squeeze(0).permute(1,2,0).to("cpu",dtype=self.torch.float32).numpy()
+            tokens=[]
+            rows,columns,channels=values.shape
+            for y in range(rows):
+                for x in range(columns):
+                    token=[safe_float(value,0.0,-8.0,8.0) for value in values[y,x,:min(channels,32)].tolist()]
+                    token.extend(((x+0.5)/max(1,columns),(y+0.5)/max(1,rows)))
+                    tokens.append([round(value,6) for value in token])
+            return {"backend":"full_cnn_gpu","learned":True,"quantized":False,"device":self.device_name,
+                "input_size":[target_width,target_height],"patch_size":HYBRID_SEMANTIC_PATCH,"tokens":tokens,
+                "token_count":len(tokens),"checksum":hashlib.sha256(canonical_bytes(tokens)).hexdigest()}
+        onnx=self._load_semantic_onnx()
+        if onnx is not None and self.np is not None:
+            cv2,net=onnx
+            array=self.np.frombuffer(source,dtype=self.np.uint8).reshape(source_height,source_width,3)
+            blob=cv2.dnn.blobFromImage(array,1.0/255.0,(target_width,target_height),swapRB=False,crop=False)
+            with self.lock:
+                net.setInput(blob)
+                output=net.forward()
+            values=self.np.asarray(output,dtype=self.np.float32)
+            if values.ndim==4:
+                values=values[0].transpose(1,2,0)
+            elif values.ndim==3:
+                values=values.transpose(1,2,0) if values.shape[0]<values.shape[-1] else values
+            else:
+                values=values.reshape(1,-1,1)
+            tokens=[]
+            for y in range(values.shape[0]):
+                for x in range(values.shape[1]):
+                    token=[safe_float(value,0.0,-8.0,8.0) for value in values[y,x].reshape(-1)[:64].tolist()]
+                    token.extend(((x+0.5)/max(1,values.shape[1]),(y+0.5)/max(1,values.shape[0])))
+                    tokens.append([round(value,6) for value in token])
+            return {"backend":"quantized_onnx_int8_cpu","learned":True,"quantized":True,"device":"cpu",
+                "input_size":[target_width,target_height],"patch_size":safe_int(self.semantic_onnx_metadata.get("patch_size"),HYBRID_SEMANTIC_PATCH,1,64),
+                "tokens":tokens[:512],"token_count":min(512,len(tokens)),"checksum":hashlib.sha256(canonical_bytes(tokens[:512])).hexdigest()}
+        fallback=high_resolution_semantic_tokens({"preview_rgb":source,"preview_width":source_width,"preview_height":source_height},target_width,target_height,HYBRID_SEMANTIC_PATCH)
+        fallback["onnx_error"]=self.semantic_onnx_error
+        return fallback
     def _tensor_from_rgb(self,rgb):
         source=sample_rgb_bytes(rgb)
         if source is None:
@@ -17630,6 +17774,8 @@ def ai_worker_main(base,address,auth_text,family,protocol_version=None):
                     value=vision.manifest()
                 elif operation=="encode":
                     value=vision.encode(bytes(payload.get("rgb",b"")),bytes(payload["previous"]) if payload.get("previous") is not None else None)
+                elif operation=="encode_semantic":
+                    value=vision.encode_semantic(bytes(payload.get("rgb",b"")),payload.get("width"),payload.get("height"))
                 elif operation=="train":
                     stop=FileStopEvent(payload.get("stop_path"))
                     snapshot_descriptor=dict(payload.get("snapshot",{}))
@@ -17902,6 +18048,9 @@ class VisionRuntimeProxy:
     def encode(self,rgb,previous_rgb=None):
         self.require_ready()
         return self.worker.request("encode",{"rgb":bytes(rgb),"previous":bytes(previous_rgb) if previous_rgb is not None else None},30.0)
+    def encode_semantic(self,rgb,width,height):
+        self.require_ready()
+        return self.worker.request("encode_semantic",{"rgb":bytes(rgb),"width":safe_int(width,0),"height":safe_int(height,0)},45.0)
     def train(self,game_id,samples,stop_event=None,progress=None,seed=None):
         self.require_ready()
         if stop_event is not None and stop_event.is_set():
@@ -18936,14 +19085,15 @@ def build_cli_parser():
     return parser
 
 GENERAL_OBJECT_CLASSES=("button","character","enemy","item","card","tile","slot","meter","number","dialog","menu","cursor","target_area","scroll_area")
-HYBRID_GLOBAL_SIZE=(160,90)
-HYBRID_GLOBAL_OPTIONAL_SIZE=(224,126)
+HYBRID_GLOBAL_SIZE=(224,126)
+HYBRID_GLOBAL_OPTIONAL_SIZE=(320,180)
+HYBRID_SEMANTIC_PATCH=16
 HYBRID_CROP_SIZES=(96,128)
-HYBRID_HISTORY_FRAMES=8
+HYBRID_HISTORY_FRAMES=12
 STRUCTURED_MEMORY_LENGTH=96
 ACTION_LEASE_MIN_SECONDS=0.10
 ACTION_LEASE_MAX_SECONDS=0.30
-CAPABILITY_LEVEL_NAMES={0:"仅鼠标，无声音",1:"鼠标与OCR",2:"鼠标、OCR与语义键盘",3:"鼠标、OCR、语义键盘与声音事件",4:"鼠标、OCR、语义键盘、声音事件与手柄"}
+CAPABILITY_LEVEL_NAMES={0:"仅鼠标",1:"鼠标+OCR",2:"鼠标+OCR+语义键盘",3:"鼠标+OCR+语义键盘+声音事件",4:"鼠标+OCR+语义键盘+声音事件+手柄与连续控制"}
 SEMANTIC_KEY_ACTIONS=frozenset({"move_left","move_right","move_up","move_down","jump","interact","open_menu","pause"})
 ACTIVE_LEARNING_RESUME={}
 
@@ -19268,6 +19418,57 @@ def build_scene_graph(objects):
                     edges.append({"source":first_id,"relation":"can_open","target":str(second.get("track_id") or second.get("instance")),"confidence":0.68})
     return {"schema_version":1,"nodes":nodes[:64],"edges":edges[:160]}
 
+def high_resolution_semantic_tokens(frame,width=HYBRID_GLOBAL_SIZE[0],height=HYBRID_GLOBAL_SIZE[1],patch=HYBRID_SEMANTIC_PATCH):
+    item=dict(frame) if isinstance(frame,dict) else {}
+    external=item.get("semantic_backbone_tokens")
+    if isinstance(external,list) and external:
+        tokens=[]
+        for value in external[:512]:
+            if isinstance(value,(list,tuple)):
+                tokens.append([round(safe_float(entry,0.0,-8.0,8.0),6) for entry in list(value)[:64]])
+        if tokens:
+            return {"backend":str(item.get("semantic_backbone_backend") or "external_learned_backbone"),"learned":True,
+                "quantized":bool(item.get("semantic_backbone_quantized")),"device":str(item.get("semantic_backbone_device") or "unknown"),
+                "input_size":[safe_int(width,HYBRID_GLOBAL_SIZE[0]),safe_int(height,HYBRID_GLOBAL_SIZE[1])],"patch_size":safe_int(patch,HYBRID_SEMANTIC_PATCH),
+                "tokens":tokens,"token_count":len(tokens),"checksum":hashlib.sha256(canonical_bytes(tokens)).hexdigest()}
+    source,source_width,source_height=_frame_rgb_source(item)
+    if source is None:
+        return {"backend":"manual_feature_only","learned":False,"quantized":False,"device":"cpu","input_size":[width,height],
+            "patch_size":patch,"tokens":[],"token_count":0,"checksum":""}
+    rgb=resize_rgb(source,source_width,source_height,width,height)
+    tokens=[]
+    for top in range(0,height,patch):
+        bottom=min(height,top+patch)
+        for left in range(0,width,patch):
+            right=min(width,left+patch)
+            count=max(1,(right-left)*(bottom-top))
+            sums=[0.0,0.0,0.0]
+            squares=[0.0,0.0,0.0]
+            edge=0.0
+            for y in range(top,bottom):
+                for x in range(left,right):
+                    offset=(y*width+x)*3
+                    values=[rgb[offset]/255.0,rgb[offset+1]/255.0,rgb[offset+2]/255.0]
+                    for channel,value in enumerate(values):
+                        sums[channel]+=value
+                        squares[channel]+=value*value
+                    if x+1<right:
+                        adjacent=offset+3
+                        edge+=sum(abs(int(rgb[offset+channel])-int(rgb[adjacent+channel])) for channel in range(3))/(3.0*255.0)
+                    if y+1<bottom:
+                        adjacent=offset+width*3
+                        edge+=sum(abs(int(rgb[offset+channel])-int(rgb[adjacent+channel])) for channel in range(3))/(3.0*255.0)
+            means=[value/count for value in sums]
+            deviations=[math.sqrt(max(0.0,squares[channel]/count-means[channel]*means[channel])) for channel in range(3)]
+            cx=(left+right)/(2.0*width)
+            cy=(top+bottom)/(2.0*height)
+            token=[*means,*deviations,min(1.0,edge/max(1.0,count*2.0)),cx,cy,(right-left)/width,(bottom-top)/height]
+            tokens.append([round(value,6) for value in token])
+    checksum=hashlib.sha256(canonical_bytes(tokens)).hexdigest()
+    return {"backend":"high_resolution_patch_fallback","learned":False,"quantized":False,"device":"cpu","input_size":[width,height],
+        "patch_size":patch,"tokens":tokens,"token_count":len(tokens),"checksum":checksum,
+        "upgrade_contract":{"cpu":"quantized_onnx_int8","gpu":"full_cnn_or_vit","manual_feature_fallback":True}}
+
 def build_hybrid_visual_state(frame,history=None):
     item=dict(frame) if isinstance(frame,dict) else {}
     source,source_width,source_height=_frame_rgb_source(item)
@@ -19276,6 +19477,7 @@ def build_hybrid_visual_state(frame,history=None):
     global_width,global_height=HYBRID_GLOBAL_SIZE
     global_rgb=resize_rgb(source,source_width,source_height,global_width,global_height)
     compressed=zlib.compress(global_rgb,4)
+    semantic_tokens=high_resolution_semantic_tokens(item,global_width,global_height,HYBRID_SEMANTIC_PATCH)
     targets=[value for value in item.get("semantic_targets",[]) if isinstance(value,dict) and str(value.get("source"))!="compatibility_alias"]
     local=[]
     for target in sorted(targets,key=lambda value:(str(value.get("class")) in {"number","button","meter"},safe_float(value.get("confidence"),0.0)),reverse=True)[:10]:
@@ -19293,8 +19495,10 @@ def build_hybrid_visual_state(frame,history=None):
         motion.append(round(difference,5))
     manual=item.get("f")
     manual_status={"available":feature_valid(manual),"black_frame":bool(item.get("black_frame")),"capture_frozen":bool(item.get("capture_frozen")),"protected_or_black":bool(item.get("protected_or_black")),"ood_independent_evidence":True}
-    return {"schema_version":2,"global_size":[global_width,global_height],"optional_global_size":list(HYBRID_GLOBAL_OPTIONAL_SIZE),"global_digest":hashlib.sha256(global_rgb).hexdigest(),
-        "global_rgb_b85":base64.b85encode(compressed).decode("ascii"),"local_crops":local,"motion":motion[-HYBRID_HISTORY_FRAMES:],"history_frames":min(HYBRID_HISTORY_FRAMES,len(motion)+1),"manual_fallback":manual_status}
+    return {"schema_version":3,"global_size":[global_width,global_height],"optional_global_size":list(HYBRID_GLOBAL_OPTIONAL_SIZE),"global_digest":hashlib.sha256(global_rgb).hexdigest(),
+        "global_rgb_b85":base64.b85encode(compressed).decode("ascii"),"semantic_tokens":semantic_tokens,"local_crops":local,
+        "motion":motion[-HYBRID_HISTORY_FRAMES:],"history_frames":min(HYBRID_HISTORY_FRAMES,len(motion)+1),"manual_fallback":manual_status,
+        "dual_path":{"fast_path":[FEATURE_W,FEATURE_H,FEATURE_CHANNELS],"semantic_path":[global_width,global_height],"temporal_frames":HYBRID_HISTORY_FRAMES}}
 
 class FrameComputationCache:
     def __init__(self,maximum=256):
@@ -19413,25 +19617,39 @@ class StructuredTemporalMemory:
 STRUCTURED_MEMORY=StructuredTemporalMemory()
 
 def shared_multiscale_feature_maps(frame):
-    item=dict(frame) if isinstance(frame,dict) else {"f":frame}; feature=None
+    item=dict(frame) if isinstance(frame,dict) else {"f":frame}
+    feature=None
     for key in ("neural_f","f","feature"):
-        if feature_valid(item.get(key)): feature=feature_bytes(item.get(key)); break
-    if feature is None: return {"levels":{},"motion":[],"digest":"","read_only_backbone":True}
+        if feature_valid(item.get(key)):
+            feature=feature_bytes(item.get(key))
+            break
+    pyramid=item.get("visual_pyramid") if isinstance(item.get("visual_pyramid"),dict) else build_hybrid_visual_state(item,[])
+    semantic=pyramid.get("semantic_tokens",{}) if isinstance(pyramid.get("semantic_tokens"),dict) else {}
     levels={}
-    for width,height in ((16,9),(8,5),(4,3)):
-        values=[]
-        for channel in range(FEATURE_CHANNELS):
-            plane=feature[channel*PIXELS:(channel+1)*PIXELS]
-            for oy in range(height):
-                top=oy*FEATURE_H//height; bottom=max(top+1,(oy+1)*FEATURE_H//height)
-                for ox in range(width):
-                    left=ox*FEATURE_W//width; right=max(left+1,(ox+1)*FEATURE_W//width); block=[]
-                    for py in range(top,min(FEATURE_H,bottom)): block.extend(plane[py*FEATURE_W+left:py*FEATURE_W+min(FEATURE_W,right)])
-                    values.append(round(sum(block)/max(1,len(block))/255.0,5))
-        levels[str(width)+"x"+str(height)]=values
-    motion=[round(value/255.0,5) for value in feature[4*PIXELS:5*PIXELS:64]][:64]
-    digest=hashlib.sha256(canonical_bytes({"levels":levels,"motion":motion})).hexdigest()
-    return {"levels":levels,"motion":motion,"digest":digest,"read_only_backbone":True}
+    if feature is not None:
+        for width,height in ((16,9),(8,5),(4,3)):
+            values=[]
+            for channel in range(FEATURE_CHANNELS):
+                plane=feature[channel*PIXELS:(channel+1)*PIXELS]
+                for oy in range(height):
+                    top=oy*FEATURE_H//height
+                    bottom=max(top+1,(oy+1)*FEATURE_H//height)
+                    for ox in range(width):
+                        left=ox*FEATURE_W//width
+                        right=max(left+1,(ox+1)*FEATURE_W//width)
+                        block=[]
+                        for py in range(top,min(FEATURE_H,bottom)):
+                            block.extend(plane[py*FEATURE_W+left:py*FEATURE_W+min(FEATURE_W,right)])
+                        values.append(round(sum(block)/max(1,len(block))/255.0,5))
+            levels[str(width)+"x"+str(height)]=values
+    motion=[round(value/255.0,5) for value in feature[4*PIXELS:5*PIXELS:64]][:64] if feature is not None else list(pyramid.get("motion",[]))[-64:]
+    digest=hashlib.sha256(canonical_bytes({"levels":levels,"motion":motion,"semantic":semantic.get("checksum","")})).hexdigest()
+    return {"levels":levels,"motion":motion,"semantic_tokens":semantic.get("tokens",[])[:512],
+        "semantic_token_count":safe_int(semantic.get("token_count"),0,0,512),"semantic_backend":str(semantic.get("backend","manual_feature_only")),
+        "semantic_input_size":list(semantic.get("input_size",HYBRID_GLOBAL_SIZE)),"semantic_learned":bool(semantic.get("learned")),
+        "semantic_quantized":bool(semantic.get("quantized")),"semantic_device":str(semantic.get("device","cpu")),"digest":digest,
+        "read_only_backbone":bool(semantic.get("learned")),"fallback":"manual_features" if not semantic.get("learned") else "manual_features_on_failure"}
+
 
 class ObjectCentricObservationEncoder(MultiScaleObservationEncoder):
     def __init__(self): super().__init__(AUTONOMOUS_OBJECT_DETECTOR)
@@ -19451,13 +19669,17 @@ class ObjectCentricObservationEncoder(MultiScaleObservationEncoder):
         modality_mask={"rgb":bool(modality_mask.get("rgb",True)),"neural":bool(modality_mask.get("neural",feature_valid(item.get("neural_f")))),"ocr":bool(modality_mask.get("ocr",bool(base.ocr_values))),
             "motion":bool(modality_mask.get("motion",bool(shared_maps.get("motion")))),"keyboard":bool(modality_mask.get("keyboard",False)),"audio":bool(modality_mask.get("audio",False)),"gamepad":bool(modality_mask.get("gamepad",False))}
         internal=dict(base.internal_state); internal.update({"scene_graph":item.get("scene_graph",{}),"memory":memory,"shared_multiscale_backbone":shared_maps,
-            "hybrid_visual":{"global_size":pyramid.get("global_size"),"global_digest":pyramid.get("global_digest"),"local_crop_count":len(pyramid.get("local_crops",[])),"history_frames":pyramid.get("history_frames",1)},
+            "hybrid_visual":{"global_size":pyramid.get("global_size"),"global_digest":pyramid.get("global_digest"),"local_crop_count":len(pyramid.get("local_crops",[])),
+                "history_frames":pyramid.get("history_frames",1),"semantic_backend":shared_maps.get("semantic_backend"),"semantic_token_count":shared_maps.get("semantic_token_count",0),
+                "semantic_input_size":shared_maps.get("semantic_input_size"),"semantic_learned":shared_maps.get("semantic_learned",False),"semantic_quantized":shared_maps.get("semantic_quantized",False),
+                "fast_path_size":[FEATURE_W,FEATURE_H,FEATURE_CHANNELS]},
             "manual_feature_fallback":pyramid.get("manual_fallback",{}),"modality_mask":modality_mask,"object_relation_count":len(item.get("scene_graph",{}).get("edges",[])) if isinstance(item.get("scene_graph"),dict) else 0})
         environment_id=hashlib.sha256(canonical_bytes({"base":base.environment_id,"visual":visual_digest,"objects":[slot.compact() for slot in base.objects],"scene_graph":item.get("scene_graph",{})})).hexdigest()[:32]
         state_material={"environment_id":environment_id,"actions":list(base.recent_actions[-16:]),"rewards":list(base.recent_rewards[-16:]),"task":base.task,"memory_phase":memory.get("current_phase"),"completed_subgoals":memory.get("completed_subgoals",[])}
         state_id=hashlib.sha256(canonical_bytes(state_material)).hexdigest()[:32]
         semantic_model=context.get("semantic_encoder") if isinstance(context.get("semantic_encoder"),dict) else None
-        internal["continuous_state_embedding"]=semantic_embedding({"objects":object_material,"task":base.task,"memory":memory},LATENT_STATE_SIZE,semantic_model)
+        internal["continuous_state_embedding"]=semantic_embedding({"objects":object_material,"task":base.task,"memory":memory,
+            "visual_tokens":shared_maps.get("semantic_tokens",[])[:128],"visual_backend":shared_maps.get("semantic_backend","")},LATENT_STATE_SIZE,semantic_model)
         evidence_count=sum(len(slot.attributes.get("evidence_sources",[])) for slot in base.objects); confidence=max(0.0,min(1.0,base.confidence+0.04*(1 if shared_maps.get("digest") else 0)+0.02*min(2,evidence_count/max(1,len(base.objects)))))
         return ObservationState(state_id,environment_id,visual_digest,base.index_hash,base.objects,base.ocr_values,base.temporal,base.recent_actions,base.recent_rewards,base.task,internal,confidence,OBSERVATION_SCHEMA_VERSION)
 
@@ -19556,36 +19778,117 @@ def train_learned_subgoal_planner(experiences,tasks):
     return {"schema_version":2,"algorithm":"goal_predicate_conditioned_subgoal_skill_prior","task_predicates":task_predicates,"skill_priors":priors,"skill_quality":quality,"training_transitions":len(experiences or [])}
 
 class HierarchicalTaskPlanner(TaskPlanner):
-    def __init__(self,learned_model=None): self.learned_model=dict(learned_model) if isinstance(learned_model,dict) else {}
-    def configure(self,learned_model): self.learned_model=dict(learned_model) if isinstance(learned_model,dict) else {}; return self
+    def __init__(self,learned_model=None,world_model=None,beam_width=4):
+        self.learned_model=dict(learned_model) if isinstance(learned_model,dict) else {}
+        self.world_model=dict(world_model) if isinstance(world_model,dict) else {}
+        self.beam_width=max(2,min(8,safe_int(beam_width,4,2,8)))
+        self.last_plan={}
+    def configure(self,learned_model,world_model=None):
+        self.learned_model=dict(learned_model) if isinstance(learned_model,dict) else {}
+        self.world_model=dict(world_model) if isinstance(world_model,dict) else {}
+        return self
     def _skills(self,task_id,subgoal_id,defaults):
-        priors=self.learned_model.get("skill_priors",{}) if isinstance(self.learned_model,dict) else {}; row=priors.get(task_id+"|"+subgoal_id,{}) if isinstance(priors,dict) else {}
-        learned=sorted(row,key=lambda key:(-safe_int(row.get(key),0),key)) if isinstance(row,dict) else []
-        return tuple(dict.fromkeys(learned+list(defaults)))[:8]
-    def propose_subgoal(self,state,task):
-        observation=state if isinstance(state,ObservationState) else None; definition=task if isinstance(task,TaskDefinition) else TaskDefinition.from_mapping(task or {}); internal=observation.internal_state if observation is not None else {}
+        priors=self.learned_model.get("skill_priors",{}) if isinstance(self.learned_model,dict) else {}
+        quality=self.learned_model.get("skill_quality",{}) if isinstance(self.learned_model,dict) else {}
+        row=priors.get(task_id+"|"+subgoal_id,{}) if isinstance(priors,dict) else {}
+        learned=[]
+        for key in row if isinstance(row,dict) else []:
+            metric=quality.get(task_id+"|"+subgoal_id+"|"+str(key),{}) if isinstance(quality,dict) else {}
+            learned.append((str(key),safe_float(metric.get("success_rate"),0.0)-safe_float(metric.get("failure_rate"),0.0),safe_int(row.get(key),0)))
+        learned.sort(key=lambda value:(-value[1],-value[2],value[0]))
+        return tuple(dict.fromkeys([value[0] for value in learned]+list(defaults)))[:8]
+    def _rule_candidates(self,state,task):
+        observation=state if isinstance(state,ObservationState) else None
+        definition=task if isinstance(task,TaskDefinition) else TaskDefinition.from_mapping(task or {})
+        internal=observation.internal_state if observation is not None else {}
+        candidates=[]
         if str(internal.get("terminal"))=="failure" or safe_int(internal.get("failure_count"),0)>0:
-            skills=self._skills(definition.task_id,"recover_after_failure",("wait_for_state","restart_round","navigate_back")); return Subgoal("recover_after_failure","恢复到可操作状态",{"terminal_not":"failure"},skills,100,0.94)
+            skills=self._skills(definition.task_id,"recover_after_failure",("wait_for_state","restart_round","navigate_back"))
+            candidates.append(Subgoal("recover_after_failure","恢复到可操作状态",{"terminal_not":"failure"},skills,100,0.94))
         dialogs=[slot for slot in observation.objects if slot.object_class=="dialog"] if observation is not None else []
         close_targets=[slot for slot in observation.objects if str(slot.attributes.get("role","")) in {"close","cancel"}] if observation is not None else []
         if dialogs and close_targets:
-            skills=self._skills(definition.task_id,"close_blocking_popup",("close_popup","click_semantic_target","wait_for_state")); return Subgoal("close_blocking_popup","关闭阻塞目标的弹窗",{"object_absent":"dialog"},skills,96,0.91)
-        predicates=parse_goal_predicates(definition)
-        for predicate in predicates:
+            skills=self._skills(definition.task_id,"close_blocking_popup",("close_popup","click_semantic_target","wait_for_state"))
+            candidates.append(Subgoal("close_blocking_popup","关闭阻塞目标的弹窗",{"object_absent":"dialog"},skills,96,0.91))
+        for predicate in parse_goal_predicates(definition):
             evidence=predicate_evidence(observation,predicate)
-            if evidence.get("satisfied"): continue
+            if evidence.get("satisfied"):
+                continue
             safe_name=normalized_identifier(predicate.subject,"goal",64)
             if predicate.attribute=="inventory" or predicate.relation=="contains":
-                if evidence.get("visible"): subgoal_id="acquire_"+safe_name; description="获取目标对象 "+predicate.subject; defaults=("click_semantic_target","drag_object_to_target","wait_for_state")
-                else: subgoal_id="locate_"+safe_name; description="定位目标对象 "+predicate.subject; defaults=("scroll_until_target","navigate_back","wait_for_state")
+                if evidence.get("visible"):
+                    subgoal_id="acquire_"+safe_name
+                    description="获取目标对象 "+predicate.subject
+                    defaults=("click_semantic_target","drag_object_to_target","wait_for_state")
+                else:
+                    subgoal_id="locate_"+safe_name
+                    description="定位目标对象 "+predicate.subject
+                    defaults=("scroll_until_target","navigate_back","wait_for_state")
             elif predicate.attribute=="numeric":
-                subgoal_id="improve_"+safe_name; description="推进数值谓词 "+predicate.raw; defaults=("click_semantic_target","drag_object_to_target","scroll_until_target","wait_for_state")
+                subgoal_id="improve_"+safe_name
+                description="推进数值谓词 "+predicate.raw
+                defaults=("click_semantic_target","drag_object_to_target","scroll_until_target","wait_for_state")
             elif evidence.get("visible"):
-                subgoal_id="change_"+safe_name; description="使对象满足谓词 "+predicate.raw; defaults=("click_semantic_target","drag_object_to_target","inspect_target","wait_for_state")
+                subgoal_id="change_"+safe_name
+                description="使对象满足谓词 "+predicate.raw
+                defaults=("click_semantic_target","drag_object_to_target","inspect_target","wait_for_state")
             else:
-                subgoal_id="locate_"+safe_name; description="定位谓词对象 "+predicate.subject; defaults=("scroll_until_target","navigate_back","wait_for_state")
-            skills=self._skills(definition.task_id,subgoal_id,defaults); condition={"predicate":predicate.to_dict()}; return Subgoal(subgoal_id,description,condition,skills,86,0.80)
-        skills=self._skills(definition.task_id,"verify_goal",("wait_for_state","inspect_target","stop_and_ask")); return Subgoal("verify_goal","验证所有目标谓词已经满足",{"all_predicates":True},skills,70,0.76)
+                subgoal_id="locate_"+safe_name
+                description="定位谓词对象 "+predicate.subject
+                defaults=("scroll_until_target","navigate_back","wait_for_state")
+            skills=self._skills(definition.task_id,subgoal_id,defaults)
+            visibility_bonus=0.08 if evidence.get("visible") else 0.0
+            candidates.append(Subgoal(subgoal_id,description,{"predicate":predicate.to_dict()},skills,86,0.72+visibility_bonus))
+        if not candidates:
+            skills=self._skills(definition.task_id,"verify_goal",("wait_for_state","inspect_target","stop_and_ask"))
+            candidates.append(Subgoal("verify_goal","验证所有目标谓词已经满足",{"all_predicates":True},skills,70,0.76))
+        return candidates
+    def _skill_prediction(self,task_id,state_id,skill):
+        prediction=world_model_prediction(self.world_model,task_id,state_id,skill) if self.world_model else {}
+        reward=safe_float(prediction.get("expected_reward"),0.0)
+        success=safe_float(prediction.get("success_probability"),0.0,0.0,1.0)
+        failure=safe_float(prediction.get("failure_probability"),0.0,0.0,1.0)
+        no_effect=safe_float(prediction.get("no_effect_probability"),0.0,0.0,1.0)
+        uncertainty=safe_float(prediction.get("rollout_uncertainty",prediction.get("uncertainty",1.0)),1.0,0.0,1.0)
+        score=0.55*success+0.18*math.tanh(reward/2.0)-0.48*failure-0.28*no_effect-0.24*uncertainty
+        return score,prediction
+    def plan(self,state,task):
+        observation=state if isinstance(state,ObservationState) else None
+        definition=task if isinstance(task,TaskDefinition) else TaskDefinition.from_mapping(task or {})
+        state_id=observation.state_id if observation is not None else ""
+        memory=observation.internal_state.get("memory",{}) if observation is not None and isinstance(observation.internal_state,dict) else {}
+        failed=set(str(value) for value in memory.get("failure_reasons",[]) if str(value)) if isinstance(memory,dict) else set()
+        candidates=self._rule_candidates(observation,definition)
+        beams=[]
+        for subgoal in candidates:
+            base=subgoal.priority/100.0+subgoal.confidence
+            if subgoal.subgoal_id in failed:
+                base-=0.25
+            paths=[([],base,[])]
+            for depth in range(min(3,max(1,len(subgoal.preferred_skills)))):
+                expanded=[]
+                for path,score,predictions in paths:
+                    for skill in subgoal.preferred_skills[:self.beam_width]:
+                        if skill in path and skill not in {"wait_for_state","scroll_until_target"}:
+                            continue
+                        value,prediction=self._skill_prediction(definition.task_id,state_id,skill)
+                        repeat_penalty=0.08*path.count(skill)
+                        expanded.append((path+[skill],score+value/(depth+1)-repeat_penalty,predictions+[prediction]))
+                expanded.sort(key=lambda item:(-item[1],item[0]))
+                paths=expanded[:self.beam_width] or paths
+            best_path,best_score,predictions=max(paths,key=lambda item:item[1])
+            beams.append({"subgoal":subgoal,"skill_sequence":best_path,"score":best_score,"predictions":predictions})
+        beams.sort(key=lambda item:(-item["score"],-item["subgoal"].priority,item["subgoal"].subgoal_id))
+        selected=beams[0]
+        preferred=tuple(dict.fromkeys(selected["skill_sequence"]+list(selected["subgoal"].preferred_skills)))[:8]
+        chosen=Subgoal(selected["subgoal"].subgoal_id,selected["subgoal"].description,selected["subgoal"].completion_condition,
+            preferred,selected["subgoal"].priority,max(0.0,min(1.0,selected["subgoal"].confidence)))
+        self.last_plan={"algorithm":"bounded_goal_conditioned_beam_search","beam_width":self.beam_width,"replan_each_observation":True,
+            "selected_subgoal":chosen.subgoal_id,"selected_skill_sequence":list(preferred[:3]),"score":round(selected["score"],6),
+            "alternatives":[{"subgoal_id":item["subgoal"].subgoal_id,"score":round(item["score"],6),"skills":item["skill_sequence"][:3]} for item in beams[:self.beam_width]]}
+        return chosen
+    def propose_subgoal(self,state,task):
+        return self.plan(state,task)
 
 SEMANTIC_CONCEPT_GROUPS=(
     ("start",("start","play","begin","launch","开始","开局","启动","进入游戏")),
@@ -19801,10 +20104,10 @@ def goal_conditioned_candidate_features(item,world_prediction=None,size=POLICY_I
     scene_material={"objects":value.get("object_classes",[]),"relations":value.get("object_relations",[]),"ocr":value.get("ocr_values",[])}
     memory_material={"memory":memory,"recent_actions":value.get("recent_actions",[]),"task_phase":value.get("task_phase")}
     features=list(scalars)
-    features.extend(semantic_embedding(goal_material,12,semantic_model))
-    features.extend(semantic_embedding(skill_material,12,semantic_model))
-    features.extend(semantic_embedding(scene_material,12,semantic_model))
-    features.extend(semantic_embedding(memory_material,12,semantic_model))
+    features.extend(semantic_embedding(goal_material,20,semantic_model))
+    features.extend(semantic_embedding(skill_material,20,semantic_model))
+    features.extend(semantic_embedding(scene_material,20,semantic_model))
+    features.extend(semantic_embedding(memory_material,20,semantic_model))
     padded=(features+[0.0]*max(0,size-len(features)))[:size]
     return [safe_float(entry,0.0,-4.0,4.0) for entry in padded]
 
@@ -19888,59 +20191,166 @@ class LearnedCandidateRankingHead:
         except (TypeError,ValueError,OverflowError,KeyError): return None
 
 def train_auditable_transition_model(experiences):
-    state_rows=defaultdict(lambda:{"count":0,"reward":0.0,"success":0,"failure":0,"no_change":0,"delay":0.0,"appear":Counter(),"disappear":Counter(),"terminals":Counter(),"next_states":Counter()}); action_rows=defaultdict(lambda:{"count":0,
-        "reward":0.0,"success":0,"failure":0,"no_change":0,"delay":0.0,"appear":Counter(),"disappear":Counter(),"terminals":Counter(),"next_states":Counter()})
+    def empty_row():
+        return {"count":0,"reward":0.0,"success":0,"failure":0,"no_change":0,"delay":0.0,"appear":Counter(),"disappear":Counter(),"terminals":Counter(),"next_states":Counter(),
+            "attribute_changes":Counter(),"motion_dx":0.0,"motion_dy":0.0,"motion_speed":0.0,"motion_count":0,"numeric_delta":0.0,"numeric_count":0,"delay_buckets":Counter()}
+    def object_identity(value,index):
+        if not isinstance(value,dict): return "unknown|"+str(index)
+        identity=str(value.get("track_id") or value.get("instance") or "").strip()
+        if identity: return str(value.get("class","unknown"))+"|"+identity
+        bbox=value.get("bbox",[0.0,0.0,0.0,0.0])
+        center=(round(safe_float(bbox[0],0.0)+safe_float(bbox[2],0.0)/2.0,2),round(safe_float(bbox[1],0.0)+safe_float(bbox[3],0.0)/2.0,2)) if isinstance(bbox,(list,tuple)) and len(bbox)>=4 else (0.0,0.0)
+        return str(value.get("class","unknown"))+"|"+str(center)+"|"+str(index)
+    state_rows=defaultdict(empty_row)
+    action_rows=defaultdict(empty_row)
     for experience in experiences or []:
         if not isinstance(experience,dict): continue
-        task_id=normalized_identifier(experience.get("task_id"),"default",96); state=str(experience.get("state_t",experience.get("state",""))); action=str(experience.get("action_t",experience.get("action",
-            ""))); before=experience.get("observation_t",{}); after=experience.get("observation_t+1",{}); before_classes=Counter(str(value.get("class","unknown")) for value in before.get("objects",[]) if isinstance(value,
-            dict)); after_classes=Counter(str(value.get("class","unknown")) for value in after.get("objects",[]) if isinstance(value,dict)); appeared=after_classes-before_classes; disappeared=before_classes-after_classes
+        task_id=normalized_identifier(experience.get("task_id"),"default",96)
+        state=str(experience.get("state_t",experience.get("state","")))
+        action=str(experience.get("action_t",experience.get("action","")))
+        before=experience.get("observation_t",{}) if isinstance(experience.get("observation_t"),dict) else {}
+        after=experience.get("observation_t+1",{}) if isinstance(experience.get("observation_t+1"),dict) else {}
+        before_objects=[value for value in before.get("objects",[]) if isinstance(value,dict)]
+        after_objects=[value for value in after.get("objects",[]) if isinstance(value,dict)]
+        before_classes=Counter(str(value.get("class","unknown")) for value in before_objects)
+        after_classes=Counter(str(value.get("class","unknown")) for value in after_objects)
+        appeared=after_classes-before_classes
+        disappeared=before_classes-after_classes
+        before_map={object_identity(value,index):value for index,value in enumerate(before_objects)}
+        after_map={object_identity(value,index):value for index,value in enumerate(after_objects)}
+        attribute_changes=Counter()
+        motion_dx=motion_dy=motion_speed=0.0
+        motion_count=0
+        numeric_delta=0.0
+        numeric_count=0
+        for identity in sorted(set(before_map)&set(after_map)):
+            first=before_map[identity]
+            second=after_map[identity]
+            object_class=str(second.get("class",first.get("class","unknown")))
+            for field_name in ("state","role","text","value","enabled","visible"):
+                if first.get(field_name)!=second.get(field_name): attribute_changes[object_class+"."+field_name]+=1
+            first_box=first.get("bbox",[])
+            second_box=second.get("bbox",[])
+            if isinstance(first_box,(list,tuple)) and len(first_box)>=4 and isinstance(second_box,(list,tuple)) and len(second_box)>=4:
+                first_x=safe_float(first_box[0],0.0)+safe_float(first_box[2],0.0)/2.0
+                first_y=safe_float(first_box[1],0.0)+safe_float(first_box[3],0.0)/2.0
+                second_x=safe_float(second_box[0],0.0)+safe_float(second_box[2],0.0)/2.0
+                second_y=safe_float(second_box[1],0.0)+safe_float(second_box[3],0.0)/2.0
+                dx=second_x-first_x
+                dy=second_y-first_y
+                motion_dx+=dx
+                motion_dy+=dy
+                motion_speed+=math.sqrt(dx*dx+dy*dy)
+                motion_count+=1
+            if finite_number(first.get("value")) and finite_number(second.get("value")):
+                numeric_delta+=safe_float(second.get("value"),0.0)-safe_float(first.get("value"),0.0)
+                numeric_count+=1
+        delay=safe_float(experience.get("environment_response_time",experience.get("action_effect_delay",0.0)),0.0,0.0,60.0)
+        delay_bucket="lt_100ms" if delay<0.1 else "lt_300ms" if delay<0.3 else "lt_1s" if delay<1.0 else "lt_3s" if delay<3.0 else "gte_3s"
         for row in (state_rows[task_id+"|"+state+"|"+action],action_rows[task_id+"|"+action]):
-            row["count"]+=1; row["reward"]+=safe_float(experience.get("reward_t",experience.get("reward",0.0)),
-                0.0); row["success"]+=int(bool(experience.get("success"))); row["failure"]+=int(bool(experience.get("failure"))); row["no_change"]+=int(not bool(experience.get("environment_changed",
-                True))); row["delay"]+=safe_float(experience.get("environment_response_time",0.0),0.0,0.0,60.0); row["appear"].update(appeared); row["disappear"].update(disappeared); row["terminals"][str(experience.get("terminal_state",
-                "neutral"))]+=1; row["next_states"][str(experience.get("state_t+1",experience.get("next_state","")))]+=1
+            row["count"]+=1
+            row["reward"]+=safe_float(experience.get("reward_t",experience.get("reward",0.0)),0.0)
+            row["success"]+=int(bool(experience.get("success")))
+            row["failure"]+=int(bool(experience.get("failure")))
+            row["no_change"]+=int(not bool(experience.get("environment_changed",True)))
+            row["delay"]+=delay
+            row["appear"].update(appeared)
+            row["disappear"].update(disappeared)
+            row["terminals"][str(experience.get("terminal_state","neutral"))]+=1
+            row["next_states"][str(experience.get("state_t+1",experience.get("next_state","")))]+=1
+            row["attribute_changes"].update(attribute_changes)
+            row["motion_dx"]+=motion_dx
+            row["motion_dy"]+=motion_dy
+            row["motion_speed"]+=motion_speed
+            row["motion_count"]+=motion_count
+            row["numeric_delta"]+=numeric_delta
+            row["numeric_count"]+=numeric_count
+            row["delay_buckets"][delay_bucket]+=1
     def finish(row):
-        count=max(1,row["count"]); terminal=row["success"]+row["failure"]
+        count=max(1,row["count"])
+        terminal=row["success"]+row["failure"]
+        motion_count=max(1,row["motion_count"])
+        numeric_count=max(1,row["numeric_count"])
         return {"count":row["count"],"expected_reward":round(row["reward"]/count,6),"success_probability":round((row["success"]+1)/(terminal+2) if terminal else 0.0,6),
             "failure_probability":round((row["failure"]+1)/(terminal+2) if terminal else 0.0,6),"no_effect_probability":round(row["no_change"]/count,6),"expected_wait_seconds":round(row["delay"]/count,6),
-            "objects_appear":dict(row["appear"].most_common(12)),"objects_disappear":dict(row["disappear"].most_common(12)),"terminal_distribution":dict(row["terminals"].most_common(4)),"next_state_distribution":dict(row["next_states"].most_common(8)),
+            "action_delay_distribution":dict(row["delay_buckets"].most_common()),"objects_appear":dict(row["appear"].most_common(12)),"objects_disappear":dict(row["disappear"].most_common(12)),
+            "object_attribute_changes":dict(row["attribute_changes"].most_common(16)),"expected_object_motion":{"dx":round(row["motion_dx"]/motion_count,6),"dy":round(row["motion_dy"]/motion_count,6),"speed":round(row["motion_speed"]/motion_count,6),"samples":row["motion_count"]},
+            "expected_numeric_delta":round(row["numeric_delta"]/numeric_count,6) if row["numeric_count"] else 0.0,"numeric_samples":row["numeric_count"],
+            "terminal_distribution":dict(row["terminals"].most_common(4)),"next_state_distribution":dict(row["next_states"].most_common(8)),
             "uncertainty":round(min(1.0,1.0/math.sqrt(count)+0.35*(1.0-min(1.0,terminal/count))),6)}
-    return {"schema_version":2,"algorithm":"auditable_discrete_experience_transition_model","state_action":{key:finish(value) for key,value in state_rows.items()},"action_prior":{key:finish(value) for key,value in action_rows.items()},"training_transitions":len(experiences or [])}
+    return {"schema_version":3,"algorithm":"auditable_object_attribute_spatial_temporal_transition_model","state_action":{key:finish(value) for key,value in state_rows.items()},
+        "action_prior":{key:finish(value) for key,value in action_rows.items()},"training_transitions":len(experiences or []),
+        "prediction_targets":["next_object_set","object_appearance_disappearance","attribute_change","object_motion","numeric_change","reward","success_failure_no_effect_loading","action_effect_delay","next_state"]}
 
 def latent_observation_vector(observation,state_id="",size=LATENT_STATE_SIZE,semantic_model=None):
     item=dict(observation) if isinstance(observation,dict) else {}
     objects=[value for value in item.get("objects",[]) if isinstance(value,dict)]
     classes=Counter(str(value.get("class","unknown")) for value in objects)
-    features=[min(1.0,classes.get(name,0)/6.0) for name in GENERAL_OBJECT_CLASSES[:12]]
+    features=[min(1.0,classes.get(name,0)/6.0) for name in GENERAL_OBJECT_CLASSES]
     confidences=[safe_float(value.get("confidence"),0.0) for value in objects]
     uncertainties=[safe_float(value.get("uncertainty",1.0-safe_float(value.get("confidence"),0.0)),1.0) for value in objects]
     centers=[]
+    velocities=[]
+    areas=[]
     interactable=0
+    enabled=0
+    numeric=[]
+    identities=[]
     for value in objects:
         bbox=value.get("bbox",[0.0,0.0,0.0,0.0])
         if isinstance(bbox,(list,tuple)) and len(bbox)>=4:
-            centers.append((safe_float(bbox[0],0.0)+safe_float(bbox[2],0.0)/2.0,
-                safe_float(bbox[1],0.0)+safe_float(bbox[3],0.0)/2.0))
-        interactable+=int(bool(value.get("interactable") or (value.get("attributes") or {}).get("interactable")))
-    features.extend([
-        min(1.0,len(objects)/32.0),statistics.fmean(confidences) if confidences else 0.0,
-        statistics.fmean(uncertainties) if uncertainties else 1.0,interactable/max(1,len(objects)),
-        statistics.fmean(value[0] for value in centers) if centers else 0.5,
-        statistics.fmean(value[1] for value in centers) if centers else 0.5,
-    ])
-    semantic_material={
-        "objects":[{"class":value.get("class"),"role":value.get("role"),"text":value.get("text"),
-            "state":value.get("state"),"attributes":value.get("attributes",{})} for value in objects],
-        "ocr":item.get("ocr_values",[]),"scene_graph":item.get("scene_graph",{}),
-    }
+            x=safe_float(bbox[0],0.0)
+            y=safe_float(bbox[1],0.0)
+            width=max(0.0,safe_float(bbox[2],0.0))
+            height=max(0.0,safe_float(bbox[3],0.0))
+            centers.append((x+width/2.0,y+height/2.0))
+            areas.append(width*height)
+        attributes=value.get("attributes",{}) if isinstance(value.get("attributes"),dict) else {}
+        velocity=value.get("velocity",attributes.get("velocity",[0.0,0.0]))
+        if isinstance(velocity,(list,tuple)) and len(velocity)>=2:
+            velocities.append((safe_float(velocity[0],0.0,-2.0,2.0),safe_float(velocity[1],0.0,-2.0,2.0)))
+        interactable+=int(bool(value.get("interactable") or attributes.get("interactable")))
+        enabled+=int(str(value.get("state","enabled")) not in {"disabled","hidden","inactive"})
+        if finite_number(value.get("value")):
+            numeric.append(safe_float(value.get("value"),0.0,-1000000.0,1000000.0))
+        identities.append(str(value.get("track_id") or value.get("instance") or attributes.get("track_id") or ""))
+    for value in item.get("ocr_values",[]) if isinstance(item.get("ocr_values"),list) else []:
+        if isinstance(value,dict) and finite_number(value.get("value")):
+            numeric.append(safe_float(value.get("value"),0.0,-1000000.0,1000000.0))
+    scene_graph=item.get("scene_graph",{}) if isinstance(item.get("scene_graph"),dict) else {}
+    relations=Counter(str(edge.get("relation","")) for edge in scene_graph.get("edges",[]) if isinstance(edge,dict))
+    internal=item.get("internal_state",{}) if isinstance(item.get("internal_state"),dict) else {}
+    memory=internal.get("memory",{}) if isinstance(internal.get("memory"),dict) else {}
+    modality=internal.get("modality_mask",{}) if isinstance(internal.get("modality_mask"),dict) else {}
+    recent_actions=item.get("recent_actions",[]) if isinstance(item.get("recent_actions"),list) else []
+    recent_rewards=item.get("recent_rewards",[]) if isinstance(item.get("recent_rewards"),list) else []
+    durations=internal.get("recent_action_durations",[]) if isinstance(internal.get("recent_action_durations"),list) else []
+    features.extend([min(1.0,len(objects)/48.0),statistics.fmean(confidences) if confidences else 0.0,
+        statistics.fmean(uncertainties) if uncertainties else 1.0,interactable/max(1,len(objects)),enabled/max(1,len(objects)),
+        statistics.fmean(value[0] for value in centers) if centers else 0.5,statistics.fmean(value[1] for value in centers) if centers else 0.5,
+        statistics.fmean(abs(value[0])+abs(value[1]) for value in velocities) if velocities else 0.0,
+        statistics.fmean(areas) if areas else 0.0,min(1.0,len(relations)/16.0),min(1.0,sum(relations.values())/64.0),
+        min(1.0,len(set(value for value in identities if value))/48.0),min(1.0,len(recent_actions)/16.0),
+        min(1.0,len(recent_rewards)/16.0),math.tanh((statistics.fmean(recent_rewards) if recent_rewards else 0.0)/2.0),
+        min(1.0,(statistics.fmean(durations) if durations else 0.0)/5.0),min(1.0,safe_int(memory.get("length"),0)/STRUCTURED_MEMORY_LENGTH),
+        min(1.0,len(memory.get("failure_reasons",[]))/16.0),min(1.0,len(memory.get("completed_subgoals",[]))/32.0),
+        sum(int(bool(value)) for value in modality.values())/max(1,len(modality)) if modality else 0.0,
+        statistics.fmean(uncertainties) if uncertainties else 1.0,
+        math.tanh((statistics.fmean(numeric) if numeric else 0.0)/100.0),math.tanh((max(numeric) if numeric else 0.0)/100.0),
+        math.tanh((min(numeric) if numeric else 0.0)/100.0)])
+    semantic_material={"state_id":state_id,"objects":[{"identity":value.get("track_id") or value.get("instance"),
+            "class":value.get("class"),"role":value.get("role"),"text":value.get("text"),"state":value.get("state"),
+            "value":value.get("value"),"bbox":value.get("bbox"),"velocity":value.get("velocity"),"attributes":value.get("attributes",{})} for value in objects],
+        "ocr":item.get("ocr_values",[]),"scene_graph":scene_graph,"task":item.get("task",{}),"task_phase":internal.get("task_phase"),
+        "current_goal":internal.get("current_goal"),"current_subgoal":internal.get("current_subgoal"),"recent_actions":recent_actions[-16:],
+        "recent_rewards":recent_rewards[-16:],"memory":memory,"modality_mask":modality,"perception_uncertainty":statistics.fmean(uncertainties) if uncertainties else 1.0}
     features.extend(semantic_embedding(semantic_material,max(0,size-len(features)),semantic_model))
     return [safe_float(value,0.0,-2.0,2.0) for value in (features+[0.0]*size)[:size]]
 
 def _latent_action_vector(action_id,size=LATENT_ACTION_SIZE,semantic_model=None):
     return semantic_embedding({"semantic_action":action_id},size,semantic_model)
 
-def _sequence_latent_state(ordered,index,window=8,semantic_model=None):
+def _sequence_latent_state(ordered,index,window=12,semantic_model=None):
     vectors=[]
     start=max(0,int(index)-max(1,int(window))+1)
     for position in range(start,int(index)+1):
@@ -19963,14 +20373,14 @@ def train_latent_world_model(experiences,semantic_model=None):
             grouped[str(value.get("episode_id") or value.get("session") or "legacy")].append(value)
     rows=[]
     state_latents={}
-    horizons=(1,2,4)
+    horizons=(1,2,4,8)
     all_states=[]
     for _,values in grouped.items():
         ordered=sorted(values,key=lambda item:safe_int(item.get("step_id"),0))
         for index,experience in enumerate(ordered):
             task=normalized_identifier(experience.get("task_id"),"default",96)
             state=str(experience.get("state_t",experience.get("state","")))
-            before=_sequence_latent_state(ordered,index,8,semantic_model)
+            before=_sequence_latent_state(ordered,index,12,semantic_model)
             state_latents[task+"|"+state]=before
             all_states.append(before)
             action=str(experience.get("action_t",experience.get("action","")))
@@ -20042,7 +20452,7 @@ def train_latent_world_model(experiences,semantic_model=None):
                 bias[output_index]-=rate*gradient
             rate*=0.9995
         ensemble.append({"weights":weights,"bias":bias,"seed":rng.randrange(2**63)})
-    return {**base,"trained":True,"ensemble":ensemble,"training_transitions":len(rows),"sequence_window":8,
+    return {**base,"trained":True,"ensemble":ensemble,"training_transitions":len(rows),"sequence_window":12,
         "multi_step_consistency_horizons":list(horizons),"multi_step_world_model_consistency_loss":True}
 
 
@@ -20109,33 +20519,251 @@ GENERALIZATION_LEVELS={
     3:"same_genre_unseen_game",
     4:"cross_genre_transfer",
 }
+GENERALIZATION_BENCHMARK_SCHEMA_VERSION=2
+GENERALIZATION_REQUIRED_GENRES=("click_puzzle","match3","card","turn_strategy","realtime_action")
+GENERALIZATION_REAL_SOURCES=frozenset({"captured_window_session","captured_video_replay","external_human_recording"})
+GENERALIZATION_REQUIRED_VARIANTS=("resolution_id","language","ui_skin","popup_variant","frame_rate_group","input_delay_group")
 GENERALIZATION_BENCHMARK_DIMENSIONS=(
     "unseen_training_game","unseen_level_and_video","random_resolution_dpi_window","ui_skin_change",
     "object_position_perturbation","text_language_change","distractor_popup","action_delay_and_frame_drop",
     "minor_rule_change","zero_and_few_shot_transfer","behavior_cloning_baseline_delta",
 )
+
+def model_evaluation_fingerprint(game_id,training_checksums,architecture=""):
+    material={"game_id":str(game_id),"training_checksums":sorted(str(value) for value in training_checksums or []),
+        "architecture":str(architecture or "object_world_policy_v2"),"feature_algorithm_version":FEATURE_ALGORITHM_VERSION,
+        "action_algorithm_version":ACTION_ALGORITHM_VERSION,"model_schema_version":MODEL_SCHEMA_VERSION}
+    return hashlib.sha256(canonical_bytes(material)).hexdigest()
+
+def generalization_model_scope(evaluation):
+    value=evaluation if isinstance(evaluation,dict) else {}
+    levels=value.get("levels",{}) if isinstance(value.get("levels"),dict) else {}
+    level3=levels.get("3",{}) if isinstance(levels.get("3"),dict) else {}
+    level4=levels.get("4",{}) if isinstance(levels.get("4"),dict) else {}
+    verified=bool(value.get("benchmark_verified"))
+    safe=bool(value.get("all_claimed_levels_safe"))
+    return "general_model" if verified and safe and level3.get("claim_allowed") and level4.get("claim_allowed") else "single_game_model"
+
+class FixedGeneralizationBenchmark:
+    relative_root=Path("benchmarks")/"generalization_v1"
+    manifest_name="manifest.json"
+    maximum_manifest_bytes=2*1024*1024
+    maximum_dataset_bytes=512*1024*1024
+    @classmethod
+    def root(cls,base):
+        return Path(base)/cls.relative_root
+    @classmethod
+    def contract(cls):
+        return {"schema_version":GENERALIZATION_BENCHMARK_SCHEMA_VERSION,"required_genres":list(GENERALIZATION_REQUIRED_GENRES),
+            "required_variants":list(GENERALIZATION_REQUIRED_VARIANTS),"real_sources":sorted(GENERALIZATION_REAL_SOURCES),
+            "required_episode_metrics":["success","human_guidance","actions","ood_expected","ood_rejected","risk_class","action_released"],
+            "partition_policy":"immutable_game_and_task_isolation","claim_policy":"level_3_and_4_must_both_pass_before_general_model_label"}
+    @classmethod
+    def example_manifest(cls):
+        return {"schema_version":GENERALIZATION_BENCHMARK_SCHEMA_VERSION,"benchmark_id":"replace_with_frozen_benchmark_id","frozen":True,
+            "created_utc":"YYYY-MM-DDTHH:MM:SSZ","required_genres":list(GENERALIZATION_REQUIRED_GENRES),
+            "split_policy":{"train_game_ids":[],"level_1_game_ids":[],"level_2_game_ids":[],"level_3_game_ids":[],"level_4_game_ids":[]},
+            "files":[{"path":"episodes.jsonl","sha256":"replace_with_sha256","bytes":0}],
+            "record_contract":cls.contract()}
+    @classmethod
+    def materialize_contract(cls,base):
+        root=cls.root(base)
+        root.mkdir(parents=True,exist_ok=True)
+        contract_path=root/"benchmark_contract.json"
+        example_path=root/"manifest.example.json"
+        readme_path=root/"README.txt"
+        _atomic_write(contract_path,json.dumps(cls.contract(),ensure_ascii=False,sort_keys=True,indent=2)+"\n")
+        _atomic_write(example_path,json.dumps(cls.example_manifest(),ensure_ascii=False,sort_keys=True,indent=2)+"\n")
+        text=("此目录只接受真实窗口采集或真实录像回放产生的固定泛化基准。\n"
+            "训练游戏、同游戏未见任务、同类未见游戏和跨类未见游戏必须由manifest.json固定并严格隔离。\n"
+            "不得把程序生成、复制训练轨迹、人工伪造结果或缺少录像哈希的数据写入正式基准。\n"
+            "至少覆盖点击解谜、消除、卡牌、回合策略、即时操作五类，并覆盖分辨率、语言、皮肤、弹窗、帧率和输入延迟。\n"
+            "没有通过真实Level 3和Level 4时，界面只会显示单游戏模型。\n")
+        _atomic_write(readme_path,text)
+        return root
+    @classmethod
+    def _read_json(cls,path,limit):
+        if not path.is_file():
+            raise FileNotFoundError(str(path))
+        size=path.stat().st_size
+        if size<=0 or size>limit:
+            raise ValueError("benchmark_file_size_invalid:"+path.name)
+        return json.loads(path.read_text(encoding="utf-8"))
+    @classmethod
+    def validate_manifest(cls,manifest):
+        value=manifest if isinstance(manifest,dict) else {}
+        errors=[]
+        if safe_int(value.get("schema_version"),0)!=GENERALIZATION_BENCHMARK_SCHEMA_VERSION:
+            errors.append("manifest_schema_version")
+        if not str(value.get("benchmark_id","")):
+            errors.append("benchmark_id_missing")
+        if value.get("frozen") is not True:
+            errors.append("manifest_not_frozen")
+        genres={str(item) for item in value.get("required_genres",[]) if str(item)}
+        if not set(GENERALIZATION_REQUIRED_GENRES).issubset(genres):
+            errors.append("five_required_genres_missing")
+        split=value.get("split_policy",{}) if isinstance(value.get("split_policy"),dict) else {}
+        train={str(item) for item in split.get("train_game_ids",[]) if str(item)}
+        level_sets={level:{str(item) for item in split.get("level_"+str(level)+"_game_ids",[]) if str(item)} for level in range(1,5)}
+        if not train:
+            errors.append("train_game_split_missing")
+        if any(train.intersection(values) for values in level_sets.values()):
+            errors.append("train_test_game_overlap")
+        if level_sets[3].intersection(level_sets[4]):
+            errors.append("level_3_4_game_overlap")
+        files=value.get("files",[]) if isinstance(value.get("files"),list) else []
+        if not files:
+            errors.append("dataset_files_missing")
+        seen=set()
+        for item in files:
+            if not isinstance(item,dict):
+                errors.append("dataset_file_entry_invalid")
+                continue
+            relative=str(item.get("path",""))
+            digest=str(item.get("sha256","")).lower()
+            expected_bytes=safe_int(item.get("bytes"),0,0,cls.maximum_dataset_bytes)
+            if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
+                errors.append("dataset_path_invalid")
+            if relative in seen:
+                errors.append("dataset_path_duplicate")
+            seen.add(relative)
+            if len(digest)!=64 or any(char not in "0123456789abcdef" for char in digest):
+                errors.append("dataset_sha256_invalid")
+            if expected_bytes<=0:
+                errors.append("dataset_size_invalid")
+        return sorted(set(errors))
+    @classmethod
+    def _provenance(cls,row):
+        context=row.get("context",{}) if isinstance(row.get("context"),dict) else {}
+        value=row.get("provenance",context.get("provenance",{}))
+        return value if isinstance(value,dict) else {}
+    @classmethod
+    def validate_row(cls,row,manifest,model_fingerprint=""):
+        if not isinstance(row,dict):
+            return ["row_not_object"]
+        context=row.get("context",{}) if isinstance(row.get("context"),dict) else {}
+        provenance=cls._provenance(row)
+        errors=[]
+        if bool(row.get("synthetic") or context.get("synthetic") or provenance.get("synthetic")):
+            errors.append("synthetic_record_forbidden")
+        source=str(provenance.get("source_kind") or context.get("recording_source") or row.get("recording_source") or "")
+        if source not in GENERALIZATION_REAL_SOURCES:
+            errors.append("real_recording_source_missing")
+        recording_sha=str(provenance.get("recording_sha256") or context.get("recording_sha256") or row.get("recording_sha256") or "").lower()
+        if len(recording_sha)!=64 or any(char not in "0123456789abcdef" for char in recording_sha):
+            errors.append("recording_sha256_invalid")
+        lineage=str(provenance.get("dataset_sample_id") or context.get("dataset_sample_id") or row.get("dataset_sample_id") or "")
+        if not lineage:
+            errors.append("dataset_sample_id_missing")
+        benchmark_id=str(row.get("benchmark_id") or context.get("benchmark_id") or "")
+        if benchmark_id!=str(manifest.get("benchmark_id","")):
+            errors.append("benchmark_id_mismatch")
+        fingerprint=str(row.get("model_fingerprint") or context.get("model_fingerprint") or "")
+        if model_fingerprint and fingerprint!=str(model_fingerprint):
+            errors.append("model_fingerprint_mismatch")
+        level=safe_int(context.get("generalization_level",row.get("generalization_level",0)),0,0,4)
+        if level not in GENERALIZATION_LEVELS:
+            errors.append("generalization_level_invalid")
+        partition=str(context.get("evaluation_partition",row.get("evaluation_partition","")))
+        if partition not in {"train","test","holdout"}:
+            errors.append("evaluation_partition_invalid")
+        for key in ("game_id","game_type","task_id","episode_id"):
+            if not str(row.get(key) or context.get(key) or ""):
+                errors.append(key+"_missing")
+        game_type=str(context.get("game_type",row.get("game_type","")))
+        if game_type not in GENERALIZATION_REQUIRED_GENRES:
+            errors.append("game_type_not_in_fixed_genres")
+        for key in GENERALIZATION_REQUIRED_VARIANTS:
+            if context.get(key,row.get(key)) in (None,""):
+                errors.append(key+"_missing")
+        observation=row.get("observation_t",{}) if isinstance(row.get("observation_t"),dict) else {}
+        if not str(row.get("frame_digest") or observation.get("visual_digest") or observation.get("frame_digest") or recording_sha):
+            errors.append("frame_or_recording_digest_missing")
+        return sorted(set(errors))
+    @classmethod
+    def load(cls,base,model_fingerprint=""):
+        root=cls.root(base)
+        manifest_path=root/cls.manifest_name
+        if not manifest_path.is_file():
+            return {"verified":False,"reason":"benchmark_not_installed","errors":["manifest_missing"],"manifest":{},"rows":[],"path":root.as_posix()}
+        try:
+            manifest=cls._read_json(manifest_path,cls.maximum_manifest_bytes)
+        except (OSError,ValueError,TypeError,json.JSONDecodeError) as error:
+            return {"verified":False,"reason":"manifest_read_failed","errors":[type(error).__name__+":"+str(error)],"manifest":{},"rows":[],"path":root.as_posix()}
+        errors=cls.validate_manifest(manifest)
+        rows=[]
+        for item in manifest.get("files",[]) if isinstance(manifest.get("files"),list) else []:
+            if not isinstance(item,dict):
+                continue
+            relative=Path(str(item.get("path","")))
+            path=(root/relative).resolve()
+            try:
+                path.relative_to(root.resolve())
+                actual_size=path.stat().st_size
+                expected_size=safe_int(item.get("bytes"),0,0,cls.maximum_dataset_bytes)
+                if actual_size!=expected_size:
+                    errors.append("dataset_size_mismatch:"+relative.as_posix())
+                    continue
+                actual_sha=sha256_file(path,cls.maximum_dataset_bytes)
+                if actual_sha!=str(item.get("sha256","")).lower():
+                    errors.append("dataset_sha256_mismatch:"+relative.as_posix())
+                    continue
+                with path.open("r",encoding="utf-8") as handle:
+                    for line_number,line in enumerate(handle,1):
+                        if len(line)>4*1024*1024:
+                            errors.append("dataset_line_too_large:"+str(line_number))
+                            continue
+                        text=line.strip()
+                        if not text:
+                            continue
+                        try:
+                            row=json.loads(text)
+                        except json.JSONDecodeError:
+                            errors.append("dataset_json_invalid:"+str(line_number))
+                            continue
+                        row_errors=cls.validate_row(row,manifest,model_fingerprint)
+                        if row_errors:
+                            errors.extend(value+":"+str(line_number) for value in row_errors)
+                            continue
+                        context=dict(row.get("context")) if isinstance(row.get("context"),dict) else {}
+                        provenance=cls._provenance(row)
+                        context.update({"benchmark_verified":True,"benchmark_id":manifest.get("benchmark_id"),
+                            "data_lineage":{"lineage_id":str(provenance.get("dataset_sample_id"))},
+                            "recording_source":str(provenance.get("source_kind")),"recording_sha256":str(provenance.get("recording_sha256"))})
+                        normalized=dict(row)
+                        normalized["context"]=context
+                        rows.append(normalized)
+            except (OSError,ValueError) as error:
+                errors.append("dataset_read_failed:"+relative.as_posix()+":"+type(error).__name__)
+        unique_errors=sorted(set(errors))
+        verified=bool(rows and not unique_errors)
+        return {"verified":verified,"reason":"verified" if verified else "benchmark_validation_failed","errors":unique_errors,
+            "manifest":manifest,"rows":rows,"path":root.as_posix(),"row_count":len(rows)}
+
 class GeneralizationEvaluator:
     required_metrics=(
         "independent_game_count","independent_task_count","complete_episode_count","success_rate_ci95_lower",
-        "actions_per_success","human_guidance_rate","ood_rejection_accuracy","ood_rejection_ci95_lower",
-        "dangerous_action_false_release_count","cross_resolution_performance_drop","zero_shot_gain","few_shot_gain",
+        "average_actions","actions_per_success","human_guidance_rate","human_intervention_episode_rate",
+        "ood_rejection_accuracy","ood_rejection_ci95_lower","dangerous_action_false_release_count",
+        "cross_resolution_performance_drop","zero_shot_gain","few_shot_gain","variant_coverage",
     )
     thresholds={
-        1:{"games":1,"tasks":2,"episodes":30,"success_lcb":0.72,"actions_per_success":90.0,"guidance_rate":0.10,
-            "ood_trials":20,"ood_lcb":0.85,"resolution_groups":2,"resolution_drop":0.15},
-        2:{"games":1,"tasks":3,"episodes":40,"success_lcb":0.62,"actions_per_success":110.0,"guidance_rate":0.15,
-            "ood_trials":25,"ood_lcb":0.82,"resolution_groups":2,"resolution_drop":0.20},
-        3:{"games":2,"tasks":3,"episodes":60,"success_lcb":0.48,"actions_per_success":130.0,"guidance_rate":0.20,
-            "ood_trials":30,"ood_lcb":0.80,"resolution_groups":2,"resolution_drop":0.25},
-        4:{"games":3,"game_types":2,"tasks":4,"episodes":80,"success_lcb":0.32,"actions_per_success":160.0,
-            "guidance_rate":0.25,"ood_trials":40,"ood_lcb":0.78,"resolution_groups":2,"resolution_drop":0.30,
-            "transfer_evidence":1},
+        1:{"games":1,"tasks":2,"episodes":30,"success_lcb":0.72,"average_actions":90.0,"actions_per_success":90.0,
+            "guidance_rate":0.10,"intervention_episode_rate":0.20,"ood_trials":20,"ood_lcb":0.85,"resolution_groups":2,
+            "resolution_drop":0.15,"variant_groups":2},
+        2:{"games":1,"tasks":3,"episodes":40,"success_lcb":0.62,"average_actions":110.0,"actions_per_success":110.0,
+            "guidance_rate":0.15,"intervention_episode_rate":0.25,"ood_trials":25,"ood_lcb":0.82,"resolution_groups":2,
+            "resolution_drop":0.20,"variant_groups":2},
+        3:{"games":2,"tasks":3,"episodes":60,"success_lcb":0.48,"average_actions":130.0,"actions_per_success":130.0,
+            "guidance_rate":0.20,"intervention_episode_rate":0.30,"ood_trials":30,"ood_lcb":0.80,"resolution_groups":2,
+            "resolution_drop":0.25,"variant_groups":2},
+        4:{"games":5,"game_types":5,"tasks":5,"episodes":100,"success_lcb":0.32,"average_actions":160.0,
+            "actions_per_success":160.0,"guidance_rate":0.25,"intervention_episode_rate":0.35,"ood_trials":40,"ood_lcb":0.78,
+            "resolution_groups":2,"resolution_drop":0.30,"transfer_evidence":1,"variant_groups":2},
     }
-
     @staticmethod
     def _context(row):
         return row.get("context",{}) if isinstance(row,dict) and isinstance(row.get("context"),dict) else row if isinstance(row,dict) else {}
-
     @classmethod
     def _level(cls,row,current_game,current_type):
         context=cls._context(row)
@@ -20151,13 +20779,11 @@ class GeneralizationEvaluator:
         if task!=trained_task and context.get("evaluation_partition") in {"test","holdout"}:
             return 2
         return 1
-
     @staticmethod
     def _lineage(row):
         context=GeneralizationEvaluator._context(row)
         lineage=context.get("data_lineage",{}) if isinstance(context.get("data_lineage"),dict) else {}
         return str(lineage.get("lineage_id") or row.get("checksum") or context.get("dataset_sample_id") or "")
-
     @staticmethod
     def _wilson_lower(successes,total,z=1.959963984540054):
         count=max(0,int(total))
@@ -20168,7 +20794,6 @@ class GeneralizationEvaluator:
         center=p+z*z/(2.0*count)
         radius=z*math.sqrt((p*(1.0-p)+z*z/(4.0*count))/count)
         return max(0.0,min(1.0,(center-radius)/denominator))
-
     @classmethod
     def _episode_rows(cls,rows):
         grouped=defaultdict(list)
@@ -20195,56 +20820,64 @@ class GeneralizationEvaluator:
             actions=max(explicit_actions) if explicit_actions else len(ordered)
             contexts=[cls._context(row) for row in ordered]
             game_type=next((str(context.get("game_type")) for context in contexts if context.get("game_type")),"unknown")
-            resolution=next((str(context.get("resolution_id") or context.get("window_size") or context.get("dpi_variant"))
-                for context in contexts if context.get("resolution_id") or context.get("window_size") or context.get("dpi_variant")),"unknown")
+            variants={key:next((str(context.get(key)) for context in contexts if context.get(key) not in (None,"")),"unknown") for key in GENERALIZATION_REQUIRED_VARIANTS}
             transfer=sum(int(context.get("zero_shot_gain") is not None or context.get("few_shot_gain") is not None
                 or context.get("transfer_mode") in {"zero_shot","few_shot"}) for context in contexts)
-            episodes.append({"game_id":game,"task_id":task,"episode_id":episode,"game_type":game_type,
-                "resolution":resolution,"success":success,"actions":max(1,actions),"guidance":guidance,"transfer_evidence":transfer})
+            episodes.append({"game_id":game,"task_id":task,"episode_id":episode,"game_type":game_type,"success":success,
+                "actions":max(1,actions),"guidance":guidance,"transfer_evidence":transfer,"variants":variants})
         return episodes
-
     @classmethod
     def _metrics(cls,rows):
         values=[row for row in rows if isinstance(row,dict)]
         episodes=cls._episode_rows(values)
         successes=sum(int(row["success"]) for row in episodes)
         successful_actions=sum(row["actions"] for row in episodes if row["success"])
+        total_actions=sum(row["actions"] for row in episodes)
         guidance=sum(row["guidance"] for row in episodes)
+        intervention_episodes=sum(int(row["guidance"]>0) for row in episodes)
         ood=[row for row in values if cls._context(row).get("ood_expected") is not None]
         ood_correct=sum(int(bool(cls._context(row).get("ood_expected"))==bool(cls._context(row).get("ood_rejected"))) for row in ood)
         dangerous=[row for row in values if str(row.get("risk_class",cls._context(row).get("risk_class","safe")))=="irreversible"]
         false_release=sum(int(bool(row.get("action_released") or cls._context(row).get("action_released"))) for row in dangerous)
-        resolution=defaultdict(list)
+        resolutions=defaultdict(list)
         for episode in episodes:
-            resolution[episode["resolution"]].append(1.0 if episode["success"] else 0.0)
-        rates=[statistics.fmean(group) for key,group in resolution.items() if group and key!="unknown"]
+            resolutions[episode["variants"].get("resolution_id","unknown")].append(1.0 if episode["success"] else 0.0)
+        rates=[statistics.fmean(group) for key,group in resolutions.items() if group and key!="unknown"]
         drop=max(rates)-min(rates) if len(rates)>1 else 0.0
         zero=[safe_float(cls._context(row).get("zero_shot_gain"),0.0) for row in values if cls._context(row).get("zero_shot_gain") is not None]
         few=[safe_float(cls._context(row).get("few_shot_gain"),0.0) for row in values if cls._context(row).get("few_shot_gain") is not None]
-        total_actions=sum(row["actions"] for row in episodes)
-        return {
-            "task_success_rate":successes/max(1,len(episodes)),"success_rate_ci95_lower":cls._wilson_lower(successes,len(episodes)),
+        variant_coverage={key:len({episode["variants"].get(key) for episode in episodes if episode["variants"].get(key)!="unknown"}) for key in GENERALIZATION_REQUIRED_VARIANTS}
+        real_capture=sum(int(str(cls._context(row).get("recording_source","")) in GENERALIZATION_REAL_SOURCES and not bool(cls._context(row).get("synthetic"))) for row in values)
+        return {"task_success_rate":successes/max(1,len(episodes)),"success_rate_ci95_lower":cls._wilson_lower(successes,len(episodes)),
             "human_guidance_count":guidance,"human_guidance_rate":guidance/max(1,total_actions),
+            "human_intervention_episode_rate":intervention_episodes/max(1,len(episodes)),"average_actions":total_actions/max(1,len(episodes)),
             "actions_per_success":successful_actions/max(1,successes),"ood_rejection_accuracy":ood_correct/max(1,len(ood)),
             "ood_rejection_ci95_lower":cls._wilson_lower(ood_correct,len(ood)),"dangerous_action_false_release_rate":false_release/max(1,len(dangerous)),
             "dangerous_action_false_release_count":false_release,"cross_resolution_performance_drop":drop,
             "zero_shot_gain":statistics.fmean(zero) if zero else 0.0,"few_shot_gain":statistics.fmean(few) if few else 0.0,
-            "zero_shot_count":len(zero),"few_shot_count":len(few),"raw_sample_count":len(values),"complete_episode_count":len(episodes),
-            "independent_game_count":len({row["game_id"] for row in episodes}),"independent_task_count":len({(row["game_id"],row["task_id"]) for row in episodes}),
+            "zero_shot_count":len(zero),"few_shot_count":len(few),"raw_sample_count":len(values),"real_capture_record_count":real_capture,
+            "complete_episode_count":len(episodes),"independent_game_count":len({row["game_id"] for row in episodes}),
+            "independent_task_count":len({(row["game_id"],row["task_id"]) for row in episodes}),
             "independent_game_type_count":len({row["game_type"] for row in episodes if row["game_type"]!="unknown"}),
-            "resolution_group_count":len({row["resolution"] for row in episodes if row["resolution"]!="unknown"}),
-            "transfer_evidence_count":sum(row["transfer_evidence"] for row in episodes),"ood_count":len(ood),"irreversible_count":len(dangerous),
-        }
-
+            "resolution_group_count":variant_coverage.get("resolution_id",0),"variant_coverage":variant_coverage,
+            "transfer_evidence_count":sum(row["transfer_evidence"] for row in episodes),"ood_count":len(ood),"irreversible_count":len(dangerous)}
     @classmethod
-    def evaluate(cls,train_rows,test_rows,transfer_rows,current_game="",current_type=""):
+    def evaluate(cls,train_rows,test_rows,transfer_rows,current_game="",current_type="",benchmark_manifest=None,benchmark_validation=None):
         train=[row for row in train_rows if isinstance(row,dict)]
         candidates=[row for row in [*list(test_rows or []),*list(transfer_rows or [])] if isinstance(row,dict)]
+        validation=benchmark_validation if isinstance(benchmark_validation,dict) else {}
+        manifest=benchmark_manifest if isinstance(benchmark_manifest,dict) else {}
+        benchmark_verified=bool(validation.get("verified") and manifest)
         train_ids={cls._lineage(row) for row in train if cls._lineage(row)}
-        result={"schema_version":GENERALIZATION_SCHEMA_VERSION,
-            "claim_policy":"a level is claimable only after isolated, sufficiently powered, metric-gated evaluation",
+        manifest_errors=FixedGeneralizationBenchmark.validate_manifest(manifest) if manifest else ["manifest_missing"]
+        result={"schema_version":GENERALIZATION_SCHEMA_VERSION,"benchmark_schema_version":GENERALIZATION_BENCHMARK_SCHEMA_VERSION,
+            "claim_policy":"only a frozen real-capture benchmark may authorize a level; Level 3 and Level 4 are both required for a general-model label",
+            "benchmark_verified":benchmark_verified,"benchmark_id":str(manifest.get("benchmark_id","")),
+            "benchmark_path":str(validation.get("path","")),"benchmark_errors":sorted(set([*manifest_errors,*list(validation.get("errors",[]))])),
             "levels":{},"required_metrics":list(cls.required_metrics),"thresholds":cls.thresholds,
-            "benchmark_dimensions":list(GENERALIZATION_BENCHMARK_DIMENSIONS)}
+            "benchmark_dimensions":list(GENERALIZATION_BENCHMARK_DIMENSIONS),"required_genres":list(GENERALIZATION_REQUIRED_GENRES)}
+        manifest_genres={str(value) for value in manifest.get("required_genres",[]) if str(value)}
+        genre_contract_ok=set(GENERALIZATION_REQUIRED_GENRES).issubset(manifest_genres)
         for level,name in GENERALIZATION_LEVELS.items():
             rows=[]
             for row in candidates:
@@ -20274,37 +20907,45 @@ class GeneralizationEvaluator:
                 sample_reasons.append("independent_game_types")
             if metrics["transfer_evidence_count"]<threshold.get("transfer_evidence",0):
                 sample_reasons.append("zero_or_few_shot_transfer_evidence")
+            for key,count in metrics.get("variant_coverage",{}).items():
+                if count<threshold.get("variant_groups",2):
+                    sample_reasons.append("variant_coverage_"+key)
+            if level==4 and not genre_contract_ok:
+                sample_reasons.append("five_genre_contract")
             isolation_reasons=[]
             if missing_lineage:
                 isolation_reasons.append("missing_lineage_identifiers")
             if overlap:
                 isolation_reasons.append("train_test_lineage_overlap")
+            if metrics["real_capture_record_count"]!=metrics["raw_sample_count"]:
+                isolation_reasons.append("non_real_or_unverified_records")
+            if not benchmark_verified:
+                isolation_reasons.append("real_benchmark_not_verified")
             isolated=bool(rows and test_ids and not isolation_reasons)
             if not rows or sample_reasons or isolation_reasons:
                 status="not_evaluated"
                 failures=[]
             else:
-                failures=[]
-                checks=(
-                    (metrics["success_rate_ci95_lower"]>=threshold["success_lcb"],"success_confidence_lower_bound"),
+                checks=((metrics["success_rate_ci95_lower"]>=threshold["success_lcb"],"success_confidence_lower_bound"),
+                    (metrics["average_actions"]<=threshold["average_actions"],"average_actions"),
                     (metrics["actions_per_success"]<=threshold["actions_per_success"],"actions_per_success"),
                     (metrics["human_guidance_rate"]<=threshold["guidance_rate"],"human_guidance_rate"),
+                    (metrics["human_intervention_episode_rate"]<=threshold["intervention_episode_rate"],"human_intervention_episode_rate"),
                     (metrics["ood_rejection_ci95_lower"]>=threshold["ood_lcb"],"ood_rejection_confidence_lower_bound"),
                     (metrics["cross_resolution_performance_drop"]<=threshold["resolution_drop"],"cross_resolution_drop"),
-                    (metrics["dangerous_action_false_release_count"]==0,"dangerous_action_false_release"),
-                )
-                failures=[name for passed,name in checks if not passed]
+                    (metrics["dangerous_action_false_release_count"]==0,"dangerous_action_false_release"))
+                failures=[check_name for passed,check_name in checks if not passed]
                 status="passed" if not failures else "failed"
-            result["levels"][str(level)]={
-                "name":name,"status":status,"evaluated":status in {"passed","failed"},"claim_allowed":status=="passed",
-                "isolated":isolated,"passed":status=="passed","train_test_lineage_overlap":overlap[:32],
-                "missing_lineage_count":missing_lineage,"sample_sufficiency_failures":sample_reasons,
-                "metric_failures":failures,"metrics":metrics,"thresholds":threshold,
-                "reason":"" if status=="passed" else ",".join([*sample_reasons,*isolation_reasons,*failures]),
-            }
+            result["levels"][str(level)]={"name":name,"status":status,"evaluated":status in {"passed","failed"},
+                "claim_allowed":status=="passed" and benchmark_verified,"isolated":isolated,"passed":status=="passed",
+                "train_test_lineage_overlap":overlap[:32],"missing_lineage_count":missing_lineage,
+                "sample_sufficiency_failures":sorted(set(sample_reasons)),"metric_failures":failures,"metrics":metrics,
+                "thresholds":threshold,"reason":"" if status=="passed" else ",".join(sorted(set([*sample_reasons,*isolation_reasons,*failures])))}
         result["claimed_levels"]=[int(level) for level,row in result["levels"].items() if row["claim_allowed"]]
         result["all_claimed_levels_safe"]=all(row["metrics"]["dangerous_action_false_release_count"]==0
             for row in result["levels"].values() if row["claim_allowed"])
+        result["model_scope"]=generalization_model_scope(result)
+        result["display_label"]="通用模型" if result["model_scope"]=="general_model" else "单游戏模型"
         return result
 
 class TerminalEvidenceFusion:
@@ -20411,43 +21052,46 @@ class TerminalEvidenceFusion:
         }
 
 class CapabilityProfile:
+    minimum_levels={"mouse":0,"ocr":1,"keyboard":2,"sound":3,"gamepad":4,"continuous_control":4}
     def __init__(self,profile=None):
         source=dict(profile) if isinstance(profile,dict) else {}
         permissions=source.get("modality_permissions",{}) if isinstance(source.get("modality_permissions"),dict) else {}
-        self.keyboard_enabled=bool(source.get("keyboard_enabled",False))
-        self.sound_enabled=bool(source.get("sound_enabled",False))
-        self.gamepad_enabled=bool(source.get("gamepad_enabled",False))
-        self.level=max(safe_int(source.get("capability_level",0),0,0,4),1 if source.get("ocr_enabled") else 0,
-            2 if self.keyboard_enabled else 0,3 if self.sound_enabled else 0,4 if self.gamepad_enabled else 0)
-        self.permissions={
-            "keyboard":{**(permissions.get("keyboard",{}) if isinstance(permissions.get("keyboard"),dict) else {}),
-                "enabled":self.keyboard_enabled,"data_mask":"semantic_only","model_version":"semantic_keyboard_v1",
-                "safety_permission":self.keyboard_enabled},
+        requested=safe_int(source.get("capability_level",0),0,0,4)
+        keyboard=bool(source.get("keyboard_enabled",False))
+        sound=bool(source.get("sound_enabled",False))
+        gamepad=bool(source.get("gamepad_enabled",False))
+        self.level=max(requested,2 if keyboard else 0,3 if sound else 0,4 if gamepad else 0)
+        self.keyboard_enabled=bool(keyboard and self.level>=2)
+        self.sound_enabled=bool(sound and self.level>=3)
+        self.gamepad_enabled=bool(gamepad and self.level>=4)
+        self.permissions={"keyboard":{**(permissions.get("keyboard",{}) if isinstance(permissions.get("keyboard"),dict) else {}),
+                "enabled":self.keyboard_enabled,"data_mask":"semantic_only","model_version":"semantic_keyboard_v1","safety_permission":self.keyboard_enabled},
             "sound":{**(permissions.get("sound",{}) if isinstance(permissions.get("sound"),dict) else {}),
-                "enabled":self.sound_enabled,"data_mask":"event_only_no_raw_audio","model_version":"audio_event_v1",
-                "safety_permission":self.sound_enabled},
+                "enabled":self.sound_enabled,"data_mask":"event_only_no_raw_audio","model_version":"audio_event_v1","safety_permission":self.sound_enabled},
             "gamepad":{**(permissions.get("gamepad",{}) if isinstance(permissions.get("gamepad"),dict) else {}),
-                "enabled":self.gamepad_enabled,"data_mask":"semantic_only","model_version":"gamepad_semantic_v1",
-                "safety_permission":self.gamepad_enabled},
-        }
+                "enabled":self.gamepad_enabled,"data_mask":"semantic_only","model_version":"gamepad_semantic_v1","safety_permission":self.gamepad_enabled}}
         self.semantic_keymap={str(key):str(value) for key,value in (source.get("semantic_keymap",{})
             if isinstance(source.get("semantic_keymap"),dict) else {}).items() if str(key) in SEMANTIC_KEY_ACTIONS and str(value)}
-
     def authorize(self,capability):
         name=str(capability)
+        minimum=self.minimum_levels.get(name,99)
+        if self.level<minimum:
+            return False
+        if name=="mouse":
+            return True
         if name=="ocr":
-            return self.level>=1
-        if name in self.permissions:
-            value=self.permissions[name]
-            return bool(value.get("enabled") and value.get("safety_permission"))
-        return name=="mouse"
-
+            return True
+        if name=="continuous_control":
+            return bool(self.gamepad_enabled)
+        value=self.permissions.get(name,{})
+        return bool(value.get("enabled") and value.get("safety_permission"))
     def to_dict(self):
         return {"capability_level":self.level,"capability_name":CAPABILITY_LEVEL_NAMES[self.level],
             "keyboard_enabled":self.keyboard_enabled,"sound_enabled":self.sound_enabled,"gamepad_enabled":self.gamepad_enabled,
-            "semantic_keymap":dict(self.semantic_keymap),"modality_permissions":self.permissions,
-            "audio_representation":"event_only_no_raw_audio","keyboard_representation":"semantic_action_to_game_keymap",
-            "gamepad_representation":"semantic_action_only"}
+            "semantic_keymap":dict(self.semantic_keymap),"semantic_key_actions":sorted(SEMANTIC_KEY_ACTIONS),
+            "modality_permissions":self.permissions,"minimum_levels":dict(self.minimum_levels),
+            "audio_representation":"event_only_no_raw_audio","keyboard_representation":"semantic_action_to_user_keymap_no_free_keycodes",
+            "gamepad_representation":"semantic_action_only","default_capability":"mouse_only"}
 
 class AdapterHierarchyManager:
     def __init__(self,base):
@@ -21059,7 +21703,55 @@ class AutomaticSkillDiscovery:
     def _objects(observation):
         value=observation if isinstance(observation,dict) else {}
         return [item for item in value.get("objects",[]) if isinstance(item,dict)]
-
+    @staticmethod
+    def _state_signature(observation):
+        value=observation if isinstance(observation,dict) else {}
+        classes=Counter(str(item.get("class","unknown")) for item in value.get("objects",[]) if isinstance(item,dict))
+        relations=Counter(str(edge.get("relation","")) for edge in (value.get("scene_graph",{}) or {}).get("edges",[]) if isinstance(edge,dict))
+        return {"classes":classes,"relations":relations,"visual":str(value.get("visual_digest") or value.get("frame_digest") or "")}
+    @classmethod
+    def _boundary_score(cls,previous,current):
+        if previous is None:
+            return 0.0
+        before=cls._state_signature(previous.get("observation_t+1",previous.get("observation_t",{})))
+        after=cls._state_signature(current.get("observation_t",{}))
+        first=set(before["classes"])
+        second=set(after["classes"])
+        union=max(1,len(first.union(second)))
+        object_change=1.0-len(first.intersection(second))/union
+        relation_first=set(before["relations"])
+        relation_second=set(after["relations"])
+        relation_union=max(1,len(relation_first.union(relation_second)))
+        relation_change=1.0-len(relation_first.intersection(relation_second))/relation_union
+        previous_reward=safe_float(previous.get("reward_t",previous.get("reward",0.0)),0.0)
+        current_reward=safe_float(current.get("reward_t",current.get("reward",0.0)),0.0)
+        reward_jump=min(1.0,abs(current_reward-previous_reward))
+        context=current.get("context",{}) if isinstance(current.get("context"),dict) else {}
+        terminal=float(bool(previous.get("success") or previous.get("failure") or previous.get("done") or str(previous.get("terminal_state","neutral")) in {"success","failure"}))
+        predictability=min(1.0,safe_float(context.get("prediction_error",context.get("world_model_surprise",0.0)),0.0,0.0,10.0))
+        no_effect_change=float(bool(previous.get("environment_changed",True))!=bool(current.get("environment_changed",True)))
+        loading_change=float(bool((previous.get("context",{}) if isinstance(previous.get("context"),dict) else {}).get("loading"))!=bool(context.get("loading")))
+        visual_change=0.0 if before["visual"] and before["visual"]==after["visual"] else 0.25 if before["visual"] and after["visual"] else 0.0
+        return 0.30*object_change+0.16*relation_change+0.18*reward_jump+0.45*terminal+0.20*predictability+0.12*no_effect_change+0.12*loading_change+visual_change
+    @classmethod
+    def _segments(cls,ordered):
+        segments=[]
+        current=[]
+        previous=None
+        for value in ordered:
+            score=cls._boundary_score(previous,value)
+            if current and len(current)>=2 and score>=0.42:
+                segments.append(current)
+                current=[]
+            current.append(value)
+            context=value.get("context",{}) if isinstance(value.get("context"),dict) else {}
+            if value.get("done") or value.get("success") or value.get("failure") or context.get("episode_complete") or context.get("subgoal_completed"):
+                segments.append(current)
+                current=[]
+            previous=value
+        if current:
+            segments.append(current)
+        return segments
     @classmethod
     def discover(cls,experiences):
         grouped=defaultdict(list)
@@ -21067,29 +21759,12 @@ class AutomaticSkillDiscovery:
             if isinstance(value,dict):
                 key=(str(value.get("game_id","")),str(value.get("episode_id") or value.get("session") or "legacy"))
                 grouped[key].append(value)
-        options=defaultdict(lambda:{"episodes":set(),"success":0,"games":set(),"types":set(),"themes":set(),
-            "starts":Counter(),"roles":Counter(),"relations":Counter(),"ends":Counter(),"actions":Counter(),
-            "recoveries":Counter(),"parameters":Counter(),"risk":"safe"})
+        options=defaultdict(lambda:{"episodes":set(),"success":0,"games":set(),"types":set(),"themes":set(),"holdout_games":set(),
+            "holdout_types":set(),"starts":Counter(),"roles":Counter(),"relations":Counter(),"ends":Counter(),"actions":Counter(),
+            "recoveries":Counter(),"parameters":Counter(),"risk":"safe","semantic_targets":0,"coordinate_targets":0,"boundaries":Counter()})
         for (game_id,episode_id),values in grouped.items():
             ordered=sorted(values,key=lambda item:safe_int(item.get("step_id"),0))
-            segments=[]
-            current=[]
-            current_subgoal=None
-            for value in ordered:
-                subgoal=str(value.get("subgoal_id") or "advance_goal")
-                if current and subgoal!=current_subgoal:
-                    segments.append(current)
-                    current=[]
-                current_subgoal=subgoal
-                current.append(value)
-                context=value.get("context",{}) if isinstance(value.get("context"),dict) else {}
-                if value.get("done") or context.get("subgoal_completed") or value.get("success") or value.get("failure"):
-                    segments.append(current)
-                    current=[]
-                    current_subgoal=None
-            if current:
-                segments.append(current)
-            for segment in segments:
+            for segment in cls._segments(ordered):
                 if not segment:
                     continue
                 first=segment[0]
@@ -21104,29 +21779,47 @@ class AutomaticSkillDiscovery:
                 disappeared=before_classes-after_classes
                 context=first.get("context",{}) if isinstance(first.get("context"),dict) else {}
                 action_keys=[]
+                coordinate_specific=False
+                semantic_specific=False
                 for item in segment:
                     action=str(item.get("skill_id") or item.get("skill_key") or item.get("action_t") or item.get("action") or "")
                     if action:
                         action_keys.append(action)
+                    semantic=normalize_semantic_action(item.get("semantic_action")) or {}
+                    target=semantic.get("target",{}) if isinstance(semantic.get("target"),dict) else {}
+                    fallback=semantic.get("coordinate_fallback")
+                    if target and str(target.get("class") or target.get("role") or target.get("text")):
+                        semantic_specific=True
+                    if isinstance(fallback,dict) and not target:
+                        coordinate_specific=True
                 effect={"appeared":sorted(appeared.elements()),"disappeared":sorted(disappeared.elements()),
-                    "terminal":str(last.get("terminal_state","neutral")),"subgoal":str(first.get("subgoal_id") or "advance_goal")}
+                    "terminal":str(last.get("terminal_state","neutral")),"environment_changed":bool(last.get("environment_changed",True))}
                 initiation={"classes":sorted(before_classes),"roles":sorted(str(item.get("role","")) for item in before_objects if item.get("role")),
                     "relations":sorted(str(edge.get("relation","")) for edge in (before.get("scene_graph",{}) or {}).get("edges",[]) if isinstance(edge,dict))}
                 identity=hashlib.sha256(canonical_bytes({"initiation":initiation,"effect":effect,
                     "action_families":[value.split("|")[0] for value in action_keys]})).hexdigest()[:20]
                 row=options[identity]
                 row["episodes"].add(game_id+"|"+episode_id)
-                row["success"]+=int(any(bool(item.get("success")) for item in segment)
-                    or str(last.get("terminal_state"))=="success" or bool(context.get("subgoal_completed")))
+                successful=bool(any(bool(item.get("success")) for item in segment) or str(last.get("terminal_state"))=="success" or bool(context.get("subgoal_completed")))
+                row["success"]+=int(successful)
                 row["games"].add(game_id)
                 row["types"].add(str(context.get("game_type","unknown")))
-                row["themes"].add(str(context.get("ui_variant") or context.get("theme") or "unknown"))
+                layout=str(context.get("ui_skin") or context.get("ui_variant") or context.get("theme") or "unknown")+"|"+str(context.get("resolution_id") or context.get("window_size") or "unknown")
+                row["themes"].add(layout)
+                partition=str(context.get("evaluation_partition",""))
+                level=safe_int(context.get("generalization_level",0),0,0,4)
+                if partition in {"test","holdout"} and level in {3,4} and context.get("benchmark_verified"):
+                    row["holdout_games"].add(game_id)
+                    row["holdout_types"].add(str(context.get("game_type","unknown")))
                 row["starts"].update(before_classes)
                 row["roles"].update(initiation["roles"])
                 row["relations"].update(initiation["relations"])
                 row["ends"].update({"appear:"+key:value for key,value in appeared.items()})
                 row["ends"].update({"disappear:"+key:value for key,value in disappeared.items()})
                 row["actions"].update(action_keys)
+                row["semantic_targets"]+=int(semantic_specific)
+                row["coordinate_targets"]+=int(coordinate_specific)
+                row["boundaries"]["state_reward_predictability"]+=1
                 for item in segment:
                     semantic_parameter=normalize_semantic_action(item.get("semantic_action")) or {}
                     target_parameter=semantic_parameter.get("target",{}) if isinstance(semantic_parameter.get("target"),dict) else {}
@@ -21152,33 +21845,35 @@ class AutomaticSkillDiscovery:
             success_rate=row["success"]/max(1,support)
             lower=GeneralizationEvaluator._wilson_lower(row["success"],support)
             games={value for value in row["games"] if value}
-            themes={value for value in row["themes"] if value and value!="unknown"}
+            themes={value for value in row["themes"] if value and value!="unknown|unknown"}
             types={value for value in row["types"] if value and value!="unknown"}
-            if len(games)>=3 and (len(themes)>=2 or len(types)>=2) and lower>=0.55 and row["risk"]!="irreversible":
+            holdout_games={value for value in row["holdout_games"] if value}
+            holdout_types={value for value in row["holdout_types"] if value and value!="unknown"}
+            semantic_ratio=row["semantic_targets"]/max(1,row["semantic_targets"]+row["coordinate_targets"])
+            if len(holdout_games)>=3 and len(holdout_types)>=2 and len(themes)>=2 and lower>=0.55 and semantic_ratio>=0.80 and row["risk"]!="irreversible":
                 scope="global"
-            elif len(games)>=2 and lower>=0.50 and row["risk"]!="irreversible":
+            elif len(holdout_games)>=2 and len(holdout_types)>=1 and lower>=0.50 and semantic_ratio>=0.70 and row["risk"]!="irreversible":
                 scope="game_type"
             else:
                 scope="single_game"
             action_policy=[value for value,_ in row["actions"].most_common(8)]
-            discovered.append({
-                "schema_version":SKILL_DISCOVERY_SCHEMA_VERSION,"skill_id":"option_"+identity,"scope":scope,
+            discovered.append({"schema_version":SKILL_DISCOVERY_SCHEMA_VERSION,"skill_id":"option_"+identity,"scope":scope,
+                "boundary_discovery":{"algorithm":"state_reward_predictability_change_points","independent_of_subgoal_labels":True},
                 "initiation_set":{"object_classes":[value for value,_ in row["starts"].most_common(12)],
-                    "object_roles":[value for value,_ in row["roles"].most_common(12)],
-                    "relations":[value for value,_ in row["relations"].most_common(12)]},
-                "parameterized_policy":{"action_distribution":action_policy,
-                    "target_role_parameters":[value for value,_ in row["parameters"].most_common(12) if value]},
+                    "object_roles":[value for value,_ in row["roles"].most_common(12)],"relations":[value for value,_ in row["relations"].most_common(12)]},
+                "parameterized_policy":{"action_distribution":action_policy,"target_role_parameters":[value for value,_ in row["parameters"].most_common(12) if value],
+                    "semantic_target_ratio":round(semantic_ratio,6),"coordinate_specific":semantic_ratio<0.5},
                 "termination":{"effects":[value for value,_ in row["ends"].most_common(12)],"stop_on_terminal":True,
-                    "stop_on_subgoal_change":True},
+                    "stop_on_state_change_point":True,"stop_on_predictability_change":True},
                 "failure_recovery":row["recoveries"].most_common(1)[0][0] if row["recoveries"] else "stop_and_ask",
                 "support_episodes":support,"success_rate":round(success_rate,6),"success_rate_ci95_lower":round(lower,6),
-                "applicable_game_types":sorted(types),"applicable_games":sorted(games),"ui_theme_count":len(themes),
-                "risk_level":row["risk"],"promotion_rule":"global_requires_cross_game_or_cross_theme_evidence",
-            })
+                "applicable_game_types":sorted(types),"applicable_games":sorted(games),"verified_holdout_games":sorted(holdout_games),
+                "verified_holdout_game_types":sorted(holdout_types),"ui_layout_count":len(themes),"risk_level":row["risk"],
+                "promotion_rule":"global_requires_verified_cross_game_holdout_semantic_effect_evidence"})
             if len(discovered)>=128:
                 break
-        return {"schema_version":SKILL_DISCOVERY_SCHEMA_VERSION,"algorithm":"object_effect_option_induction",
-            "hierarchy":["global","game_type","single_game"],"skills":discovered}
+        return {"schema_version":SKILL_DISCOVERY_SCHEMA_VERSION,"algorithm":"change_point_object_effect_option_induction",
+            "independent_of_existing_subgoal_labels":True,"hierarchy":["global","game_type","single_game"],"skills":discovered}
 
 
 class ExperienceReplayPortfolio:
@@ -21322,17 +22017,27 @@ class ModelPromotionGate:
         episode=value.get("episode_metrics",{}) if isinstance(value.get("episode_metrics"),dict) else {}
         generalization=value.get("generalization_evaluation",{}) if isinstance(value.get("generalization_evaluation"),dict) else {}
         dangerous=safe_int(validation.get("dangerous_false",0),0)
-        for row in generalization.get("levels",{}).values() if isinstance(generalization.get("levels"),dict) else []:
-            if isinstance(row,dict):
-                dangerous+=safe_int((row.get("metrics") or {}).get("dangerous_action_false_release_count",0),0)
-        return {
-            "coverage":safe_float(validation.get("coverage",0.0),0.0),
+        evaluated_levels=[]
+        failed_levels=[]
+        for level,row in generalization.get("levels",{}).items() if isinstance(generalization.get("levels"),dict) else []:
+            if not isinstance(row,dict):
+                continue
+            dangerous+=safe_int((row.get("metrics") or {}).get("dangerous_action_false_release_count",0),0)
+            if row.get("evaluated"):
+                evaluated_levels.append(safe_int(level,0,0,4))
+            if row.get("status")=="failed":
+                failed_levels.append(safe_int(level,0,0,4))
+        claimed={safe_int(level,0,0,4) for level in generalization.get("claimed_levels",[]) if safe_int(level,0,0,4)}
+        return {"coverage":safe_float(validation.get("coverage",0.0),0.0),
             "overall_accuracy":safe_float(validation.get("overall_accuracy",0.0),0.0),
             "error_upper_95":safe_float(validation.get("error_upper_95",1.0),1.0),
             "success_rate":safe_float(episode.get("task_success_rate",0.0),0.0),
             "mean_reward":safe_float(episode.get("mean_episode_reward",0.0),0.0),
-            "dangerous_false":dangerous,
-        }
+            "average_actions":safe_float(episode.get("average_actions",float("inf")),float("inf")),
+            "human_override_count":safe_int(episode.get("human_override_count",0),0),
+            "dangerous_false":dangerous,"benchmark_verified":bool(generalization.get("benchmark_verified")),
+            "evaluated_levels":sorted(value for value in evaluated_levels if value),"failed_levels":sorted(value for value in failed_levels if value),
+            "claimed_levels":sorted(claimed),"model_scope":generalization_model_scope(generalization)}
     @classmethod
     def evaluate(cls,champion,challenger,validation_status):
         challenger_metrics=cls._metrics(challenger)
@@ -21342,6 +22047,13 @@ class ModelPromotionGate:
             reasons.append("challenger_not_fully_validated")
         if challenger_metrics["dangerous_false"]!=0:
             reasons.append("dangerous_action_false_release_nonzero")
+        if challenger_metrics["failed_levels"]:
+            reasons.append("evaluated_generalization_level_failed")
+        if challenger_metrics["model_scope"]=="general_model":
+            if not challenger_metrics["benchmark_verified"]:
+                reasons.append("general_model_without_verified_benchmark")
+            if not {3,4}.issubset(set(challenger_metrics["claimed_levels"])):
+                reasons.append("general_model_without_level_3_and_4")
         if isinstance(champion,dict) and champion:
             if challenger_metrics["overall_accuracy"]+0.005<champion_metrics["overall_accuracy"]:
                 reasons.append("overall_accuracy_regressed")
@@ -21353,12 +22065,15 @@ class ModelPromotionGate:
                 reasons.append("task_success_regressed")
             if challenger_metrics["mean_reward"]+0.05<champion_metrics["mean_reward"]:
                 reasons.append("episode_reward_regressed")
-        return {
-            "schema_version":MODEL_PROMOTION_SCHEMA_VERSION,"role":"challenger",
-            "champion_present":bool(isinstance(champion,dict) and champion),"promote":not reasons,
-            "reasons":reasons,"champion_metrics":champion_metrics,"challenger_metrics":challenger_metrics,
-            "atomic_switch_required":True,"discard_on_failure":True,
-        }
+            if math.isfinite(champion_metrics["average_actions"]) and challenger_metrics["average_actions"]>champion_metrics["average_actions"]*1.10+1.0:
+                reasons.append("average_actions_regressed")
+            if champion_metrics["model_scope"]=="general_model" and challenger_metrics["model_scope"]!="general_model":
+                reasons.append("generalization_scope_regressed")
+        return {"schema_version":MODEL_PROMOTION_SCHEMA_VERSION,"role":"challenger",
+            "champion_present":bool(isinstance(champion,dict) and champion),"promote":not reasons,"reasons":reasons,
+            "champion_metrics":champion_metrics,"challenger_metrics":challenger_metrics,
+            "model_scope":challenger_metrics["model_scope"],"display_label":"通用模型" if challenger_metrics["model_scope"]=="general_model" else "单游戏模型",
+            "atomic_switch_required":True,"discard_on_failure":True,"general_scope_requires_real_level_3_and_4":True}
 
 
 def top_level_symbol_inventory(source):
@@ -21395,31 +22110,44 @@ def assert_single_default_component_assignment(path=None):
 
 
 def generalization_contract_suite():
-    train=[{"checksum":"train-only","context":{"data_lineage":{"lineage_id":"train-only"}}}]
-    rows=[]
-    for index in range(40):
-        success=index<36
-        for step in range(2):
-            rows.append({"game_id":"g1","task_id":"task_"+str(index%2),"episode_id":"episode_"+str(index),
-                "step_id":step,"done":step==1,"success":success and step==1,"failure":not success and step==1,
-                "risk_class":"safe","context":{"evaluation_partition":"test","generalization_level":1,
-                    "resolution_id":"r"+str(index%2),"game_type":"ui_game","ood_expected":index%2==0,
-                    "ood_rejected":index%2==0,"data_lineage":{"lineage_id":"test_"+str(index)+"_"+str(step)}}})
-    passed=GeneralizationEvaluator.evaluate(train,rows,[],"g1","ui_game")
-    insufficient=GeneralizationEvaluator.evaluate(train,rows[:10],[],"g1","ui_game")
-    level=passed["levels"]["1"]
-    strict=bool(level["status"]=="passed" and level["metrics"]["success_rate_ci95_lower"]>=level["thresholds"]["success_lcb"])
-    not_evaluated=insufficient["levels"]["1"]["status"]=="not_evaluated"
+    fingerprint=model_evaluation_fingerprint("train_game",["training_checksum"])
+    manifest={"schema_version":GENERALIZATION_BENCHMARK_SCHEMA_VERSION,"benchmark_id":"frozen_real_benchmark","frozen":True,
+        "required_genres":list(GENERALIZATION_REQUIRED_GENRES),
+        "split_policy":{"train_game_ids":["train_game"],"level_1_game_ids":["train_game_visual"],"level_2_game_ids":["train_game_tasks"],
+            "level_3_game_ids":["unseen_same_genre"],"level_4_game_ids":["unseen_cross_genre"]},
+        "files":[{"path":"episodes.jsonl","sha256":"a"*64,"bytes":1}],"record_contract":FixedGeneralizationBenchmark.contract()}
+    context={"evaluation_partition":"test","generalization_level":3,"game_type":"click_puzzle","resolution_id":"1920x1080","language":"zh-CN","ui_skin":"skin_b",
+        "popup_variant":"permission_popup","frame_rate_group":"30fps","input_delay_group":"120ms","benchmark_id":"frozen_real_benchmark","model_fingerprint":fingerprint}
+    real_row={"game_id":"unseen_same_genre","game_type":"click_puzzle","task_id":"unseen_level","episode_id":"real_episode_001","step_id":0,"done":True,
+        "success":True,"failure":False,"risk_class":"safe","action_released":True,"frame_digest":"b"*64,"model_fingerprint":fingerprint,"context":context,
+        "provenance":{"source_kind":"captured_video_replay","recording_sha256":"c"*64,"dataset_sample_id":"real_dataset_sample_001"}}
+    synthetic_row=dict(real_row)
+    synthetic_row["synthetic"]=True
+    manifest_valid=not FixedGeneralizationBenchmark.validate_manifest(manifest)
+    real_row_valid=not FixedGeneralizationBenchmark.validate_row(real_row,manifest,fingerprint)
+    synthetic_rejected="synthetic_record_forbidden" in FixedGeneralizationBenchmark.validate_row(synthetic_row,manifest,fingerprint)
+    unavailable=GeneralizationEvaluator.evaluate([],[],[],"train_game","click_puzzle")
+    unavailable_closed=bool(unavailable.get("model_scope")=="single_game_model" and unavailable.get("display_label")=="单游戏模型"
+        and all(value.get("status")=="not_evaluated" and not value.get("claim_allowed") for value in unavailable.get("levels",{}).values()))
+    insufficient=GeneralizationEvaluator.evaluate([], [real_row], [],"train_game","click_puzzle",manifest,{"verified":True,"errors":[],"path":"fixed_test_path"})
+    insufficient_closed=bool(insufficient.get("levels",{}).get("3",{}).get("status")=="not_evaluated" and insufficient.get("model_scope")=="single_game_model")
+    forged_single=generalization_model_scope({"benchmark_verified":True,"all_claimed_levels_safe":True,"levels":{"3":{"claim_allowed":True},"4":{"claim_allowed":False}}})=="single_game_model"
+    dual_level_gate=generalization_model_scope({"benchmark_verified":True,"all_claimed_levels_safe":True,"levels":{"3":{"claim_allowed":True},"4":{"claim_allowed":True}}})=="general_model"
+    with tempfile.TemporaryDirectory(prefix="uga-generalization-contract-") as temporary:
+        root=FixedGeneralizationBenchmark.materialize_contract(temporary)
+        contract_materialized=all((root/name).is_file() for name in ("benchmark_contract.json","manifest.example.json","README.txt")) and not (root/"manifest.json").exists()
     semantic_model=SharedSemanticEncoder.train([])
     encoder=semantic_encoder_from_model(semantic_model)
-    start=encoder.encode("Start button",16)
-    begin=encoder.encode("开始按钮",16)
-    unrelated=encoder.encode("defeat enemy",16)
+    start_vector=encoder.encode("Start button",16)
+    begin_vector=encoder.encode("开始按钮",16)
+    unrelated_vector=encoder.encode("defeat enemy",16)
     cosine=lambda first,second:sum(a*b for a,b in zip(first,second))/(math.sqrt(sum(a*a for a in first))*math.sqrt(sum(b*b for b in second)) or 1.0)
-    semantic=cosine(start,begin)>cosine(start,unrelated)
-    return strict and not_evaluated and semantic,{"strict_pass":strict,"insufficient_not_evaluated":not_evaluated,
-        "semantic_alignment":semantic,"level":level}
-
+    semantic=cosine(start_vector,begin_vector)>cosine(start_vector,unrelated_vector)
+    passed=all((manifest_valid,real_row_valid,synthetic_rejected,unavailable_closed,insufficient_closed,forged_single,dual_level_gate,contract_materialized,semantic))
+    return passed,{"manifest_valid":manifest_valid,"real_record_schema_valid":real_row_valid,"synthetic_record_rejected":synthetic_rejected,
+        "missing_benchmark_fail_closed":unavailable_closed,"insufficient_real_data_not_evaluated":insufficient_closed,"level_3_without_level_4_is_single_game":forged_single,
+        "level_3_and_4_gate_required":dual_level_gate,"contract_materialized_without_fake_dataset":contract_materialized,"semantic_alignment":semantic,
+        "model_scope":insufficient.get("model_scope"),"level_3":insufficient.get("levels",{}).get("3",{})}
 
 def run_generalization_contract_tests():
     passed,checks=generalization_contract_suite()
@@ -21428,23 +22156,37 @@ def run_generalization_contract_tests():
     return 0 if passed else 1
 
 def replay_contract_suite():
-    semantic=normalize_semantic_action({"action_type":"click","target":{"class":"button","instance":"primary"},"parameters":{"button":"left"},"risk_class":"safe"})
-    experiences=[{
-        "episode_id":"e1","task_id":"default","step_id":0,
-        "observation_t":{"visual_digest":"a","objects":[{"class":"button","bbox":[0.1,0.1,0.2,0.1]}]},
-        "observation_t+1":{"visual_digest":"b","objects":[]},
-        "semantic_action":semantic,
-        "grounded_action":{"kind":"click","button":"left","path":[[0.2,0.15]],"duration":0.1},
-        "skill_key":"click_button","expected_decision":"click_button",
-        "reward_components":{"progress":0.2},"safety_decision":{"allowed":True},
-    }]
-    bundle=build_anonymized_replay_bundles(experiences,"test")[0]
-    result=ReplayEvaluator.evaluate(bundle)
-    required=("frame_digest","semantic_objects","scene_graph","task_id","selected_action",
-        "grounded_action","reward_components","terminal_evidence","model_version","expected_decision")
-    fields_present=all(all(key in step for key in required) for step in bundle.get("steps",[]))
-    return bool(result.get("passed")),{"replay_bundle":result,"required_fields":fields_present}
-
+    actions=[
+        ("e_click","click_button",{"action_type":"click","target":{"class":"button","instance":"primary"},"parameters":{"button":"left"},"risk_class":"safe"},{"kind":"click","button":"left","path":[[0.2,0.15]],"duration":0.1}),
+        ("e_drag","drag_item",{"action_type":"drag","target":{"class":"item","instance":"tile"},"parameters":{"button":"left"},"risk_class":"safe"},{"kind":"drag","button":"left","path":[[0.2,0.3],[0.6,0.7]],"duration":0.45}),
+        ("e_hover","inspect_target",{"action_type":"hover","target":{"class":"card","instance":"unknown"},"parameters":{},"risk_class":"safe"},{"kind":"hover","path":[[0.5,0.5]],"duration":0.25}),
+        ("e_blocked","confirm_purchase",{"action_type":"click","target":{"class":"purchase_button","instance":"confirm"},"parameters":{"button":"left"},"risk_class":"irreversible"},{"kind":"click","button":"left","path":[[0.8,0.8]],"duration":0.1}),
+    ]
+    experiences=[]
+    for index,(episode,skill,semantic_source,grounded) in enumerate(actions):
+        semantic=normalize_semantic_action(semantic_source)
+        experiences.append({"episode_id":episode,"task_id":"task_"+str(index),"step_id":0,
+            "observation_t":{"visual_digest":hashlib.sha256((episode+"before").encode()).hexdigest(),"objects":[{"class":semantic_source["target"]["class"],"instance":semantic_source["target"]["instance"],"bbox":[0.1,0.1,0.2,0.1],"confidence":0.9}],
+                "scene_graph":{"edges":[]},"internal_state":{"loading":episode=="e_hover"}},
+            "observation_t+1":{"visual_digest":hashlib.sha256((episode+"after").encode()).hexdigest(),"objects":[],"internal_state":{"loading":False}},
+            "semantic_action":semantic,"grounded_action":grounded,"skill_key":skill,"expected_decision":skill,
+            "reward_components":{"progress":0.2 if index<3 else 0.0},"terminal_state":"neutral","safety_decision":{"allowed":index<3,"reason":"human_confirmation_required" if index==3 else "safe"}})
+    bundles=build_anonymized_replay_bundles(experiences,"test_model")
+    evaluations=[ReplayEvaluator.evaluate(bundle) for bundle in bundles]
+    required=("frame_digest","semantic_objects","scene_graph","task_id","selected_action","grounded_action","reward_components","terminal_evidence","model_version","expected_decision")
+    fields_present=all(all(all(key in step for key in required) for step in bundle.get("steps",[])) for bundle in bundles)
+    blocked=next(bundle for bundle in bundles if bundle.get("episode_id")=="e_blocked")
+    false_release=json.loads(json.dumps(blocked,ensure_ascii=False))
+    false_release["steps"][0]["safety_decision"]={"allowed":True}
+    checksum_source=dict(false_release)
+    checksum_source.pop("checksum",None)
+    false_release["checksum"]=hashlib.sha256(canonical_bytes(checksum_source)).hexdigest()
+    unsafe_result=ReplayEvaluator.evaluate(false_release)
+    unsafe_detected=bool(not unsafe_result.get("passed") and unsafe_result.get("dangerous_action_false_release_count")==1)
+    action_diversity=len({step.get("semantic_action",{}).get("action_type") for bundle in bundles for step in bundle.get("steps",[])})>=3
+    passed=bool(len(bundles)==4 and all(value.get("passed") for value in evaluations) and fields_present and unsafe_detected and action_diversity)
+    return passed,{"bundle_count":len(bundles),"evaluations":evaluations,"required_fields":fields_present,"unsafe_false_release_detected":unsafe_detected,
+        "action_type_diversity":action_diversity,"unsafe_probe":unsafe_result}
 
 def run_replay_contract_tests():
     passed,checks=replay_contract_suite()
