@@ -685,6 +685,7 @@ class ModeResultStatus(str, Enum):
 
 class QuizQuestionType(str, Enum):
     ACTION = "action"
+    EPISODE_RESULT = "episode_result"
     REGION_IS_NUMERIC = "region_is_numeric"
     OCR_CONFIRMATION = "ocr_confirmation"
     OCR_CORRECTION = "ocr_correction"
@@ -848,7 +849,7 @@ WINDOW_RULE_VERSION = 2
 CAPTURE_BACKEND_VERSION = 2
 RECOVERY_BACKUP_LIMIT = 1024 * 1024 * 1024
 MIN_DATA_OPERATION_RESERVE = 256 * 1024 * 1024
-RUNTIME_LAYOUT_VERSION = 3
+RUNTIME_LAYOUT_VERSION = 4
 FIXED_RUNTIME_PYTHON_VERSION = "3.12.10"
 FIXED_RUNTIME_PYTHON_ABI = (3, 12)
 FIXED_RUNTIME_PYTHON_URL = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip"
@@ -1251,6 +1252,18 @@ class HardwareSnapshot:
     cpu_to_gpu_copy_p95_ms: float = 0.0
     device_removed_count: int = 0
     device_reset_count: int = 0
+    gpu_oom_count: int = 0
+    device_removed_delta: int = 0
+    device_reset_delta: int = 0
+    gpu_oom_delta: int = 0
+    last_accelerator_fault_monotonic: float | None = None
+    accelerator_fault_age_seconds: float | None = None
+    accelerator_self_test_passed: bool = False
+    backend_blacklisted: bool = False
+    available_ram_known: bool = False
+    free_vram_known: bool = False
+    total_vram: int | None = None
+    tested_peak_vram: int | None = None
 
 
 def physical_core_count():
@@ -1293,6 +1306,41 @@ class RuntimePlan:
     world_model_horizon: int = 3
     object_slot_count: int = 24
     vision_width_multiplier: float = 1.0
+    purpose: str = ModeId.AI.value
+    vision_backend: str = "windows-x64-cpu"
+    policy_backend: str = "windows-x64-cpu"
+    world_model_backend: str = "windows-x64-cpu"
+    vram_status: str = "unknown"
+    large_model_validated: bool = False
+
+    def to_dict(self):
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimePlanSet:
+    collect: RuntimePlan
+    ai: RuntimePlan
+    upgrade: RuntimePlan
+    quiz: RuntimePlan
+
+    def for_mode(self, value):
+        mode = normalize_mode_id(value)
+        if mode == ModeId.COLLECT.value:
+            return self.collect
+        if mode == ModeId.UPGRADE.value:
+            return self.upgrade
+        if mode == ModeId.QUIZ.value:
+            return self.quiz
+        return self.ai
+
+    def to_dict(self):
+        return {
+            ModeId.COLLECT.value: self.collect.to_dict(),
+            ModeId.AI.value: self.ai.to_dict(),
+            ModeId.UPGRADE.value: self.upgrade.to_dict(),
+            ModeId.QUIZ.value: self.quiz.to_dict(),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1335,16 +1383,39 @@ def model_tier_spec(value=None):
     return MODEL_TIER_SPECS[normalize_model_tier(name)]
 
 
-def select_model_tier(backend, end_to_end_p95_ms, score_ms=None, free_vram=0, available_ram=0):
+def select_model_tier(
+    backend,
+    end_to_end_p95_ms,
+    score_ms=None,
+    free_vram=None,
+    available_ram=None,
+    total_vram=None,
+    tested_peak_vram=None,
+    vram_test_passed=False,
+    maximum_peak_ratio=0.72,
+):
     family = str(backend or "").casefold()
     latency = float(end_to_end_p95_ms or score_ms or 9999.0)
     score = float(score_ms or latency)
-    vram = int(free_vram or 0)
-    ram = int(available_ram or 0)
     accelerated = "nvidia" in family or "directml" in family
-    if accelerated and latency <= 42.0 and score <= 85.0 and (vram == 0 or vram >= 3 * 1024**3):
+    vram_known = free_vram is not None and int(free_vram) >= 0
+    ram_known = available_ram is not None and int(available_ram) > 0
+    total_known = total_vram is not None and int(total_vram) > 0
+    peak_known = tested_peak_vram is not None and int(tested_peak_vram) >= 0
+    usable_vram = int(total_vram) if total_known else int(free_vram) + int(tested_peak_vram or 0) if vram_known else 0
+    peak_ratio = int(tested_peak_vram) / max(1, usable_vram) if peak_known and usable_vram > 0 else 1.0
+    large_vram_safe = bool(
+        accelerated
+        and vram_known
+        and peak_known
+        and bool(vram_test_passed)
+        and int(free_vram) >= 3 * 1024**3
+        and peak_ratio <= max(0.5, min(0.75, float(maximum_peak_ratio)))
+    )
+    if large_vram_safe and latency <= 42.0 and score <= 85.0:
         return "Large"
-    if latency <= 80.0 and score <= 160.0 and (accelerated or ram == 0 or ram >= 8 * 1024**3):
+    base_memory_safe = bool(accelerated or ram_known and int(available_ram) >= 8 * 1024**3)
+    if latency <= 80.0 and score <= 160.0 and base_memory_safe:
         return "Base"
     return "Tiny"
 
@@ -1435,6 +1506,22 @@ class WindowsGpuTelemetry:
 WINDOWS_GPU_TELEMETRY = WindowsGpuTelemetry()
 
 
+def resource_integer(value, default, minimum, maximum):
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        number = int(default)
+    return max(int(minimum), min(int(maximum), number))
+
+
+def resource_number(value, default):
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        number = float(default)
+    return number if math.isfinite(number) else float(default)
+
+
 class ResourceGovernor:
     def __init__(self, window_seconds=30):
         self.window_seconds = max(10, min(30, int(window_seconds)))
@@ -1454,7 +1541,16 @@ class ResourceGovernor:
             "torch_threads": cores,
             "model_tier": "Tiny",
         }
-        self.plan = self._plan_for_state(ResourceState.NORMAL, "windows-x64-cpu")
+        self._local = threading.local()
+        self.accelerator_faults = deque(maxlen=64)
+        self.backend_fault_counts = Counter()
+        self.backend_blacklist = set()
+        self.last_accelerator_fault_at = None
+        self.accelerator_self_tests = {}
+        self._fault_counter_baseline = {"removed": 0, "reset": 0, "oom": 0}
+        self._fault_force_cpu = False
+        self.plans = self._plans_for_state(ResourceState.NORMAL, "windows-x64-cpu")
+        self.plan = self.plans.ai
         self.recovery_since = None
         self.thread = None
         self.stop_event = threading.Event()
@@ -1463,7 +1559,19 @@ class ResourceGovernor:
         self._system_cpu_previous = None
         self._process_cpu_previous = (time.monotonic(), time.process_time())
         self._gpu_cache = (0.0, None, None)
-        self._last_snapshot = HardwareSnapshot(0.0, 0.0, 0, 0, "windows-x64-cpu", None, None, 0.0, 0.0, 0.0, 0.0)
+        self._last_snapshot = HardwareSnapshot(
+            cpu_percent=0.0,
+            process_cpu_percent=0.0,
+            available_ram=0,
+            process_rss=0,
+            gpu_backend="windows-x64-cpu",
+            gpu_utilization=None,
+            free_vram=None,
+            capture_p95_ms=0.0,
+            queue_ratio=0.0,
+            queue_oldest_ms=0.0,
+            disk_write_p95_ms=0.0,
+        )
 
     def apply_benchmark_profile(self, profile):
         value = dict(profile) if isinstance(profile, dict) else {}
@@ -1542,8 +1650,33 @@ class ResourceGovernor:
                     ),
                 }
             )
-            self.plan = self._plan_for_state(self.state, self.benchmark_profile["backend"])
-            return self.plan
+            for key in (
+                "resolution_tier",
+                "fast_visual_size",
+                "semantic_visual_size",
+                "ocr_roi_scale",
+                "policy_state_size",
+                "policy_hidden_size",
+                "policy_ensemble_size",
+                "temporal_context_length",
+                "world_model_horizon",
+                "object_slot_count",
+                "vision_width_multiplier",
+                "vision_backend",
+                "policy_backend",
+                "world_model_backend",
+                "free_vram",
+                "total_vram",
+                "tested_peak_vram",
+                "vram_test_passed",
+                "large_model_validated",
+                "vram_status",
+            ):
+                if key in value:
+                    self.benchmark_profile[key] = value.get(key)
+            self.plans = self._plans_for_state(self.state, self.benchmark_profile["backend"])
+            self.plan = self.plans.ai
+            return self.current_plan()
 
     def ensure_started(self):
         with self.lock:
@@ -1582,6 +1715,50 @@ class ResourceGovernor:
     def report_cpu_to_gpu_copy(self, milliseconds):
         RUNTIME_METRICS.observe("cpu_to_gpu_copy_ms", max(0.0, float(milliseconds)))
 
+    def _persist_backend_fault_state(self):
+        store = APP_CONTEXT.store
+        if store is None or not getattr(store, "base", None):
+            return
+        payload = {
+            "schema_version": 1,
+            "updated": time.time(),
+            "run_id": str(os.getpid()) + "|" + str(int(time.time())),
+            "blacklisted_backends": sorted(self.backend_blacklist),
+            "fault_counts": dict(self.backend_fault_counts),
+            "last_fault_monotonic": self.last_accelerator_fault_at,
+            "events": list(self.accelerator_faults)[-32:],
+            "cpu_safe_backend_retained": True,
+        }
+        try:
+            _atomic_json_write(Path(store.base) / "audit" / "runtime_backend_blacklist.json", payload)
+        except (OSError, ValueError, TypeError) as persist_error:
+            record_cleanup_error("GPU_FAULT_STATE_PERSIST_FAILED", persist_error)
+
+    def _record_accelerator_fault_locked(self, backend, details, now):
+        family = str(backend or "windows-x64-cpu")
+        kinds = [name for name in ("oom", "device_removed", "device_reset") if details.get(name)]
+        if not kinds:
+            return
+        event = {
+            "created": time.time(),
+            "monotonic": float(now),
+            "backend": family,
+            "kinds": kinds,
+            "signature": str(details.get("signature", "")),
+        }
+        self.accelerator_faults.append(event)
+        self.last_accelerator_fault_at = float(now)
+        self.accelerator_self_tests.pop(family, None)
+        self.backend_fault_counts[family] += 1
+        recent_same_backend = [
+            item
+            for item in self.accelerator_faults
+            if item.get("backend") == family and now - safe_float(item.get("monotonic"), 0.0) <= 120.0
+        ]
+        if len(recent_same_backend) >= 2 and ("nvidia" in family.casefold() or "directml" in family.casefold()):
+            self.backend_blacklist.add(family)
+            self._fault_force_cpu = True
+
     def report_accelerator_fault(self, error):
         details = classify_accelerator_fault(error)
         if details["device_removed"]:
@@ -1590,7 +1767,74 @@ class ResourceGovernor:
             RUNTIME_METRICS.increment("gpu_device_reset")
         if details["oom"]:
             RUNTIME_METRICS.increment("gpu_oom")
+        if details.get("accelerator_fault"):
+            now = time.monotonic()
+            backend = self._manifest_backend()
+            with self.lock:
+                self._record_accelerator_fault_locked(backend, details, now)
+                self.state = ResourceState.RED
+                self.recovery_since = None
+                self._fault_counter_baseline = {
+                    "removed": int(RUNTIME_METRICS.counters.get("gpu_device_removed", 0)),
+                    "reset": int(RUNTIME_METRICS.counters.get("gpu_device_reset", 0)),
+                    "oom": int(RUNTIME_METRICS.counters.get("gpu_oom", 0)),
+                }
+                self.plans = self._plans_for_state(ResourceState.RED, backend)
+                self.plan = self.plans.ai
+            self._persist_backend_fault_state()
+        details["backend_blacklisted"] = self.is_backend_blacklisted(self._manifest_backend())
         return details
+
+    def mark_accelerator_self_test(self, backend, passed, total_vram=None, tested_peak_vram=None):
+        family = str(backend or "")
+        now = time.monotonic()
+        with self.lock:
+            matching_faults = [
+                safe_float(item.get("monotonic"), 0.0)
+                for item in self.accelerator_faults
+                if item.get("backend") == family
+            ]
+            last_fault = max(matching_faults or [0.0])
+            valid = bool(passed and family not in self.backend_blacklist and now >= last_fault)
+            self.accelerator_self_tests[family] = {
+                "passed": valid,
+                "monotonic": now,
+                "total_vram": None if total_vram is None else int(total_vram),
+                "tested_peak_vram": None if tested_peak_vram is None else int(tested_peak_vram),
+            }
+            if valid:
+                self.benchmark_profile["vram_test_passed"] = True
+                self.benchmark_profile["large_model_validated"] = bool(
+                    total_vram is not None
+                    and tested_peak_vram is not None
+                    and int(tested_peak_vram) <= int(total_vram) * 0.72
+                )
+                self.benchmark_profile["total_vram"] = total_vram
+                self.benchmark_profile["tested_peak_vram"] = tested_peak_vram
+                self.benchmark_profile["vram_status"] = "known" if total_vram is not None else "unknown"
+                self.recovery_since = None
+            self.plans = self._plans_for_state(self.state, family or self.benchmark_profile.get("backend"))
+            self.plan = self.plans.ai
+        self._persist_backend_fault_state()
+        return valid
+
+    def blacklist_backend_for_run(self, backend, reason="repeated_accelerator_fault"):
+        family = str(backend or "")
+        if not family:
+            return False
+        with self.lock:
+            self.backend_blacklist.add(family)
+            self._fault_force_cpu = True
+            self.backend_fault_counts[family + "|blacklist"] += 1
+            self.plans = self._plans_for_state(ResourceState.RED, family)
+            self.plan = self.plans.ai
+        self._persist_backend_fault_state()
+        return True
+
+    def is_backend_blacklisted(self, backend):
+        family = str(backend or "")
+        with self.lock:
+            return family in self.backend_blacklist
 
     @staticmethod
     def _filetime_value(value):
@@ -1784,31 +2028,75 @@ class ResourceGovernor:
             RUNTIME_METRICS.percentile("end_to_end_perception_ms", 0.99, 0.75),
             RUNTIME_METRICS.percentile("end_to_end_decision_ms", 0.99, 0.75),
         )
+        now = time.monotonic()
+        counts = {
+            "removed": int(RUNTIME_METRICS.counters.get("gpu_device_removed", 0)),
+            "reset": int(RUNTIME_METRICS.counters.get("gpu_device_reset", 0)),
+            "oom": int(RUNTIME_METRICS.counters.get("gpu_oom", 0)),
+        }
+        with self.lock:
+            deltas = {
+                key: max(0, counts[key] - safe_int(self._fault_counter_baseline.get(key), 0))
+                for key in counts
+            }
+            self._fault_counter_baseline = dict(counts)
+            if any(deltas.values()):
+                details = {
+                    "oom": deltas["oom"] > 0,
+                    "device_removed": deltas["removed"] > 0,
+                    "device_reset": deltas["reset"] > 0,
+                    "signature": hashlib.sha256(canonical_bytes({"backend": backend, "counts": counts})).hexdigest(),
+                }
+                self._record_accelerator_fault_locked(backend, details, now)
+            last_fault = self.last_accelerator_fault_at
+            fault_age = None if last_fault is None else max(0.0, now - last_fault)
+            self_test = self.accelerator_self_tests.get(str(backend), {})
+            self_test_passed = bool(
+                self_test.get("passed")
+                and safe_float(self_test.get("monotonic"), 0.0) >= safe_float(last_fault, 0.0)
+            )
+            backend_blacklisted = str(backend) in self.backend_blacklist
+            total_vram = self.benchmark_profile.get("total_vram")
+            tested_peak_vram = self.benchmark_profile.get("tested_peak_vram")
         snapshot = HardwareSnapshot(
-            round(cpu, 3),
-            round(process_cpu, 3),
-            int(available_ram),
-            int(process_rss),
-            backend,
-            gpu_utilization,
-            free_vram,
-            round(self._series_p95("capture_latency_ms"), 3),
-            round(queue_ratio, 5),
-            round(queue_oldest, 3),
-            round(self._disk_p95(), 3),
-            round(end_to_end_p95, 3),
-            round(end_to_end_p99, 3),
-            dedicated_vram_used,
-            shared_vram_used,
-            round(self._series_p95("gpu_queue_wait_ms"), 3),
-            round(self._series_p95("cpu_to_gpu_copy_ms"), 3),
-            int(RUNTIME_METRICS.counters.get("gpu_device_removed", 0)),
-            int(RUNTIME_METRICS.counters.get("gpu_device_reset", 0)),
+            cpu_percent=round(cpu, 3),
+            process_cpu_percent=round(process_cpu, 3),
+            available_ram=int(available_ram),
+            process_rss=int(process_rss),
+            gpu_backend=str(backend),
+            gpu_utilization=gpu_utilization,
+            free_vram=free_vram,
+            capture_p95_ms=round(self._series_p95("capture_latency_ms"), 3),
+            queue_ratio=round(queue_ratio, 5),
+            queue_oldest_ms=round(queue_oldest, 3),
+            disk_write_p95_ms=round(self._disk_p95(), 3),
+            end_to_end_p95_ms=round(end_to_end_p95, 3),
+            end_to_end_p99_ms=round(end_to_end_p99, 3),
+            dedicated_vram_used=dedicated_vram_used,
+            shared_vram_used=shared_vram_used,
+            gpu_queue_wait_p95_ms=round(self._series_p95("gpu_queue_wait_ms"), 3),
+            cpu_to_gpu_copy_p95_ms=round(self._series_p95("cpu_to_gpu_copy_ms"), 3),
+            device_removed_count=counts["removed"],
+            device_reset_count=counts["reset"],
+            gpu_oom_count=counts["oom"],
+            device_removed_delta=deltas["removed"],
+            device_reset_delta=deltas["reset"],
+            gpu_oom_delta=deltas["oom"],
+            last_accelerator_fault_monotonic=last_fault,
+            accelerator_fault_age_seconds=fault_age,
+            accelerator_self_test_passed=self_test_passed,
+            backend_blacklisted=backend_blacklisted,
+            available_ram_known=int(available_ram) > 0,
+            free_vram_known=free_vram is not None,
+            total_vram=None if total_vram is None else safe_int(total_vram, 0, 0),
+            tested_peak_vram=None if tested_peak_vram is None else safe_int(tested_peak_vram, 0, 0),
         )
         with self.lock:
             self.history.append(snapshot)
             self._last_snapshot = snapshot
-            self._update_state_locked(time.monotonic())
+            self._update_state_locked(now)
+        if any(deltas.values()) or backend_blacklisted:
+            self._persist_backend_fault_state()
         store = APP_CONTEXT.store
         if store is not None and getattr(store, "base", None) and snapshot.end_to_end_p95_ms > 0:
             update_hardware_profile_health(store.base, snapshot.end_to_end_p95_ms)
@@ -1821,188 +2109,275 @@ class ResourceGovernor:
         queue_yellow = len(last_five) >= 5 and all(item.queue_ratio > 0.70 for item in last_five)
         queue_red = len(recent) >= 2 and all(item.queue_ratio > 0.90 for item in recent[-2:])
         thresholds = RUNTIME_THRESHOLDS
+        accelerator = "nvidia" in current.gpu_backend.casefold() or "directml" in current.gpu_backend.casefold()
+        new_fault = bool(current.device_removed_delta or current.device_reset_delta or current.gpu_oom_delta)
+        fault_age = current.accelerator_fault_age_seconds
+        fault_red = bool(
+            accelerator
+            and (
+                current.backend_blacklisted
+                or new_fault
+                or fault_age is not None and fault_age <= 30.0 and not current.accelerator_self_test_passed
+            )
+        )
+        fault_yellow = bool(
+            accelerator
+            and not fault_red
+            and fault_age is not None
+            and not current.accelerator_self_test_passed
+        )
         severe = bool(
-            queue_red
-            or 0 < current.available_ram < thresholds.ram_red_bytes
+            fault_red
+            or queue_red
+            or current.available_ram_known and current.available_ram < thresholds.ram_red_bytes
             or current.capture_p95_ms > thresholds.capture_red_ms
             or current.end_to_end_p95_ms > thresholds.end_to_end_red_p95_ms
             or current.disk_write_p95_ms > 180.0
             or current.cpu_percent > 97.0
             or current.gpu_utilization is not None and current.gpu_utilization > 98.0
-            or current.free_vram is not None and current.free_vram < thresholds.free_vram_red_bytes
+            or current.free_vram_known and current.free_vram < thresholds.free_vram_red_bytes
             or current.gpu_queue_wait_p95_ms > 40.0
             or current.cpu_to_gpu_copy_p95_ms > 30.0
-            or current.device_removed_count > 0
-            or current.device_reset_count > 0
         )
         warning = bool(
             severe
+            or fault_yellow
             or queue_yellow
             or current.capture_p95_ms > thresholds.capture_yellow_ms
             or current.end_to_end_p95_ms > thresholds.end_to_end_yellow_p95_ms
-            or 0 < current.available_ram < thresholds.ram_yellow_bytes
+            or current.available_ram_known and current.available_ram < thresholds.ram_yellow_bytes
             or current.disk_write_p95_ms > 80.0
             or current.cpu_percent > 88.0
             or current.process_cpu_percent > 85.0
             or current.gpu_utilization is not None and current.gpu_utilization > 94.0
-            or current.free_vram is not None and current.free_vram < thresholds.free_vram_yellow_bytes
+            or current.free_vram_known and current.free_vram < thresholds.free_vram_yellow_bytes
             or current.gpu_queue_wait_p95_ms > 18.0
             or current.cpu_to_gpu_copy_p95_ms > 12.0
             or current.shared_vram_used is not None and current.shared_vram_used > 2 * 1024**3
         )
         desired = ResourceState.RED if severe else ResourceState.YELLOW if warning else ResourceState.NORMAL
-        rank = {ResourceState.NORMAL: 0, ResourceState.YELLOW: 1, ResourceState.RED: 2}
         previous_state = self.state
-        if rank[desired] > rank[self.state]:
-            self.state = desired
+        if fault_red:
+            self.state = ResourceState.RED
             self.recovery_since = None
-        elif rank[desired] < rank[self.state]:
-            if self.recovery_since is None:
-                self.recovery_since = now
-            elif now - self.recovery_since >= 30.0:
+        elif (
+            previous_state is ResourceState.RED
+            and fault_age is not None
+            and fault_age > 30.0
+            and not current.accelerator_self_test_passed
+        ):
+            self.state = ResourceState.YELLOW
+            self.recovery_since = now
+        elif current.accelerator_self_test_passed and not severe:
+            self.state = ResourceState.YELLOW if warning else ResourceState.NORMAL
+            self.recovery_since = None
+        else:
+            rank = {ResourceState.NORMAL: 0, ResourceState.YELLOW: 1, ResourceState.RED: 2}
+            if rank[desired] > rank[self.state]:
                 self.state = desired
                 self.recovery_since = None
-        else:
-            self.recovery_since = None
-        self.plan = self._plan_for_state(self.state, current.gpu_backend)
-        if self.state is ResourceState.RED and 0 < current.available_ram < RUNTIME_THRESHOLDS.ram_red_bytes:
+            elif rank[desired] < rank[self.state]:
+                if self.recovery_since is None:
+                    self.recovery_since = now
+                elif now - self.recovery_since >= 30.0:
+                    self.state = desired
+                    self.recovery_since = None
+            else:
+                self.recovery_since = None
+        self.plans = self._plans_for_state(self.state, current.gpu_backend)
+        self.plan = self.plans.ai
+        if (
+            self.state is ResourceState.RED
+            and current.available_ram_known
+            and current.available_ram < thresholds.ram_red_bytes
+        ):
             FEATURE_ENGINE.clear_frames()
             cache = globals().get("POLICY_TRAINING_CACHE")
             if cache is not None:
                 cache.clear()
             collect_garbage("resource_red", 30.0, previous_state is not ResourceState.RED)
 
-    def _plan_for_state(self, state, backend):
+    @staticmethod
+    def _size_pair(value, default, minimum=(32, 18), maximum=(1024, 1024)):
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            width = resource_integer(value[0], default[0], minimum[0], maximum[0])
+            height = resource_integer(value[1], default[1], minimum[1], maximum[1])
+            return width, height
+        return int(default[0]), int(default[1])
+
+    def _plan_for_state(self, state, backend, purpose=ModeId.AI.value):
         profile = self.benchmark_profile
-
-        def bounded_integer(value, default, minimum, maximum):
-            try:
-                number = int(value)
-            except (TypeError, ValueError, OverflowError):
-                number = int(default)
-            return max(int(minimum), min(int(maximum), number))
-
-        threads = max(
-            1,
-            min(
-                physical_core_count(),
-                bounded_integer(profile.get("torch_threads"), physical_core_count(), 1, 256),
-            ),
-        )
-        capture = bounded_integer(profile.get("capture_fps"), 30, 5, 120)
-        motion_capture = bounded_integer(profile.get("motion_capture_fps"), capture, 5, 120)
-        semantic = bounded_integer(profile.get("semantic_interval"), 4, 1, 60)
-        ocr = bounded_integer(profile.get("ocr_interval"), semantic + 2, semantic, 120)
-        vision_batch = bounded_integer(profile.get("vision_batch"), 8, 1, 1024)
-        policy_batch = bounded_integer(profile.get("policy_batch"), 24, 1, 4096)
+        mode = normalize_mode_id(purpose)
+        cores = physical_core_count()
+        threads = resource_integer(profile.get("torch_threads"), cores, 1, cores)
+        capture = resource_integer(profile.get("capture_fps"), 30, 5, 120)
+        motion_capture = resource_integer(profile.get("motion_capture_fps"), capture, 5, 120)
+        semantic_interval = resource_integer(profile.get("semantic_interval"), 4, 1, 120)
+        ocr_interval = resource_integer(profile.get("ocr_interval"), semantic_interval + 2, 1, 240)
+        vision_batch = resource_integer(profile.get("vision_batch"), 8, 1, 1024)
+        policy_batch = resource_integer(profile.get("policy_batch"), 24, 1, 4096)
         precision = str(profile.get("precision", "fp32"))
-        model_name = normalize_model_tier(profile.get("model_tier", "Tiny"))
-        if state is ResourceState.YELLOW and model_name == "Large":
-            model_name = "Base"
-        elif state is ResourceState.RED:
-            model_name = "Tiny"
-        model_spec = model_tier_spec(model_name)
         tier = str(profile.get("resolution_tier", "low"))
-        tier_sizes = {
-            "low": (64, 36, 224, 126, 1.0),
-            "medium": (128, 72, 320, 180, 1.35),
-            "high": (160, 90, 384, 216, 1.60),
+        tier_defaults = {
+            "low": ((64, 36), (224, 126), 1.0),
+            "medium": ((128, 72), (320, 180), 1.35),
+            "high": ((160, 90), (384, 216), 1.6),
         }
-        if tier not in tier_sizes:
+        if tier not in tier_defaults:
             tier = "low"
-        if state is ResourceState.NORMAL:
-            tier_order = {"low": 0, "medium": 1, "high": 2}
-            model_floor = {"Tiny": "low", "Base": "medium", "Large": "high"}[model_spec.name]
-            if tier_order[tier] < tier_order[model_floor]:
-                tier = model_floor
-        if state is ResourceState.YELLOW:
-            tier = "medium" if tier == "high" else "low"
-        elif state is ResourceState.RED:
-            tier = "low"
-        fast_w, fast_h, semantic_w, semantic_h, ocr_scale = tier_sizes[tier]
+        fast_default, semantic_default, scale_default = tier_defaults[tier]
+        fast_w, fast_h = self._size_pair(profile.get("fast_visual_size"), fast_default)
+        semantic_w, semantic_h = self._size_pair(profile.get("semantic_visual_size"), semantic_default)
+        ocr_scale = max(0.5, min(3.0, resource_number(profile.get("ocr_roi_scale"), scale_default)))
+        requested_model = normalize_model_tier(profile.get("model_tier", "Tiny"))
+        if state is ResourceState.YELLOW and requested_model == "Large":
+            requested_model = "Base"
         if state is ResourceState.RED:
-            return RuntimePlan(
-                max(15, capture * 9 // 10),
-                max(2, semantic * 3),
-                max(3, ocr * 2),
-                0,
-                max(1, threads // 3),
-                160,
-                str(backend),
-                max(1, vision_batch // 4),
-                max(1, policy_batch // 4),
-                precision,
-                fast_w,
-                fast_h,
-                semantic_w,
-                semantic_h,
-                ocr_scale,
-                max(20, min(motion_capture, capture)),
-                tier,
-                model_spec.name,
-                model_spec.state_size,
-                model_spec.hidden_size,
-                model_spec.ensemble_size,
-                model_spec.temporal_context,
-                model_spec.planning_horizon,
-                model_spec.object_slots,
-                model_spec.vision_width_multiplier,
-            )
-        if state is ResourceState.YELLOW:
-            return RuntimePlan(
-                capture,
-                max(2, semantic * 2),
-                max(3, ocr * 3 // 2),
-                max(1, policy_batch // 2),
-                max(1, threads * 2 // 3),
-                240,
-                str(backend),
-                max(1, vision_batch // 2),
-                max(1, policy_batch // 2),
-                precision,
-                fast_w,
-                fast_h,
-                semantic_w,
-                semantic_h,
-                ocr_scale,
-                max(24, min(motion_capture, capture)),
-                tier,
-                model_spec.name,
-                model_spec.state_size,
-                model_spec.hidden_size,
-                model_spec.ensemble_size,
-                model_spec.temporal_context,
-                model_spec.planning_horizon,
-                model_spec.object_slots,
-                model_spec.vision_width_multiplier,
-            )
-        return RuntimePlan(
-            capture,
-            semantic,
-            ocr,
-            policy_batch,
-            threads,
-            MAX_PROTOTYPES,
-            str(backend),
-            vision_batch,
-            policy_batch,
-            precision,
-            fast_w,
-            fast_h,
-            semantic_w,
-            semantic_h,
-            ocr_scale,
-            motion_capture,
-            tier,
-            model_spec.name,
-            model_spec.state_size,
-            model_spec.hidden_size,
-            model_spec.ensemble_size,
-            model_spec.temporal_context,
-            model_spec.planning_horizon,
-            model_spec.object_slots,
-            model_spec.vision_width_multiplier,
+            requested_model = "Tiny"
+        spec = model_tier_spec(requested_model)
+        state_size = resource_integer(profile.get("policy_state_size"), spec.state_size, 64, 2048)
+        hidden_size = resource_integer(profile.get("policy_hidden_size"), spec.hidden_size, 32, 2048)
+        ensemble_size = resource_integer(profile.get("policy_ensemble_size"), spec.ensemble_size, 1, 15)
+        temporal = resource_integer(profile.get("temporal_context_length"), spec.temporal_context, 8, 512)
+        horizon = resource_integer(profile.get("world_model_horizon"), spec.planning_horizon, 1, 64)
+        slots = resource_integer(profile.get("object_slot_count"), spec.object_slots, 8, 256)
+        width_multiplier = resource_number(
+            profile.get("vision_width_multiplier"), spec.vision_width_multiplier
         )
+        width_multiplier = max(0.5, min(4.0, width_multiplier))
+        family = str(backend or "windows-x64-cpu")
+        accelerated = "nvidia" in family.casefold() or "directml" in family.casefold()
+        force_cpu = bool(
+            self._fault_force_cpu
+            or family in self.backend_blacklist
+            or state is ResourceState.RED and accelerated
+        )
+        vision_backend = str(profile.get("vision_backend", family if accelerated else "windows-x64-cpu"))
+        policy_backend = str(profile.get("policy_backend", family if accelerated else "windows-x64-cpu"))
+        world_backend = str(profile.get("world_model_backend", "windows-x64-cpu" if accelerated else family))
+        if force_cpu:
+            family = "windows-x64-cpu"
+            vision_backend = family
+            policy_backend = family
+            world_backend = family
+            precision = "int8"
+        if mode == ModeId.COLLECT.value:
+            capture = max(capture, motion_capture)
+            semantic_interval = max(semantic_interval, 6)
+            ocr_interval = max(ocr_interval, 12)
+            training_batch = 0
+            vision_batch = max(1, min(vision_batch, 4))
+            policy_batch = max(1, min(policy_batch, 8))
+        elif mode == ModeId.UPGRADE.value:
+            capture = max(5, min(capture, 12))
+            motion_capture = capture
+            semantic_interval = max(semantic_interval, 8)
+            ocr_interval = max(ocr_interval, 16)
+            training_batch = policy_batch
+            vision_batch = max(vision_batch, 8)
+        elif mode == ModeId.QUIZ.value:
+            capture = max(8, min(capture, 20))
+            motion_capture = capture
+            semantic_interval = 1
+            ocr_interval = 1
+            training_batch = 0
+            semantic_w = max(semantic_w, 320)
+            semantic_h = max(semantic_h, 180)
+            ocr_scale = max(ocr_scale, 1.35)
+            policy_batch = max(1, min(policy_batch, 8))
+        else:
+            training_batch = 0
+            capture = max(15, capture)
+            semantic_interval = max(1, semantic_interval)
+            ocr_interval = max(2, ocr_interval)
+        if state is ResourceState.YELLOW:
+            capture = max(12, capture * 4 // 5)
+            motion_capture = min(motion_capture, capture)
+            semantic_interval = max(2, semantic_interval * 3 // 2)
+            ocr_interval = max(3, ocr_interval * 3 // 2)
+            vision_batch = max(1, vision_batch // 2)
+            policy_batch = max(1, policy_batch // 2)
+            training_batch = max(0, training_batch // 2)
+            ensemble_size = max(1, ensemble_size - 2)
+            horizon = max(1, horizon // 2)
+        elif state is ResourceState.RED:
+            capture = max(10, min(capture, 18))
+            motion_capture = min(motion_capture, capture)
+            semantic_interval = max(4, semantic_interval * 2)
+            ocr_interval = max(6, ocr_interval * 2)
+            training_batch = 0
+            vision_batch = 1
+            policy_batch = max(1, min(policy_batch, 4))
+            threads = max(1, threads // 3)
+            fast_w, fast_h = min(fast_w, 64), min(fast_h, 36)
+            semantic_w, semantic_h = min(semantic_w, 224), min(semantic_h, 126)
+            state_size = min(state_size, 192)
+            hidden_size = min(hidden_size, 128)
+            ensemble_size = min(ensemble_size, 3)
+            temporal = min(temporal, 32)
+            horizon = min(horizon, 3)
+            slots = min(slots, 24)
+            width_multiplier = min(width_multiplier, 1.0)
+        return RuntimePlan(
+            capture_fps=int(capture),
+            semantic_frame_interval=int(semantic_interval),
+            ocr_frame_interval=int(ocr_interval),
+            training_batch_size=int(training_batch),
+            torch_threads=int(threads),
+            prototype_limit=(
+                160
+                if state is ResourceState.RED
+                else 240 if state is ResourceState.YELLOW else MAX_PROTOTYPES
+            ),
+            backend=family,
+            vision_batch_size=int(vision_batch),
+            policy_batch_size=int(policy_batch),
+            precision=precision,
+            fast_vision_width=int(fast_w),
+            fast_vision_height=int(fast_h),
+            semantic_width=int(semantic_w),
+            semantic_height=int(semantic_h),
+            ocr_roi_scale=float(ocr_scale),
+            motion_capture_fps=int(motion_capture),
+            resolution_tier=tier,
+            model_tier=spec.name,
+            policy_state_size=int(state_size),
+            policy_hidden_size=int(hidden_size),
+            policy_ensemble_size=int(ensemble_size),
+            temporal_context_length=int(temporal),
+            world_model_horizon=int(horizon),
+            object_slot_count=int(slots),
+            vision_width_multiplier=float(width_multiplier),
+            purpose=mode,
+            vision_backend=vision_backend,
+            policy_backend=policy_backend,
+            world_model_backend=world_backend,
+            vram_status=str(profile.get("vram_status", "unknown")),
+            large_model_validated=bool(profile.get("large_model_validated", False)),
+        )
+
+    def _plans_for_state(self, state, backend):
+        return RuntimePlanSet(
+            collect=self._plan_for_state(state, backend, ModeId.COLLECT.value),
+            ai=self._plan_for_state(state, backend, ModeId.AI.value),
+            upgrade=self._plan_for_state(state, backend, ModeId.UPGRADE.value),
+            quiz=self._plan_for_state(state, backend, ModeId.QUIZ.value),
+        )
+
+    @contextmanager
+    def plan_scope(self, mode):
+        previous = getattr(self._local, "mode", None)
+        self._local.mode = normalize_mode_id(mode)
+        try:
+            yield self.current_plan(self._local.mode)
+        finally:
+            if previous is None:
+                try:
+                    del self._local.mode
+                except AttributeError:
+                    pass
+            else:
+                self._local.mode = previous
 
     def _run(self):
         while not self.stop_event.is_set():
@@ -2013,10 +2388,11 @@ class ResourceGovernor:
                 record_cleanup_error("RESOURCE_GOVERNOR_SAMPLE_FAILED", error)
             self.stop_event.wait(max(0.05, 1.0 - (time.monotonic() - started)))
 
-    def current_plan(self):
+    def current_plan(self, mode=None):
         self.ensure_started()
+        selected = normalize_mode_id(mode or getattr(self._local, "mode", ModeId.AI.value))
         with self.lock:
-            return self.plan
+            return self.plans.for_mode(selected)
 
     def current_snapshot(self):
         self.ensure_started()
@@ -2026,11 +2402,18 @@ class ResourceGovernor:
     def status(self):
         self.ensure_started()
         with self.lock:
-            return {"state": self.state.value, "plan": self.plan, "snapshot": self._last_snapshot}
+            return {
+                "state": self.state.value,
+                "plan": self.plan,
+                "plans": self.plans.to_dict(),
+                "snapshot": self._last_snapshot,
+                "backend_blacklist": sorted(self.backend_blacklist),
+                "accelerator_faults": list(self.accelerator_faults)[-16:],
+            }
 
     def sample_production_allowed(self):
         snapshot = self.current_snapshot()
-        return snapshot.queue_ratio <= 0.90 and self.current_plan().training_batch_size > 0
+        return snapshot.queue_ratio <= 0.90 and self.current_plan(ModeId.UPGRADE.value).training_batch_size > 0
 
 
 RESOURCE_GOVERNOR = ResourceGovernor(30)
@@ -2513,7 +2896,12 @@ def run_startup_microbenchmark(
         "vision_latency_ms": 0.0,
         "vision_throughput_fps": 0.0,
         "training_step_ms": 0.0,
-        "free_vram": 0,
+        "free_vram": None,
+        "total_vram": None,
+        "tested_peak_vram": None,
+        "vram_status": "unknown",
+        "vram_test_passed": False,
+        "large_model_validated": False,
         "capture_training_interference_ratio": 1.0,
         "capture_training_interference_tested": False,
         "benchmark_timing_contract": "per_iteration_device_synchronization_cuda_events",
@@ -2574,9 +2962,14 @@ def run_startup_microbenchmark(
             try:
                 free_vram, total_vram = torch.cuda.mem_get_info(target_device)
                 profile["free_vram"] = int(free_vram)
+                profile["total_vram"] = int(total_vram)
                 profile["vram_total_runtime"] = int(total_vram)
+                profile["vram_status"] = "known"
+                torch.cuda.reset_peak_memory_stats(target_device)
             except (RuntimeError, AttributeError, TypeError):
-                profile["free_vram"] = 0
+                profile["free_vram"] = None
+                profile["total_vram"] = None
+                profile["vram_status"] = "unknown"
         if str(target_device) == "cpu":
             thread_candidates = sorted(set([1, 2, 4, 6, 8, physical, max(1, physical // 2)]))
             thread_candidates = [value for value in thread_candidates if value <= physical]
@@ -2902,6 +3295,21 @@ def run_startup_microbenchmark(
                 profile["capture_fps"] = max(15, profile["capture_fps"] - 5)
                 profile["resolution_tier"] = "medium" if profile["resolution_tier"] == "high" else "low"
             optimizer.zero_grad(set_to_none=True)
+            if is_cuda:
+                try:
+                    peak_vram = int(torch.cuda.max_memory_allocated(target_device))
+                    total_vram = profile.get("total_vram")
+                    profile["tested_peak_vram"] = peak_vram
+                    profile["vram_test_passed"] = bool(
+                        total_vram is not None and int(total_vram) > 0 and peak_vram <= int(total_vram) * 0.72
+                    )
+                    profile["large_model_validated"] = bool(profile["vram_test_passed"])
+                    profile["vram_headroom_ratio"] = round(1.0 - peak_vram / max(1, int(total_vram)), 6)
+                except (RuntimeError, AttributeError, TypeError, ValueError):
+                    profile["tested_peak_vram"] = None
+                    profile["vram_test_passed"] = False
+                    profile["large_model_validated"] = False
+            optimizer.zero_grad(set_to_none=True)
             del vision, policy_members, optimizer, probe, training_tensor, training_target
             if is_cuda:
                 torch.cuda.empty_cache()
@@ -2945,26 +3353,27 @@ def run_startup_microbenchmark(
         profile.get("end_to_end_p95_ms"),
         profile.get("composite_score_ms"),
         profile.get("free_vram"),
-        _total_physical_ram(),
+        _total_physical_ram() or None,
+        profile.get("total_vram"),
+        profile.get("tested_peak_vram"),
+        profile.get("vram_test_passed", False),
     )
     selected_model_spec = model_tier_spec(profile["model_tier"])
-    tier_order = {"low": 0, "medium": 1, "high": 2}
-    model_floor = {"Tiny": "low", "Base": "medium", "Large": "high"}[selected_model_spec.name]
-    current_tier = str(profile.get("resolution_tier", "low"))
-    if current_tier not in tier_order or tier_order[current_tier] < tier_order[model_floor]:
-        current_tier = model_floor
-        profile["resolution_tier"] = current_tier
-        fast_size, semantic_size, ocr_scale = tier_shapes[current_tier]
-        profile["fast_visual_size"] = fast_size
-        profile["semantic_visual_size"] = semantic_size
-        profile["ocr_roi_scale"] = ocr_scale
-    profile["policy_state_size"] = selected_model_spec.state_size
-    profile["policy_hidden_size"] = selected_model_spec.hidden_size
-    profile["policy_ensemble_size"] = selected_model_spec.ensemble_size
-    profile["temporal_context_length"] = selected_model_spec.temporal_context
-    profile["world_model_horizon"] = selected_model_spec.planning_horizon
-    profile["object_slot_count"] = selected_model_spec.object_slots
-    profile["vision_width_multiplier"] = selected_model_spec.vision_width_multiplier
+    profile.setdefault("policy_state_size", selected_model_spec.state_size)
+    profile.setdefault("policy_hidden_size", selected_model_spec.hidden_size)
+    profile.setdefault("policy_ensemble_size", selected_model_spec.ensemble_size)
+    profile.setdefault("temporal_context_length", selected_model_spec.temporal_context)
+    profile.setdefault("world_model_horizon", selected_model_spec.planning_horizon)
+    profile.setdefault("object_slot_count", selected_model_spec.object_slots)
+    profile.setdefault("vision_width_multiplier", selected_model_spec.vision_width_multiplier)
+    accelerated_backend = "nvidia" in str(backend).casefold() or "directml" in str(backend).casefold()
+    profile["vision_backend"] = str(backend) if accelerated_backend else "windows-x64-cpu"
+    profile["policy_backend"] = (
+        str(backend)
+        if accelerated_backend and profile.get("free_vram") is not None and int(profile.get("free_vram")) >= 2 * 1024**3
+        else "windows-x64-cpu"
+    )
+    profile["world_model_backend"] = "windows-x64-cpu"
     profile["policy_benchmark_architecture"] = (
         "five_member_real_inference_and_sequential_real_member_training"
     )
@@ -2993,7 +3402,10 @@ def run_startup_microbenchmark(
 def wait_for_runtime_training_plan(stop_event=None):
     RESOURCE_GOVERNOR.ensure_started()
     while True:
-        plan = RESOURCE_GOVERNOR.current_plan()
+        try:
+            plan = RESOURCE_GOVERNOR.current_plan(ModeId.UPGRADE.value)
+        except TypeError:
+            plan = RESOURCE_GOVERNOR.current_plan()
         if plan.training_batch_size > 0:
             return plan
         FEATURE_ENGINE.clear_frames()
@@ -8141,17 +8553,63 @@ def preprocess_signature():
     return dict(VISION_PREPROCESS_SIGNATURE)
 
 
-def runtime_python_path(base):
-    root = Path(base) / "runtime.current" / "python"
+def runtime_backend_slot(family):
+    value = str(family or "").casefold()
+    if "nvidia" in value or "cuda" in value:
+        return "cuda"
+    if "directml" in value or "dml" in value:
+        return "directml"
+    return "cpu"
+
+
+def runtime_tree_path(base, family=None):
+    root = Path(base)
+    if family is None:
+        return root / "runtime.current"
+    return root / "runtime" / runtime_backend_slot(family)
+
+
+def runtime_active_path(base):
+    return Path(base) / "runtime" / "active.json"
+
+
+def runtime_python_path(base, family=None):
+    root = runtime_tree_path(base, family) / "python"
     return root / ("python.exe" if os.name == "nt" else "python")
 
 
-def runtime_site_packages(base):
-    return Path(base) / "runtime.current" / "python" / "Lib" / "site-packages"
+def runtime_site_packages(base, family=None):
+    return runtime_tree_path(base, family) / "python" / "Lib" / "site-packages"
 
 
-def runtime_manifest_path(base):
-    return Path(base) / "runtime.current" / "runtime_manifest.json"
+def runtime_manifest_path(base, family=None):
+    return runtime_tree_path(base, family) / "runtime_manifest.json"
+
+
+def write_runtime_active_state(base, selected_family, reason="selection"):
+    root = Path(base) / "runtime"
+    root.mkdir(parents=True, exist_ok=True)
+    available = {}
+    for family in ("windows-x64-cpu", "windows-x64-nvidia-cu130", "windows-x64-directml"):
+        tree = runtime_tree_path(base, family)
+        manifest = _runtime_tree_manifest(tree, False) if tree.exists() else None
+        if isinstance(manifest, dict):
+            available[family] = {
+                "slot": runtime_backend_slot(family),
+                "runtime_family": str(manifest.get("runtime_family", family)),
+                "manifest_checksum": str(manifest.get("manifest_checksum", "")),
+            }
+    payload = {
+        "schema_version": 1,
+        "updated": time.time(),
+        "selected": str(selected_family or "windows-x64-cpu"),
+        "selected_slot": runtime_backend_slot(selected_family),
+        "reason": str(reason),
+        "available": available,
+        "cpu_safe_retained": "windows-x64-cpu" in available,
+    }
+    _atomic_json_write(runtime_active_path(base), payload)
+    return payload
 
 
 def sha256_file(path, maximum=None):
@@ -13732,6 +14190,8 @@ class AskQuestionProducer:
         selected_ranked = []
         selected_priority = float("inf")
         selected_decision = {}
+        selected_fingerprint = ""
+        found_high_value = False
         candidates = usable[-28:]
         if not self.prototypes:
             return selected, [], {}
@@ -13771,11 +14231,22 @@ class AskQuestionProducer:
                 trigger_count = len(decision.get("guidance_trigger", []))
                 novelty = 1.0 if candidate_frame.get("new_semantic_objects") else 0.0
                 priority = gap - 2.0 * trigger_count - 1.5 * novelty
+            reasons = high_value_question_reasons(candidate_frame, ranked, decision, temporal)
+            fingerprint = question_fingerprint(self.game_id, candidate_frame, ranked, decision)
+            if not reasons or HIGH_VALUE_QUESTION_CACHE.get(fingerprint) is not None:
+                continue
+            decision["high_value_reasons"] = reasons
+            decision["question_fingerprint"] = fingerprint
             if priority < selected_priority:
+                found_high_value = True
                 selected_priority = priority
                 selected = candidate_frame
                 selected_ranked = ranked
                 selected_decision = decision
+                selected_fingerprint = fingerprint
+        if not found_high_value:
+            raise CaptureUnavailable("当前没有未回答的高价值问题；已跳过高置信、低风险或重复状态")
+        HIGH_VALUE_QUESTION_CACHE[selected_fingerprint] = {"asked": time.time(), "game_id": self.game_id}
         return selected, selected_ranked, selected_decision
 
     def _make_choices_base(self, question_frame, ranked):
@@ -13876,9 +14347,15 @@ class AskQuestionProducer:
             try:
                 frame, ranked, decision = self._select_frame(payload)
                 choices, candidates = self._make_choices(frame, ranked)
-                questions = [action_quiz_question(frame, choices)]
+                action_question = action_quiz_question(frame, choices)
+                action_metadata = action_question.setdefault("metadata", {})
+                action_metadata["question_fingerprint"] = str(
+                    decision.get("question_fingerprint", "")
+                )
+                action_question["metadata"]["high_value_reasons"] = list(decision.get("high_value_reasons", []))
+                questions = [action_question]
                 numeric_candidates = []
-                should_ask_numeric = self.counter % 4 == 0
+                should_ask_numeric = False
                 numeric_triggers = {
                     "unknown_numeric_region",
                     "low_ocr_confidence",
@@ -13914,6 +14391,9 @@ class AskQuestionProducer:
                         if str(definition.get("goal_relation", "uncertain")) == "uncertain":
                             trigger_values.append("numeric_relation_unknown")
                         decision["guidance_trigger"] = list(dict.fromkeys(trigger_values))
+                episode_reasons = episode_result_confirmation_required(frame, decision)
+                if episode_reasons:
+                    questions.append(episode_result_quiz_question(frame, episode_reasons))
                 self.counter += 1
                 self._put_result(
                     {
@@ -14938,6 +15418,368 @@ class TrainingPostActionVerifier:
         return bool(after is not None and visual_distance(before, after["f"]) >= float(threshold))
 
 
+STATE_COVERAGE_BUCKETS = (
+    "normal_start",
+    "resolution_or_dpi_variant",
+    "window_size_variant",
+    "ui_skin_variant",
+    "level_variant",
+    "low_health_or_resource",
+    "popup",
+    "network_disconnected",
+    "loading",
+    "stuck",
+    "failure_recovery",
+    "wrong_action_recovery",
+    "dangerous_control_nearby",
+)
+
+PRETRAINED_SEMANTIC_TIERS = {
+    "cpu_onnx": {
+        "backend": "windows-x64-cpu",
+        "purpose": ("generic_button_icon", "ui_element", "text_image_match", "zero_shot_name", "screen_transfer"),
+        "proposal_only": True,
+    },
+    "gpu_small_encoder": {
+        "backend": "accelerator",
+        "purpose": ("generic_button_icon", "ui_element", "text_image_match", "zero_shot_name", "screen_transfer"),
+        "proposal_only": True,
+    },
+    "gpu_visual_language": {
+        "backend": "accelerator_large",
+        "purpose": ("generic_button_icon", "ui_element", "text_image_match", "zero_shot_name", "screen_transfer"),
+        "proposal_only": True,
+    },
+}
+
+HIGH_VALUE_QUESTION_CACHE = BoundedTTLMap(4096, 30 * 24 * 3600.0)
+
+
+def state_coverage_bucket(frame, context=None):
+    value = frame if isinstance(frame, dict) else {}
+    meta = context if isinstance(context, dict) else {}
+    targets = value.get("semantic_targets", []) if isinstance(value.get("semantic_targets"), list) else []
+    classes = {str(item.get("class", "")).casefold() for item in targets if isinstance(item, dict)}
+    text = " ".join(str(item.get("text", "")) for item in targets if isinstance(item, dict)).casefold()
+    result = set()
+    if safe_int(meta.get("step_id", 0), 0) <= 1 or meta.get("episode_start"):
+        result.add("normal_start")
+    dpi = safe_float(value.get("dpi_scale", meta.get("dpi_scale", 1.0)), 1.0)
+    rect = value.get("client_rect", [])
+    if abs(dpi - 1.0) > 0.02 or value.get("resolution_changed"):
+        result.add("resolution_or_dpi_variant")
+    if isinstance(rect, (list, tuple)) and len(rect) >= 4 and (safe_int(rect[2], 0) != 0 or safe_int(rect[3], 0) != 0):
+        result.add("window_size_variant")
+    if value.get("ui_skin") or meta.get("ui_skin"):
+        result.add("ui_skin_variant")
+    if value.get("level_id") or meta.get("level_id"):
+        result.add("level_variant")
+    numeric = value.get("numeric_state", {}) if isinstance(value.get("numeric_state"), dict) else {}
+    resource_low = any(
+        safe_float(item, 1.0) < 0.25
+        for item in numeric.values()
+        if isinstance(item, (int, float))
+    )
+    if meta.get("low_resource") or resource_low:
+        result.add("low_health_or_resource")
+    if "dialog" in classes or "popup" in classes or "modal" in classes:
+        result.add("popup")
+    network_tokens = ("断开", "网络错误", "offline", "disconnected")
+    if value.get("network_disconnected") or any(token in text for token in network_tokens):
+        result.add("network_disconnected")
+    if value.get("loading") or "loading" in classes or any(token in text for token in ("加载", "loading")):
+        result.add("loading")
+    if value.get("stuck") or safe_int(meta.get("same_action_no_effect_count", 0), 0) >= 2:
+        result.add("stuck")
+    if meta.get("failure_recovery_stack") or meta.get("terminal_state") == "failure":
+        result.add("failure_recovery")
+    if meta.get("human_correction") or meta.get("wrong_action"):
+        result.add("wrong_action_recovery")
+    if any(str(item.get("risk_class", "safe")) == "irreversible" for item in targets if isinstance(item, dict)):
+        result.add("dangerous_control_nearby")
+    return sorted(result or {"normal_start"})
+
+
+def question_fingerprint(game_id, frame, ranked=None, decision=None, question_type=QuizQuestionType.ACTION.value):
+    value = frame if isinstance(frame, dict) else {}
+    choices = []
+    for item in list(ranked or [])[:4]:
+        if not isinstance(item, dict):
+            continue
+        semantic = normalize_semantic_action(
+            item.get("semantic_action") or item.get("a")
+        ) or semantic_action_from_coordinate(item.get("a"))
+        choices.append(semantic_action_signature(semantic))
+    coarse = value.get("coarse")
+    if isinstance(coarse, (bytes, bytearray)):
+        state = feature_bytes(coarse)
+    elif feature_valid(value.get("f")):
+        state = coarse_feature(value.get("f"))
+    else:
+        state = b""
+    payload = {
+        "game_id": str(game_id),
+        "question_type": str(question_type),
+        "state": hashlib.sha256(
+            state + str(value.get("object_signature", "")).encode("utf-8", "replace")
+        ).hexdigest()[:24],
+        "choices": choices,
+        "triggers": sorted(str(item) for item in (decision or {}).get("guidance_trigger", [])),
+        "risk": str((decision or {}).get("risk_class", "")),
+    }
+    return hashlib.sha256(canonical_bytes(payload)).hexdigest()
+
+
+def high_value_question_reasons(frame, ranked, decision, temporal=None):
+    value = decision if isinstance(decision, dict) else {}
+    items = [item for item in ranked or [] if isinstance(item, dict)]
+    reasons = set(str(item) for item in value.get("guidance_trigger", []) if str(item))
+    if len(items) >= 2:
+        first = items[0]
+        second = items[1]
+        gap = abs(safe_float(first.get("score"), 0.0) - safe_float(second.get("score"), 0.0))
+        scale = max(1.0, abs(safe_float(first.get("score"), 0.0)))
+        if gap / scale <= 0.08:
+            reasons.add("near_tie")
+        policy_first = max(items[:4], key=lambda item: safe_float(item.get("bc_probability"), 0.0))
+        value_first = max(items[:4], key=lambda item: safe_float(item.get("success_probability"), 0.0))
+        if str(policy_first.get("cluster_id")) != str(value_first.get("cluster_id")):
+            reasons.add("policy_value_disagreement")
+    irreversible = any(
+        str(
+            (normalize_semantic_action(item.get("semantic_action")) or {}).get(
+                "risk_class", item.get("risk_class", "safe")
+            )
+        )
+        == "irreversible"
+        for item in items[:4]
+    )
+    if irreversible:
+        reasons.add("irreversible_risk")
+    if isinstance(frame, dict) and frame.get("new_semantic_objects"):
+        reasons.add("new_object_type")
+    triggers = set(str(item) for item in value.get("guidance_trigger", []))
+    numeric_triggers = {
+        "unknown_numeric_region",
+        "low_ocr_confidence",
+        "ocr_temporal_disagreement",
+        "numeric_relation_unknown",
+        "numeric_direction_conflict",
+        "numeric_value_correlated_with_policy_uncertainty",
+    }
+    if triggers.intersection(numeric_triggers):
+        reasons.add("decision_relevant_ocr")
+    memory = temporal if isinstance(temporal, dict) else {}
+    if memory.get("world_model_conflict") or value.get("world_model_conflict"):
+        reasons.add("world_model_actual_conflict")
+    if safe_int(memory.get("same_action_no_effect_count", 0), 0) >= 2 or value.get("repeated_no_effect"):
+        reasons.add("repeated_no_effect")
+    confidence = safe_float(value.get("confidence"), 0.0, 0.0, 1.0)
+    if confidence >= 0.92 and not reasons and str(value.get("risk_class", "safe")) == "safe":
+        return []
+    return sorted(reasons)
+
+
+def episode_result_confirmation_required(frame, decision=None):
+    value = frame if isinstance(frame, dict) else {}
+    verdict = decision if isinstance(decision, dict) else {}
+    reasons = []
+    success = bool(value.get("success_detected") or verdict.get("success_detected"))
+    failure = bool(value.get("failure_detected") or verdict.get("failure_detected"))
+    if success and failure:
+        reasons.append("success_failure_conflict")
+    if value.get("ocr_unstable") or "ocr_temporal_disagreement" in set(verdict.get("guidance_trigger", [])):
+        reasons.append("ocr_unstable")
+    if value.get("settlement_animation") or value.get("animation_only"):
+        reasons.append("settlement_or_animation")
+    if verdict.get("predicted_success") and verdict.get("human_override"):
+        reasons.append("predicted_success_then_override")
+    semantic_text = " ".join(
+        str(item.get("text", ""))
+        for item in value.get("semantic_targets", [])
+        if isinstance(item, dict)
+    ).casefold()
+    obvious = any(token in semantic_text for token in ("胜利", "失败", "成功", "game over", "victory", "defeat"))
+    if verdict.get("terminal_candidate") and not obvious:
+        reasons.append("no_obvious_terminal_text")
+    return sorted(set(reasons))
+
+
+def episode_result_quiz_question(frame, reasons):
+    return QuizQuestion(
+        question_id="episode_result|" + uuid.uuid4().hex,
+        question_type=QuizQuestionType.EPISODE_RESULT.value,
+        title="本局结果是什么？",
+        frame=frame,
+        options=[
+            {"code": "A", "label": "成功", "value": "success"},
+            {"code": "B", "label": "失败", "value": "failure"},
+            {"code": "C", "label": "中断/无法判断", "value": "interrupted"},
+        ],
+        metadata={"required_reasons": list(reasons), "strong_episode_label": True},
+    ).to_dict()
+
+
+class CorrectiveLearningWorkflow:
+    def __init__(self, base, game_id):
+        self.base = Path(base)
+        self.game_id = str(game_id)
+        token = hashlib.sha256(self.game_id.encode("utf-8", "replace")).hexdigest()[:16]
+        self.directory = self.base / "audit" / "corrective_learning"
+        self.pending_path = self.directory / ("pending_" + token + ".json")
+        self.history_path = self.directory / ("history_" + token + ".jsonl")
+
+    @staticmethod
+    def _frame_state(frame):
+        value = frame if isinstance(frame, dict) else {}
+        feature = feature_bytes(value.get("f")) if feature_valid(value.get("f")) else b""
+        neural = feature_bytes(value.get("neural_f")) if feature_valid(value.get("neural_f")) else b""
+        return {
+            "created": time.time(),
+            "frame_time": safe_float(value.get("time"), 0.0),
+            "feature_sha256": hashlib.sha256(feature).hexdigest() if feature else "",
+            "neural_sha256": hashlib.sha256(neural).hexdigest() if neural else "",
+            "object_signature": str(value.get("object_signature", "")),
+            "capture_method": str(value.get("method", "")),
+            "coverage_buckets": state_coverage_bucket(value, {}),
+        }
+
+    def record_override(self, frame, wrong_action, candidates, decision, reason):
+        semantic = normalize_semantic_action(wrong_action) or semantic_action_from_coordinate(wrong_action)
+        entries = []
+        for item in list(candidates or [])[:8]:
+            if not isinstance(item, dict):
+                continue
+            candidate = normalize_semantic_action(
+                item.get("semantic_action") or item.get("action") or item.get("a")
+            ) or semantic_action_from_coordinate(item.get("a"))
+            entries.append(
+                {
+                    "cluster_id": str(item.get("cluster_id", "")),
+                    "semantic_action": candidate,
+                    "policy": safe_float(item.get("bc_probability", item.get("policy_probability", 0.0)), 0.0),
+                    "value": safe_float(item.get("success_probability", item.get("value_probability", 0.0)), 0.0),
+                    "risk": safe_float(item.get("risk_probability", 0.0), 0.0),
+                    "world": safe_float(item.get("world_score", item.get("predicted_reward", 0.0)), 0.0),
+                }
+            )
+        payload = {
+            "schema_version": 2,
+            "game_id": self.game_id,
+            "created": time.time(),
+            "state": self._frame_state(frame),
+            "wrong_action": semantic,
+            "wrong_action_signature": semantic_action_signature(semantic),
+            "candidate_list": entries,
+            "disagreement": {
+                "policy_value": safe_float((decision or {}).get("policy_value_disagreement"), 0.0),
+                "ensemble": safe_float((decision or {}).get("ensemble_disagreement"), 0.0),
+                "world_model": safe_float((decision or {}).get("world_model_disagreement"), 0.0),
+            },
+            "takeover_reason": str(reason),
+            "status": "awaiting_corrective_action",
+        }
+        self.directory.mkdir(parents=True, exist_ok=True)
+        _atomic_json_write(self.pending_path, payload)
+        return payload
+
+    def load(self):
+        try:
+            value = json.loads(self.pending_path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) and value.get("status") == "awaiting_corrective_action" else None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    def complete(self, pending, correct_action, outcome):
+        value = dict(pending) if isinstance(pending, dict) else {}
+        semantic = normalize_semantic_action(correct_action) or semantic_action_from_coordinate(correct_action)
+        value.update(
+            {
+                "completed": time.time(),
+                "correct_action": semantic,
+                "correct_action_signature": semantic_action_signature(semantic),
+                "actual_change": dict(outcome) if isinstance(outcome, dict) else {},
+                "status": "completed",
+                "supervision": {"wrong_action": "strong_negative", "correct_action": "strong_positive"},
+            }
+        )
+        self.directory.mkdir(parents=True, exist_ok=True)
+        with self.history_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
+        try:
+            self.pending_path.unlink()
+        except FileNotFoundError:
+            pass
+        return value
+
+
+class PersistentTaskGraph:
+    def __init__(self, base, game_id):
+        self.base = Path(base)
+        self.game_id = str(game_id)
+        token = hashlib.sha256(self.game_id.encode("utf-8", "replace")).hexdigest()[:16]
+        self.path = self.base / "models" / "task_graph" / (token + ".json")
+        self.value = self._load()
+
+    def _load(self):
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                return value
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        return {
+            "schema_version": 1,
+            "game_id": self.game_id,
+            "long_term_goal": "",
+            "visited_pages": [],
+            "completed_subgoals": [],
+            "resources": {},
+            "failed_paths": [],
+            "dependencies": {},
+            "recovery_paths": {},
+            "current_progress": {},
+        }
+
+    def observe(self, observation, subgoal=None, outcome=None):
+        if hasattr(observation, "to_dict"):
+            state = observation.to_dict()
+        elif isinstance(observation, dict):
+            state = observation
+        else:
+            state = {}
+        page = str(state.get("environment_id") or state.get("scene_id") or state.get("state_id") or "")
+        if page:
+            self.value["visited_pages"] = list(dict.fromkeys(self.value.get("visited_pages", []) + [page]))[-512:]
+        goal = getattr(subgoal, "subgoal_id", "") if subgoal is not None else ""
+        if goal:
+            completion = getattr(subgoal, "completion_condition", {})
+            skills = list(getattr(subgoal, "preferred_skills", ()))
+            dependency = {
+                "prerequisites": [],
+                "completion_evidence": completion,
+                "skills": skills,
+            }
+            self.value.setdefault("dependencies", {}).setdefault(goal, dependency)
+            self.value["current_progress"] = {"subgoal": goal, "updated": time.time()}
+        result = outcome if isinstance(outcome, dict) else {}
+        if result.get("success") and goal:
+            completed = self.value.get("completed_subgoals", []) + [goal]
+            self.value["completed_subgoals"] = list(dict.fromkeys(completed))[-512:]
+        if result.get("failure") and goal:
+            failed = {
+                "subgoal": goal,
+                "state": page,
+                "reason": str(result.get("reason", "failure")),
+                "created": time.time(),
+            }
+            self.value["failed_paths"] = (self.value.get("failed_paths", []) + [failed])[-512:]
+            recovery = ["wait_for_state", "navigate_back", "restart_round"]
+            self.value.setdefault("recovery_paths", {}).setdefault(goal, recovery)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_json_write(self.path, self.value)
+        return dict(self.value)
+
 class LearningController:
     def __init__(self, context, host=None):
         if isinstance(context, ModeContext):
@@ -15015,9 +15857,13 @@ class LearningExecution:
         self.last_modality_sample = 0.0
         self.gamepad_monitor = None
         self.audio_monitor = None
+        self.corrective_workflow = None
+        self.pending_correction = None
 
     def preflight(self):
         self.game = self.phase.get("game") or self.host.require_game()
+        self.corrective_workflow = CorrectiveLearningWorkflow(self.host.store.base, self.game["id"])
+        self.pending_correction = self.corrective_workflow.load()
         profile = self.host.store.load_game_profile(self.game["id"])
         self.task_id = normalized_identifier(profile.get("default_task_id"), "default", 96)
         selected_options = getattr(self.host, "capture_options", None)
@@ -15312,6 +16158,7 @@ class LearningExecution:
                 "modality_versions": self.capability.to_dict().get("modality_permissions", {}),
             }
         )
+        context["state_coverage_buckets"] = state_coverage_bucket(frame, context)
         return context
 
     def save(self, frame, action, source, weight=1.0, cursor_point=None):
@@ -15352,6 +16199,41 @@ class LearningExecution:
         context["counterfactual_training"] = build_counterfactual_training_payload(
             frame, semantic, source, self.recent_action_results
         )
+        pending = self.pending_correction
+        if isinstance(pending, dict):
+            context.update(
+                {
+                    "human_override": True,
+                    "human_correction": True,
+                    "corrective_action": semantic,
+                    "wrong_action": pending.get("wrong_action"),
+                    "wrong_action_signature": str(pending.get("wrong_action_signature", "")),
+                    "ai_candidate_list": list(pending.get("candidate_list", [])),
+                    "model_disagreement": dict(pending.get("disagreement", {})),
+                    "user_takeover_reason": str(pending.get("takeover_reason", "immediate_takeover")),
+                    "sample_role": "human_correction",
+                    "strong_positive_weight": 3.5,
+                    "state_coverage_buckets": sorted(
+                        set(context.get("state_coverage_buckets", []))
+                        | {"wrong_action_recovery"}
+                    ),
+                }
+            )
+            rejected = list(pending.get("candidate_list", []))
+            wrong = pending.get("wrong_action")
+            if wrong:
+                rejected.insert(0, {"semantic_action": wrong, "cluster_id": "wrong_action"})
+            self.host.store.append_rejection(
+                self.game["id"],
+                frame["f"],
+                rejected,
+                "corrective_strong_negative",
+                frame.get("rgb"),
+                frame.get("neural_f"),
+                context,
+            )
+            source = "corrective_strong_positive"
+            weight = max(3.5, safe_float(weight, 1.0))
         saved = self.host.store.append_sample(
             self.game["id"], frame["f"], semantic, source, context, frame.get("rgb"), frame.get("neural_f"), weight
         )
@@ -15359,6 +16241,15 @@ class LearningExecution:
             self.keyboard_discarded += 1
             return False
         self.record_save_outcome(saved, frame, semantic)
+        if saved and isinstance(pending, dict):
+            outcome = {
+                "changed": bool(self.last_action_changed),
+                "frame_time": safe_float(frame.get("time"), 0.0),
+                "feature_sha256": hashlib.sha256(feature_bytes(frame.get("f"))).hexdigest(),
+            }
+            self.corrective_workflow.complete(pending, semantic, outcome)
+            self.pending_correction = None
+            self.host.set_status("已保存AI错误动作强负例、用户纠正动作强正例和真实画面变化")
         return saved
 
     def record_save_outcome(self, saved, frame, action):
@@ -19061,9 +19952,16 @@ class TrainingExecution:
         self.online_episode_id = ""
         self.online_episode_recorded = False
         self.last_captured_frame = None
+        self.last_ranked_candidates = []
+        self.last_decision_snapshot = {}
+        self.last_selection_for_correction = None
+        self.corrective_workflow = None
+        self.task_graph_memory = None
 
     def preflight(self):
         self.game = self.phase.get("game") or self.host.require_game()
+        self.corrective_workflow = CorrectiveLearningWorkflow(self.host.store.base, self.game["id"])
+        self.task_graph_memory = PersistentTaskGraph(self.host.store.base, self.game["id"])
         self.runtime_session_id = "ai|" + uuid.uuid4().hex
         self.host.mode_session_id = self.runtime_session_id
         self.target = dict(self.phase.get("window") or self.host.require_window(False))
@@ -19479,10 +20377,20 @@ class TrainingExecution:
             self.isolation.signal("mouse", mouse_events[0].get("time") if mouse_events else time.monotonic())
             reason = "检测到物理或其他程序注入的鼠标输入，训练立即停止"
             self.host.set_input_status("因人工鼠标输入锁定")
+        if self.corrective_workflow is not None and self.last_selection_for_correction is not None:
+            self.corrective_workflow.record_override(
+                self.last_captured_frame,
+                self.last_selection_for_correction.get("action", self.last_selection_for_correction),
+                self.last_ranked_candidates,
+                self.last_decision_snapshot,
+                reason,
+            )
         self.host.request_mode_stop("stopped", reason)
         self.host.api.block_input()
         self.host.api.release_all_buttons()
-        self.host.set_status(reason + "；不会自动恢复")
+        self.host.set_status(
+            reason + "；下一次点击“人”后首个正确动作将自动形成强正负纠错样本"
+        )
         return True
 
     def acquire_frame(self):
@@ -19610,6 +20518,8 @@ class TrainingExecution:
         )
         observation = objectized_observation(captured, temporal, self.task_definition)
         self.current_subgoal = self.task_planner.propose_subgoal(observation, self.task_definition)
+        if self.task_graph_memory is not None:
+            temporal["task_graph"] = self.task_graph_memory.observe(observation, self.current_subgoal, {})
         temporal["subgoal_id"] = self.current_subgoal.subgoal_id
         temporal["planner_plan"] = dict(getattr(self.task_planner, "last_plan", {}))
         temporal["observation_state_id"] = observation.state_id
@@ -19634,6 +20544,11 @@ class TrainingExecution:
             self.agent_policy.task_id,
         )
         decision = self.host.evaluate_action_candidates(ranked)
+        self.last_ranked_candidates = [dict(item) for item in ranked[:8] if isinstance(item, dict)]
+        self.last_decision_snapshot = dict(decision)
+        self.last_decision_snapshot["high_value_reasons"] = high_value_question_reasons(
+            captured, ranked, decision, temporal
+        )
         if not decision.get("accepted"):
             self.reset_candidate()
             now = time.monotonic()
@@ -20024,6 +20939,7 @@ class TrainingExecution:
 
     def execute_selected_action(self, selection):
         fresh = self.frame_buffer.latest(None, 0.35)
+        self.last_selection_for_correction = dict(selection) if isinstance(selection, dict) else selection
         try:
             self.host.api.validate_target(self.target, True)
             self.host.api.validate_uipi(self.target)
@@ -20072,10 +20988,20 @@ class TrainingExecution:
             if kind == "mouse"
             else "检测到非ESC键盘输入，训练立即停止"
         )
+        if self.corrective_workflow is not None and self.last_selection_for_correction is not None:
+            self.corrective_workflow.record_override(
+                self.last_captured_frame,
+                self.last_selection_for_correction.get("action", self.last_selection_for_correction),
+                self.last_ranked_candidates,
+                self.last_decision_snapshot,
+                reason,
+            )
         self.host.request_mode_stop("stopped", reason)
         self.host.api.block_input()
         self.host.api.release_all_buttons()
-        self.host.set_status(reason + "；不会自动恢复")
+        self.host.set_status(
+            reason + "；下一次点击“人”后首个正确动作将自动形成强正负纠错样本"
+        )
 
     def _collect_outcome_base(self, selection, before):
         action_end = time.monotonic()
@@ -20992,6 +21918,30 @@ def compile_numeric_supervision(app, game_id, frame, answers):
     return result
 
 
+def compile_episode_result_supervision(app, game_id, frame, answers):
+    matches = [
+        value
+        for value in answers or []
+        if isinstance(value, dict) and value.get("question_type") == QuizQuestionType.EPISODE_RESULT.value
+    ]
+    if not matches:
+        return {"episode_result": "", "episode_result_confirmed": False}
+    answer = matches[-1]
+    result = str(answer.get("value", "interrupted"))
+    if result not in {"success", "failure", "interrupted"}:
+        result = "interrupted"
+    payload = {
+        "frame_digest": frame_digest(frame),
+        "episode_result": result,
+        "human_confirmed": True,
+        "strong_episode_label": True,
+        "required_reasons": list((answer.get("metadata") or {}).get("required_reasons", [])),
+        "created": time.time(),
+    }
+    app.store.append_guidance_event(game_id, "episode_result_supervision", payload)
+    return {"episode_result": result, "episode_result_confirmed": True}
+
+
 class TeachingController:
     def __init__(self, app):
         self.app = app
@@ -21097,6 +22047,7 @@ class TeachingController:
                 "numeric_questions": 0,
                 "ocr_corrections": 0,
                 "numeric_relations": 0,
+                "episode_results": 0,
             }
             answer_queue = queue.Queue()
             app.ask_answer_queue = answer_queue
@@ -21147,8 +22098,11 @@ class TeachingController:
                     candidates = list(command.get("candidates", []))
                     guidance_trigger = list(command.get("guidance_trigger", []))
                     numeric_result = compile_numeric_supervision(app, game["id"], frame, answers)
+                    episode_result = compile_episode_result_supervision(app, game["id"], frame, answers)
                     for counter_name in ("numeric_questions", "ocr_corrections", "numeric_relations"):
                         app.ask_counts[counter_name] += safe_int(numeric_result.get(counter_name), 0)
+                    if episode_result.get("episode_result_confirmed"):
+                        app.ask_counts["episode_results"] += 1
                     action_answers = [
                         value for value in answers if value.get("question_type") == QuizQuestionType.ACTION.value
                     ]
@@ -21205,6 +22159,10 @@ class TeachingController:
                                 "human_override": True,
                                 "trajectory_schema_version": TRAJECTORY_SCHEMA_VERSION,
                                 "ocr_values": list(numeric_result.get("ocr_values", [])),
+                                "episode_result": str(episode_result.get("episode_result", "")),
+                                "episode_result_confirmed": bool(episode_result.get("episode_result_confirmed")),
+                                "terminal": str(episode_result.get("episode_result", "")),
+                                "state_coverage_buckets": state_coverage_bucket(frame, {"human_override": True}),
                                 "quiz_answers": [
                                     {
                                         "question_type": value.get("question_type"),
@@ -28461,7 +29419,8 @@ class AppLifecycleService(AppServiceBase):
         result = None
         error = None
         try:
-            value = target()
+            with RESOURCE_GOVERNOR.plan_scope(name):
+                value = target()
             if isinstance(value, ModeResult):
                 result = value
             else:
@@ -31072,6 +32031,13 @@ class AppStorageService(AppServiceBase):
             self.api.block_input()
             self.api.release_all_buttons()
             base = Path(self.store.base)
+            failed_backend = RESOURCE_GOVERNOR._manifest_backend()
+            if safe_int(RESOURCE_GOVERNOR.backend_fault_counts.get(failed_backend), 0) >= 2:
+                RESOURCE_GOVERNOR.blacklist_backend_for_run(failed_backend, "repeated_accelerator_fault")
+            cpu_manifest = validate_runtime_manifest(base, True, True, "windows-x64-cpu")
+            if not isinstance(cpu_manifest, dict):
+                raise RuntimeError("CPU安全后端未保留，拒绝无验证热切换")
+            write_runtime_active_state(base, "windows-x64-cpu", "accelerator_fault_hot_fallback")
             recovery_dir = make_data_directory(base, Path("audit") / "runtime_recovery")
             session_record = {
                 "schema_version": 1,
@@ -31082,6 +32048,21 @@ class AppStorageService(AppServiceBase):
                 "fault": type(error).__name__ + ":" + str(error),
                 "fault_details": dict(details),
                 "phase": "input_locked_session_saved_worker_restart_cpu_safe",
+                "failed_backend": failed_backend,
+                "backend_blacklisted": RESOURCE_GOVERNOR.is_backend_blacklisted(failed_backend),
+                "safe_snapshot": {
+                    "selected_game": str(self.selected_game or ""),
+                    "mode_session_id": str(getattr(self, "mode_session_id", "")),
+                    "resource_plan": RESOURCE_GOVERNOR.current_plan(ModeId.AI.value).to_dict(),
+                },
+                "recovery_policy": {
+                    "release_all_inputs": True,
+                    "stop_current_action": True,
+                    "checkpoint": True,
+                    "switch_to_cpu": True,
+                    "lower_model_and_resolution": True,
+                    "resume_from_safe_state": bool(should_resume_ai),
+                },
             }
             _atomic_json_write(recovery_dir / (str(int(time.time() * 1000)) + ".json"), session_record)
             try:
@@ -31121,6 +32102,15 @@ class AppStorageService(AppServiceBase):
                     "ocr_interval": 8,
                     "vision_batch": 4,
                     "policy_batch": 16,
+                    "fast_visual_size": [64, 36],
+                    "semantic_visual_size": [224, 126],
+                    "policy_hidden_size": 128,
+                    "policy_ensemble_size": 3,
+                    "world_model_horizon": 2,
+                    "object_slot_count": 16,
+                    "vision_backend": "windows-x64-cpu",
+                    "policy_backend": "windows-x64-cpu",
+                    "world_model_backend": "windows-x64-cpu",
                 }
             )
             if old_worker is not None and old_worker is not worker:
@@ -34349,9 +35339,10 @@ def recover_runtime_layout(base):
     return True
 
 
-def validate_runtime_manifest(base, verify_files=False, verify_lock=False):
-    recover_runtime_layout(base)
-    current = Path(base) / "runtime.current"
+def validate_runtime_manifest(base, verify_files=False, verify_lock=False, runtime_family=None):
+    if runtime_family is None:
+        recover_runtime_layout(base)
+    current = runtime_tree_path(base, runtime_family)
     value = _runtime_tree_manifest(current, verify_files)
     if value is None:
         path = current / "runtime_manifest.json"
@@ -35791,6 +36782,16 @@ def runtime_install_worker(request_path):
             (item for item in candidate_records if item.get("stable")),
             key=lambda item: safe_float(item.get("score_ms"), float("inf")),
         )
+        retained_staging = base / ("runtime.retained." + uuid.uuid4().hex)
+        retained_staging.mkdir(parents=True, exist_ok=False)
+        retained_families = []
+        for item in candidate_records:
+            if not item.get("stable"):
+                continue
+            family = str(item.get("family", "windows-x64-cpu"))
+            target = retained_staging / runtime_backend_slot(family)
+            shutil.copytree(Path(item["root"]), target)
+            retained_families.append(family)
         for item in candidate_records:
             root = Path(item["root"])
             if item is selected:
@@ -35933,7 +36934,24 @@ def runtime_install_worker(request_path):
             raise
         if backup.exists():
             shutil.rmtree(backup, ignore_errors=True)
-        _runtime_emit("progress", value=100.0, message="下载与离线验证完成")
+        retained_root = base / "runtime"
+        retained_backup = base / ("runtime.retained.rollback." + uuid.uuid4().hex)
+        retained_moved = False
+        try:
+            if retained_root.exists():
+                os.replace(retained_root, retained_backup)
+                retained_moved = True
+            os.replace(retained_staging, retained_root)
+            write_runtime_active_state(base, selected_backend, "measured_backend_selection")
+        except Exception:
+            if retained_root.exists() and not retained_moved:
+                shutil.rmtree(retained_root, ignore_errors=True)
+            if retained_moved and retained_backup.exists() and not retained_root.exists():
+                os.replace(retained_backup, retained_root)
+            raise
+        if retained_backup.exists():
+            shutil.rmtree(retained_backup, ignore_errors=True)
+        _runtime_emit("progress", value=100.0, message="下载与离线验证完成，CPU安全后端已保留")
         _runtime_emit("result", manifest=manifest)
         return 0
     except Exception as error:
@@ -36982,7 +38000,9 @@ class OfflineVisionRuntime:
 
     def _load_runtime(self):
         try:
-            self.runtime_manifest = validate_runtime_manifest(self.base, True, True)
+            force_cpu_safe = os.environ.get("UGAI_FORCE_CPU_SAFE", "0") == "1"
+            requested_family = "windows-x64-cpu" if force_cpu_safe else None
+            self.runtime_manifest = validate_runtime_manifest(self.base, True, True, requested_family)
             if self.runtime_manifest is None:
                 raise RuntimeError("运行库清单不存在")
             selected_family = str(
@@ -36990,7 +38010,6 @@ class OfflineVisionRuntime:
                 or self.runtime_manifest.get("gpu_backend")
                 or "windows-x64-cpu"
             )
-            force_cpu_safe = os.environ.get("UGAI_FORCE_CPU_SAFE", "0") == "1"
             effective_family = "windows-x64-cpu" if force_cpu_safe else selected_family
             self.runtime_manifest = dict(self.runtime_manifest)
             self.runtime_manifest["effective_runtime_family"] = (
@@ -37002,7 +38021,7 @@ class OfflineVisionRuntime:
             self.device_name = "内置CPU可训练编码器"
             self.ready = True
             self.error = ""
-            site = runtime_site_packages(self.base)
+            site = runtime_site_packages(self.base, requested_family)
             if site.exists() and str(site) not in sys.path:
                 sys.path.insert(0, str(site))
             import importlib
@@ -37478,6 +38497,9 @@ class OfflineVisionRuntime:
                 "read_only_shared_backbone": True,
                 "low_rank_film_adapters": True,
                 "manual_feature_fallback": True,
+                "pretrained_semantic_tiers": PRETRAINED_SEMANTIC_TIERS,
+                "pretrained_semantic_proposal_only": True,
+                "final_action_requires_safety_shield_and_whitelist": True,
             }
         )
         return result
@@ -37591,6 +38613,13 @@ class OfflineVisionRuntime:
                 ),
                 "learned": True,
                 "quantized": False,
+                "pretrained_semantic_tier": (
+                    "gpu_visual_language"
+                    if RESOURCE_GOVERNOR.current_plan().model_tier == "Large"
+                    else "gpu_small_encoder"
+                ),
+                "proposal_only": True,
+                "requires_online_safety_validation": True,
                 "device": self.device_name,
                 "input_size": [target_width, target_height],
                 "patch_size": HYBRID_SEMANTIC_PATCH,
@@ -37623,6 +38652,9 @@ class OfflineVisionRuntime:
                 "backend": "quantized_onnx_int8_cpu",
                 "learned": True,
                 "quantized": True,
+                "pretrained_semantic_tier": "cpu_onnx",
+                "proposal_only": True,
+                "requires_online_safety_validation": True,
                 "device": "cpu",
                 "input_size": [target_width, target_height],
                 "patch_size": safe_int(self.semantic_onnx_metadata.get("patch_size"), HYBRID_SEMANTIC_PATCH, 1, 64),
@@ -37637,6 +38669,9 @@ class OfflineVisionRuntime:
             HYBRID_SEMANTIC_PATCH,
         )
         fallback["onnx_error"] = self.semantic_onnx_error
+        fallback["pretrained_semantic_tier"] = "deterministic_manual_fallback"
+        fallback["proposal_only"] = True
+        fallback["requires_online_safety_validation"] = True
         return fallback
 
     def _tensor_from_rgb(self, rgb):
@@ -38079,7 +39114,9 @@ def create_training_snapshot(base, game_id, samples):
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
         connection.execute(
-            "CREATE TABLE training_samples(sample_id INTEGER PRIMARY KEY,rgb BLOB NOT NULL,action TEXT NOT NULL,session TEXT NOT NULL,created REAL NOT NULL)"
+            "CREATE TABLE training_samples("
+            "sample_id INTEGER PRIMARY KEY,rgb BLOB NOT NULL,action TEXT NOT NULL,"
+            "session TEXT NOT NULL,created REAL NOT NULL)"
         )
         rows = []
         for index, item in enumerate(samples or []):
@@ -38400,7 +39437,8 @@ class AIWorkerClient:
         from multiprocessing.connection import Listener
 
         self.base = Path(base).resolve()
-        manifest = validate_runtime_manifest(self.base, True, True)
+        requested_runtime_family = "windows-x64-cpu" if force_cpu_safe else None
+        manifest = validate_runtime_manifest(self.base, True, True, requested_runtime_family)
         if (
             manifest is None
             or manifest.get("lock_complete") is not True
@@ -38421,7 +39459,11 @@ class AIWorkerClient:
         self.active_training_client = None
         self.status = {}
         self.candidate_index_tokens = set()
-        log_name = "training_worker_startup.log" if self.worker_filename == "training_worker.py" else "ai_worker_startup.log"
+        log_name = (
+            "training_worker_startup.log"
+            if self.worker_filename == "training_worker.py"
+            else "ai_worker_startup.log"
+        )
         self.startup_log_path = make_data_directory(self.base, "logs") / log_name
         self.startup_log_handle = self.startup_log_path.open("ab", buffering=0)
         self.startup_log_handle.write(
@@ -38438,7 +39480,7 @@ class AIWorkerClient:
         self.address = (r"\\.\pipe\UniversalGameAI-" + uuid.uuid4().hex) if os.name == "nt" else ("127.0.0.1", 0)
         listener = Listener(self.address, family=self.family, authkey=self.auth)
         actual_address = listener.address
-        python = runtime_python_path(self.base)
+        python = runtime_python_path(self.base, requested_runtime_family)
         if not python.is_file():
             listener.close()
             raise RuntimeError("固定独立Python工作进程不存在")
@@ -40717,7 +41759,12 @@ def run_static_contract_tests(path=None):
     }
     module_assignments = set()
     for node in tree.body:
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            targets = []
         module_assignments.update(target.id for target in targets if isinstance(target, ast.Name))
     remaining_mutable_caches = mutable_cache_names.intersection(module_assignments)
     check(
@@ -40958,6 +42005,119 @@ class AcceptanceNamespace:
     run_acceptance_test = staticmethod(run_acceptance_test)
 
 
+class RealHardwareReleaseGate:
+    ROLES = ("low_end_cpu", "nvidia_cuda", "amd_or_intel_directml")
+    REQUIRED_CASES = (
+        "dpi_100",
+        "dpi_125",
+        "dpi_150",
+        "dpi_200",
+        "multi_monitor_negative_coordinates",
+        "ldplayer_window",
+        "ordinary_window",
+        "administrator_integrity_difference",
+        "window_minimized",
+        "window_occluded",
+        "window_recreated",
+        "usb_gamepad_unplug",
+        "escape_starting",
+        "escape_running",
+        "escape_stopping",
+        "network_interruption",
+        "runtime_download_interruption",
+    )
+    ROLE_CASES = {
+        "low_end_cpu": ("memory_pressure", "below_20_fps", "no_discrete_gpu", "cpu_safe_backend"),
+        "nvidia_cuda": ("cuda_execution", "vram_pressure", "driver_reset", "gpu_fault_cpu_recovery"),
+        "amd_or_intel_directml": (
+            "directml_execution",
+            "shared_vram",
+            "operator_compatibility",
+            "gpu_fault_cpu_recovery",
+        ),
+    }
+
+    def __init__(self, base, build_hash=None):
+        self.base = Path(base).resolve()
+        self.build_hash = str(build_hash or current_build_hash())
+        self.directory = self.base / "audit" / "release_evidence"
+
+    @staticmethod
+    def _passed_cases(value):
+        cases = value.get("cases", {}) if isinstance(value.get("cases"), dict) else {}
+        result = {str(name) for name, status in cases.items() if status is True or status == "passed"}
+        result.update(str(name) for name in value.get("passed_cases", []) if str(name))
+        return result
+
+    def evaluate(self):
+        records = []
+        failures = []
+        if self.directory.exists():
+            for path in sorted(self.directory.glob("*.json")):
+                try:
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+                    failures.append(path.name + ":" + type(error).__name__)
+                    continue
+                if not isinstance(value, dict):
+                    failures.append(path.name + ":invalid_record")
+                    continue
+                value = dict(value)
+                value["evidence_file"] = path.name
+                records.append(value)
+        valid = []
+        machine_ids = set()
+        role_records = {}
+        for value in records:
+            role = str(value.get("role", ""))
+            machine_id = str(value.get("machine_fingerprint") or value.get("machine_id") or "")
+            cases = self._passed_cases(value)
+            record_failures = []
+            if role not in self.ROLES:
+                record_failures.append("unknown_role")
+            if not machine_id or machine_id in machine_ids:
+                record_failures.append("missing_or_duplicate_machine")
+            if str(value.get("build_hash", "")) != self.build_hash:
+                record_failures.append("build_hash_mismatch")
+            if value.get("real_windows_11") is not True or safe_int(value.get("windows_build"), 0) < 22000:
+                record_failures.append("not_real_windows_11")
+            if str(value.get("architecture", "")).casefold() != RUNTIME_ARCH_X64:
+                record_failures.append("not_x64")
+            required = set(self.REQUIRED_CASES) | set(self.ROLE_CASES.get(role, ()))
+            missing = sorted(required - cases)
+            if missing:
+                record_failures.append("missing_cases:" + ",".join(missing))
+            if value.get("all_inputs_released_after_exit") is not True:
+                record_failures.append("input_release_not_proven")
+            if value.get("raw_measurements_attached") is not True:
+                record_failures.append("raw_measurements_missing")
+            value["gate_failures"] = record_failures
+            if record_failures:
+                failures.append(value.get("evidence_file", machine_id or role) + ":" + "|".join(record_failures))
+                continue
+            machine_ids.add(machine_id)
+            role_records[role] = value
+            valid.append(value)
+        missing_roles = sorted(set(self.ROLES) - set(role_records))
+        if missing_roles:
+            failures.append("missing_roles:" + ",".join(missing_roles))
+        result = {
+            "schema_version": 1,
+            "build_hash": self.build_hash,
+            "strict_pass": not failures and len(machine_ids) >= 3 and not missing_roles,
+            "independent_machine_count": len(machine_ids),
+            "roles": sorted(role_records),
+            "required_roles": list(self.ROLES),
+            "records": valid,
+            "failures": failures,
+            "fail_closed": True,
+        }
+        output = self.base / "audit" / "real_hardware_release_gate.json"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_json_write(output, result)
+        return result
+
+
 def strict_acceptance_gate(path):
     if os.name != "nt" or not path:
         sys.stdout.write(
@@ -40980,7 +42140,15 @@ def strict_acceptance_gate(path):
         )
         return 1
     report = AcceptanceReport(path)
-    result = report.strict_passed()
+    contract_result = report.strict_passed()
+    hardware_result = RealHardwareReleaseGate(path, report.data.get("build_hash")).evaluate()
+    result = bool(contract_result and hardware_result.get("strict_pass"))
+    report.data["real_hardware_release_gate"] = hardware_result
+    report.data["strict_pass"] = result
+    if not hardware_result.get("strict_pass"):
+        failures = list(report.data.get("failures", []))
+        failures.append("三台独立Windows 11 x64真实硬件发布证据不完整")
+        report.data["failures"] = list(dict.fromkeys(failures))
     sys.stdout.write(json.dumps(report.data, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
     return 0 if result else 1
 
