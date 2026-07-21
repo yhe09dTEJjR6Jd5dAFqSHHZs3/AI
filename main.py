@@ -69,7 +69,7 @@ COARSE_LEN = COARSE_W * COARSE_H * FEATURE_CHANNELS
 SQUARED_DIFF = tuple(value * value for value in range(-255, 256))
 FEATURE_ALGORITHM_VERSION = 4
 ACTION_ALGORITHM_VERSION = 6
-DATABASE_SCHEMA_VERSION = 13
+DATABASE_SCHEMA_VERSION = 14
 MODEL_SCHEMA_VERSION = 5
 POLICY_MODEL_SCHEMA_VERSION = 7
 DEFAULT_POLICY_SCORE_WEIGHTS = {"bc": 60.0, "q": 45.0, "success": 35.0, "risk": 45.0, "ood": 55.0}
@@ -81,11 +81,12 @@ DATA_LINEAGE_SCHEMA_VERSION = 3
 MODALITY_MASK_SCHEMA_VERSION = 2
 MAX_TRAINING_SAMPLES = 24000
 POLICY_ENSEMBLE_SIZE = 5
-POLICY_INPUT_SIZE = 96
-POLICY_HIDDEN_SIZE = 64
-LATENT_STATE_SIZE = 64
-LATENT_ACTION_SIZE = 24
-SEMANTIC_ENCODER_SCHEMA_VERSION = 2
+VISUAL_EMBEDDING_SIZE = 64
+POLICY_INPUT_SIZE = 192
+POLICY_HIDDEN_SIZE = 128
+LATENT_STATE_SIZE = 128
+LATENT_ACTION_SIZE = 32
+SEMANTIC_ENCODER_SCHEMA_VERSION = 3
 SEMANTIC_EMBEDDING_SIZE = 64
 SEMANTIC_VOCAB_LIMIT = 4096
 LATENT_WORLD_ENSEMBLE_SIZE = 5
@@ -171,8 +172,8 @@ AFFORDANCE_NAMES = (
     "advances_scene",
     "irreversible",
 )
-NEURAL_OFFLINE_POLICY_SCHEMA_VERSION = 1
-SEQUENCE_WORLD_MODEL_SCHEMA_VERSION = 1
+NEURAL_OFFLINE_POLICY_SCHEMA_VERSION = 2
+SEQUENCE_WORLD_MODEL_SCHEMA_VERSION = 2
 SEMANTIC_AMBIGUITY_MARGIN = 0.35
 SEMANTIC_TARGET_MIN_CONFIDENCE = 0.30
 MODE_IDLE = "IDLE"
@@ -679,6 +680,45 @@ class ModeResultStatus(str, Enum):
     FAILED = "failed"
 
 
+class QuizQuestionType(str, Enum):
+    ACTION = "action"
+    REGION_IS_NUMERIC = "region_is_numeric"
+    OCR_CONFIRMATION = "ocr_confirmation"
+    OCR_CORRECTION = "ocr_correction"
+    NUMERIC_RELATION = "numeric_relation"
+    CONTEXT_RULE = "context_rule"
+
+
+class NumericGoalRelation(str, Enum):
+    HIGHER_BETTER = "higher_better"
+    LOWER_BETTER = "lower_better"
+    IRRELEVANT = "irrelevant"
+    CONTEXT_DEPENDENT = "context_dependent"
+    UNCERTAIN = "uncertain"
+
+
+@dataclass(slots=True)
+class QuizQuestion:
+    question_id: str
+    question_type: str
+    title: str
+    frame: dict
+    options: list
+    highlighted_regions: list = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
+
+    def to_dict(self):
+        return {
+            "question_id": str(self.question_id),
+            "question_type": str(self.question_type),
+            "title": str(self.title),
+            "frame": dict(self.frame) if isinstance(self.frame, dict) else {},
+            "options": [dict(value) for value in self.options if isinstance(value, dict)],
+            "highlighted_regions": [dict(value) for value in self.highlighted_regions if isinstance(value, dict)],
+            "metadata": dict(self.metadata) if isinstance(self.metadata, dict) else {},
+        }
+
+
 class WorkerMessageKind(str, Enum):
     READY = "ready"
     PROGRESS = "progress"
@@ -987,7 +1027,16 @@ STRICT_ACCEPTANCE_CASES = {
     "人": ("client_only_real_mouse", "capture_modalities_closed_loop"),
     "升级": ("socket_blocked", "model_optimized", "pool_optimized", "deterministic_seed"),
     "AI": ("all_coordinates_in_client", "immutable_snapshot_change_stop"),
-    "做题": ("choices_only", "submit_required", "finish_button", "escape"),
+    "做题": (
+        "structured_questions_only",
+        "action_question",
+        "numeric_region_question",
+        "ocr_confirmation",
+        "numeric_relation_question",
+        "submit_required",
+        "finish_button",
+        "escape",
+    ),
     "弹窗": ("confirm_only", "success_status_only", "error_confirm_only"),
     "停止": (
         "starting",
@@ -1025,7 +1074,7 @@ STRICT_ACCEPTANCE_CASES = {
     "错误恢复": ("input_locked", "rollback", "retry", "no_pressed_buttons", "no_orphan_process", "no_staging"),
 }
 SAMPLE_IMAGE_VERSION = 1
-NEURAL_FEATURE_VERSION = 2
+NEURAL_FEATURE_VERSION = 3
 MODEL_MAX_BYTES = 256 * 1024 * 1024
 REQUIRED_DEFAULT_BUTTONS = {"选择文件夹", "检查文件完整性", "游戏名称", "选择窗口", "人", "升级", "AI", "做题"}
 REQUIRED_CAPTURE_TOGGLES = ("鼠标", "键盘", "手柄", "声音")
@@ -1062,7 +1111,7 @@ VISION_PREPROCESS_SIGNATURE = {
     "content_region": "confirmed_client_content",
     "normalization": "uint8_to_float32_div_255",
     "channel_order": "RGB",
-    "encoder_architecture": 2,
+    "encoder_architecture": 3,
 }
 VISION_PREPROCESS_HASH = hashlib.sha256(
     json.dumps(VISION_PREPROCESS_SIGNATURE, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1176,6 +1225,19 @@ class HardwareSnapshot:
     disk_write_p95_ms: float
 
 
+def physical_core_count():
+    try:
+        import psutil
+
+        value = psutil.cpu_count(logical=False)
+        if value:
+            return max(1, int(value))
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass
+    logical = max(1, int(os.cpu_count() or 1))
+    return max(1, logical // 2 if logical >= 4 else logical)
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimePlan:
     capture_fps: int
@@ -1185,6 +1247,9 @@ class RuntimePlan:
     torch_threads: int
     prototype_limit: int
     backend: str
+    vision_batch_size: int = 8
+    policy_batch_size: int = 24
+    precision: str = "fp32"
 
 
 class ResourceGovernor:
@@ -1193,7 +1258,18 @@ class ResourceGovernor:
         self.lock = threading.RLock()
         self.history = deque(maxlen=self.window_seconds)
         self.state = ResourceState.NORMAL
-        self.plan = RuntimePlan(30, 4, 6, 24, max(1, min(4, os.cpu_count() or 1)), MAX_PROTOTYPES, "windows-x64-cpu")
+        cores = physical_core_count()
+        self.benchmark_profile = {
+            "backend": "windows-x64-cpu",
+            "vision_batch": 8,
+            "policy_batch": 24,
+            "capture_fps": 30,
+            "semantic_interval": 4,
+            "ocr_interval": 6,
+            "precision": "fp32",
+            "torch_threads": cores,
+        }
+        self.plan = self._plan_for_state(ResourceState.NORMAL, "windows-x64-cpu")
         self.recovery_since = None
         self.thread = None
         self.stop_event = threading.Event()
@@ -1203,6 +1279,74 @@ class ResourceGovernor:
         self._process_cpu_previous = (time.monotonic(), time.process_time())
         self._gpu_cache = (0.0, None, None)
         self._last_snapshot = HardwareSnapshot(0.0, 0.0, 0, 0, "windows-x64-cpu", None, None, 0.0, 0.0, 0.0, 0.0)
+
+    def apply_benchmark_profile(self, profile):
+        value = dict(profile) if isinstance(profile, dict) else {}
+        if not value:
+            return self.current_plan()
+        with self.lock:
+            self.benchmark_profile.update(
+                {
+                    "backend": str(
+                        value.get("backend", self.benchmark_profile.get("backend", "windows-x64-cpu"))
+                    ),
+                    "vision_batch": max(
+                        1,
+                        safe_int(
+                            value.get("vision_batch"),
+                            self.benchmark_profile.get("vision_batch", 8),
+                            1,
+                            1024,
+                        ),
+                    ),
+                    "policy_batch": max(
+                        1,
+                        safe_int(
+                            value.get("policy_batch"),
+                            self.benchmark_profile.get("policy_batch", 24),
+                            1,
+                            4096,
+                        ),
+                    ),
+                    "capture_fps": max(
+                        5,
+                        safe_int(
+                            value.get("capture_fps"),
+                            self.benchmark_profile.get("capture_fps", 30),
+                            5,
+                            120,
+                        ),
+                    ),
+                    "semantic_interval": max(
+                        1,
+                        safe_int(
+                            value.get("semantic_interval"),
+                            self.benchmark_profile.get("semantic_interval", 4),
+                            1,
+                            60,
+                        ),
+                    ),
+                    "ocr_interval": max(
+                        1,
+                        safe_int(
+                            value.get("ocr_interval"),
+                            value.get("semantic_interval", 4) + 2,
+                            1,
+                            120,
+                        ),
+                    ),
+                    "precision": str(value.get("precision", self.benchmark_profile.get("precision", "fp32"))),
+                    "torch_threads": max(
+                        1,
+                        min(
+                            physical_core_count(),
+                            safe_int(value.get("torch_threads"), physical_core_count(), 1, 256),
+                        ),
+                    ),
+                }
+            )
+            self.plan = self._plan_for_state(self.state, self.benchmark_profile["backend"])
+            return self.plan
 
     def ensure_started(self):
         with self.lock:
@@ -1471,14 +1615,67 @@ class ResourceGovernor:
                 cache.clear()
             collect_garbage("resource_red", 30.0, previous_state is not ResourceState.RED)
 
-    @staticmethod
-    def _plan_for_state(state, backend):
-        threads = max(1, min(4, os.cpu_count() or 1))
+    def _plan_for_state(self, state, backend):
+        profile = self.benchmark_profile
+
+        def bounded_integer(value, default, minimum, maximum):
+            try:
+                number = int(value)
+            except (TypeError, ValueError, OverflowError):
+                number = int(default)
+            return max(int(minimum), min(int(maximum), number))
+
+        threads = max(
+            1,
+            min(
+                physical_core_count(),
+                bounded_integer(profile.get("torch_threads"), physical_core_count(), 1, 256),
+            ),
+        )
+        capture = bounded_integer(profile.get("capture_fps"), 30, 5, 120)
+        semantic = bounded_integer(profile.get("semantic_interval"), 4, 1, 60)
+        ocr = bounded_integer(profile.get("ocr_interval"), semantic + 2, semantic, 120)
+        vision_batch = bounded_integer(profile.get("vision_batch"), 8, 1, 1024)
+        policy_batch = bounded_integer(profile.get("policy_batch"), 24, 1, 4096)
+        precision = str(profile.get("precision", "fp32"))
         if state is ResourceState.RED:
-            return RuntimePlan(10, 16, 24, 0, min(2, threads), 160, str(backend))
+            return RuntimePlan(
+                max(5, capture // 3),
+                semantic * 4,
+                ocr * 4,
+                0,
+                max(1, threads // 3),
+                160,
+                str(backend),
+                max(1, vision_batch // 4),
+                max(1, policy_batch // 4),
+                precision,
+            )
         if state is ResourceState.YELLOW:
-            return RuntimePlan(20, 7, 12, 12, min(3, threads), 240, str(backend))
-        return RuntimePlan(30, 4, 6, 24, threads, MAX_PROTOTYPES, str(backend))
+            return RuntimePlan(
+                max(10, capture * 2 // 3),
+                max(2, semantic * 2),
+                max(3, ocr * 2),
+                max(1, policy_batch // 2),
+                max(1, threads * 2 // 3),
+                240,
+                str(backend),
+                max(1, vision_batch // 2),
+                max(1, policy_batch // 2),
+                precision,
+            )
+        return RuntimePlan(
+            capture,
+            semantic,
+            ocr,
+            policy_batch,
+            threads,
+            MAX_PROTOTYPES,
+            str(backend),
+            vision_batch,
+            policy_batch,
+            precision,
+        )
 
     def _run(self):
         while not self.stop_event.is_set():
@@ -1517,7 +1714,7 @@ def configure_torch_runtime(torch_module, plan=None):
     global _TORCH_INTEROP_CONFIGURED
     value = plan or RESOURCE_GOVERNOR.current_plan()
     try:
-        torch_module.set_num_threads(max(1, min(4, int(value.torch_threads))))
+        torch_module.set_num_threads(max(1, min(physical_core_count(), int(value.torch_threads))))
     except (RuntimeError, AttributeError, TypeError, ValueError):
         pass
     if not _TORCH_INTEROP_CONFIGURED:
@@ -1527,6 +1724,245 @@ def configure_torch_runtime(torch_module, plan=None):
         except (RuntimeError, AttributeError, TypeError, ValueError):
             pass
     return value
+
+
+def run_startup_microbenchmark(base, torch_module=None, device=None, backend="windows-x64-cpu", force=False):
+    root = Path(base)
+    manifest_dir = root / "manifests"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    path = manifest_dir / "hardware_profile.json"
+    physical = physical_core_count()
+    logical = max(1, int(os.cpu_count() or 1))
+    fingerprint = {
+        "schema_version": 2,
+        "backend": str(backend),
+        "physical_cores": physical,
+        "logical_cores": logical,
+        "torch_version": str(getattr(torch_module, "__version__", "")),
+        "platform": sys.platform,
+        "python": list(sys.version_info[:3]),
+    }
+    fingerprint_hash = hashlib.sha256(canonical_bytes(fingerprint)).hexdigest()
+    if path.is_file() and not force:
+        try:
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            if cached.get("fingerprint") == fingerprint_hash and safe_int(cached.get("schema_version"), 0) == 2:
+                RESOURCE_GOVERNOR.apply_benchmark_profile(cached)
+                return cached
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+    profile = {
+        **fingerprint,
+        "fingerprint": fingerprint_hash,
+        "created": time.time(),
+        "vision_batch": 8,
+        "policy_batch": 24,
+        "capture_fps": 30,
+        "semantic_interval": 4,
+        "ocr_interval": 6,
+        "precision": "fp32",
+        "torch_threads": physical,
+        "vision_latency_ms": 0.0,
+        "vision_throughput_fps": 0.0,
+        "training_step_ms": 0.0,
+        "free_vram": 0,
+        "capture_training_interference_ratio": 1.0,
+        "capture_training_interference_tested": False,
+    }
+
+    def median_ms(callable_value, repetitions=3):
+        values = []
+        for _ in range(max(1, repetitions)):
+            started = time.perf_counter()
+            callable_value()
+            values.append((time.perf_counter() - started) * 1000.0)
+        return statistics.median(values)
+
+    if torch_module is not None:
+        torch = torch_module
+        target_device = device if device is not None else torch.device("cpu")
+        is_cuda = bool(str(target_device).startswith("cuda") and torch.cuda.is_available())
+        profile["precision"] = "fp16" if is_cuda else "fp32"
+        if is_cuda:
+            try:
+                free_vram, _ = torch.cuda.mem_get_info(target_device)
+                profile["free_vram"] = int(free_vram)
+            except (RuntimeError, AttributeError, TypeError):
+                profile["free_vram"] = 0
+        if str(target_device) == "cpu":
+            thread_candidates = sorted(set([1, 2, 4, 6, 8, physical, max(1, physical // 2)]))
+            thread_candidates = [value for value in thread_candidates if value <= physical]
+            thread_timings = {}
+            left = torch.randn((384, 384), dtype=torch.float32)
+            right = torch.randn((384, 384), dtype=torch.float32)
+            for threads in thread_candidates:
+                try:
+                    torch.set_num_threads(threads)
+                    _ = left @ right
+                    timing = median_ms(lambda: left @ right, 2)
+                    thread_timings[str(threads)] = timing
+                except (RuntimeError, ValueError, TypeError):
+                    continue
+            if thread_timings:
+                optimal = min(thread_timings, key=lambda key: thread_timings[key])
+                profile["torch_threads"] = max(1, min(physical, int(optimal)))
+                profile["thread_benchmark_ms"] = thread_timings
+                try:
+                    torch.set_num_threads(profile["torch_threads"])
+                except (RuntimeError, ValueError, TypeError):
+                    pass
+        try:
+            vision = torch.nn.Sequential(
+                torch.nn.Conv2d(3, 32, 3, padding=1, bias=False),
+                torch.nn.Hardswish(),
+                torch.nn.Conv2d(32, 32, 3, padding=1, groups=32, bias=False),
+                torch.nn.Hardswish(),
+                torch.nn.Conv2d(32, 64, 1, bias=False),
+                torch.nn.Hardswish(),
+                torch.nn.AdaptiveAvgPool2d(1),
+            ).to(target_device).eval()
+            batch_candidates = [1, 4, 8, 16, 24, 32, 48, 64, 96, 128]
+            if not is_cuda:
+                batch_candidates = [1, 2, 4, 8, 12, 16, 24, 32]
+            timings = {}
+            best_batch = 1
+            for batch in batch_candidates:
+                try:
+                    tensor = torch.randn((batch, 3, FEATURE_H, FEATURE_W), device=target_device)
+                    with torch.inference_mode():
+                        _ = vision(tensor)
+                        if is_cuda:
+                            torch.cuda.synchronize()
+                        timing = median_ms(
+                            lambda: vision(tensor),
+                            3,
+                        )
+                        if is_cuda:
+                            torch.cuda.synchronize()
+                    timings[str(batch)] = timing
+                    per_frame = timing / batch
+                    if timing <= 180.0 and per_frame <= 35.0:
+                        best_batch = batch
+                    del tensor
+                except RuntimeError as error:
+                    if "out of memory" in str(error).casefold() and is_cuda:
+                        torch.cuda.empty_cache()
+                        break
+                    continue
+            profile["vision_batch"] = best_batch
+            selected_timing = safe_float(timings.get(str(best_batch)), 0.0)
+            profile["vision_latency_ms"] = selected_timing / max(1, best_batch)
+            profile["vision_throughput_fps"] = 1000.0 * best_batch / max(0.001, selected_timing)
+            profile["vision_batch_benchmark_ms"] = timings
+            if profile["vision_latency_ms"] <= 12.0:
+                profile["capture_fps"] = 45
+                profile["semantic_interval"] = 2
+            elif profile["vision_latency_ms"] <= 25.0:
+                profile["capture_fps"] = 30
+                profile["semantic_interval"] = 3
+            else:
+                profile["capture_fps"] = 20
+                profile["semantic_interval"] = 5
+            profile["ocr_interval"] = max(profile["semantic_interval"] + 2, 4)
+
+            policy = torch.nn.Sequential(
+                torch.nn.Linear(POLICY_INPUT_SIZE + LATENT_ACTION_SIZE, POLICY_HIDDEN_SIZE),
+                torch.nn.Tanh(),
+                torch.nn.Linear(POLICY_HIDDEN_SIZE, POLICY_HIDDEN_SIZE),
+                torch.nn.Tanh(),
+                torch.nn.Linear(POLICY_HIDDEN_SIZE, 8),
+            ).to(target_device)
+            optimizer = torch.optim.AdamW(policy.parameters(), lr=0.001)
+            policy_timings = {}
+            policy_batch = 8
+            candidates = [8, 16, 32, 64, 96, 128, 192, 256, 384, 512]
+            if not is_cuda:
+                candidates = [8, 16, 24, 32, 48, 64, 96, 128]
+            for batch in candidates:
+                try:
+                    tensor = torch.randn((batch, POLICY_INPUT_SIZE + LATENT_ACTION_SIZE), device=target_device)
+                    target = torch.randn((batch, 8), device=target_device)
+                    def training_step():
+                        optimizer.zero_grad(set_to_none=True)
+                        loss = (policy(tensor) - target).pow(2).mean()
+                        loss.backward()
+                        optimizer.step()
+                    training_step()
+                    if is_cuda:
+                        torch.cuda.synchronize()
+                    timing = median_ms(training_step, 2)
+                    if is_cuda:
+                        torch.cuda.synchronize()
+                    policy_timings[str(batch)] = timing
+                    if timing <= 120.0:
+                        policy_batch = batch
+                    del tensor, target
+                except RuntimeError as error:
+                    if "out of memory" in str(error).casefold() and is_cuda:
+                        torch.cuda.empty_cache()
+                        break
+                    continue
+            profile["policy_batch"] = policy_batch
+            profile["training_step_ms"] = safe_float(policy_timings.get(str(policy_batch)), 0.0)
+            profile["policy_batch_benchmark_ms"] = policy_timings
+
+            probe = torch.randn((1, 3, FEATURE_H, FEATURE_W), device=target_device)
+            with torch.inference_mode():
+                baseline = median_ms(lambda: vision(probe), 4)
+            stop = threading.Event()
+            training_tensor = torch.randn(
+                (max(8, min(policy_batch, 64)), POLICY_INPUT_SIZE + LATENT_ACTION_SIZE),
+                device=target_device,
+            )
+            training_target = torch.zeros((training_tensor.shape[0], 8), device=target_device)
+            def background_training():
+                while not stop.is_set():
+                    optimizer.zero_grad(set_to_none=True)
+                    loss = (policy(training_tensor) - training_target).pow(2).mean()
+                    loss.backward()
+                    optimizer.step()
+            worker = threading.Thread(target=background_training, daemon=True)
+            worker.start()
+            interruptible_wait(None, 0.05)
+            with torch.inference_mode():
+                interfered = median_ms(lambda: vision(probe), 4)
+            stop.set()
+            worker.join(0.5)
+            profile["capture_training_interference_ratio"] = interfered / max(0.001, baseline)
+            profile["capture_training_interference_tested"] = True
+            if profile["capture_training_interference_ratio"] > 1.5:
+                profile["policy_batch"] = max(8, profile["policy_batch"] // 2)
+                profile["capture_fps"] = max(15, profile["capture_fps"] - 10)
+            optimizer.zero_grad(set_to_none=True)
+            del vision, policy, optimizer, probe, training_tensor, training_target
+            if is_cuda:
+                torch.cuda.empty_cache()
+        except (RuntimeError, AttributeError, TypeError, ValueError) as error:
+            profile["benchmark_error"] = type(error).__name__ + ":" + str(error)
+    else:
+        numpy_module = FEATURE_ENGINE.optional_numpy()
+        if numpy_module is not None:
+            left = numpy_module.random.default_rng(7).standard_normal((256, 256), dtype=numpy_module.float32)
+            right = numpy_module.random.default_rng(11).standard_normal((256, 256), dtype=numpy_module.float32)
+            profile["numpy_matrix_ms"] = median_ms(lambda: left @ right, 3)
+            profile["vision_batch"] = 4
+            profile["policy_batch"] = 16
+            profile["capture_fps"] = 20
+            profile["semantic_interval"] = 5
+            profile["ocr_interval"] = 8
+
+    profile["checksum"] = hashlib.sha256(
+        canonical_bytes({key: value for key, value in profile.items() if key != "checksum"})
+    ).hexdigest()
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(profile, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+    RESOURCE_GOVERNOR.apply_benchmark_profile(profile)
+    return profile
 
 
 def wait_for_runtime_training_plan(stop_event=None):
@@ -3258,7 +3694,7 @@ class ResourceShutdownBarrier:
 def finite_number(value):
     try:
         return math.isfinite(float(value))
-    except RECOVERABLE_ERRORS:
+    except (TypeError, ValueError, OverflowError):
         return False
 
 
@@ -11638,6 +12074,190 @@ class ModeSession:
         return False
 
 
+NUMERIC_REGION_QUESTION_CACHE = BoundedTTLMap(maximum=4096, ttl_seconds=6 * 3600.0)
+
+
+def _valid_norm_rect(value):
+    if not isinstance(value, (list, tuple)) or len(value) < 4:
+        return None
+    norm = [round(max(0.0, min(1.0, safe_float(item))), 8) for item in value[:4]]
+    if norm[2] <= 0.0 or norm[3] <= 0.0 or norm[0] + norm[2] > 1.000001 or norm[1] + norm[3] > 1.000001:
+        return None
+    return norm
+
+
+def numeric_region_cache_key(game_id, candidate):
+    bbox = _valid_norm_rect((candidate or {}).get("bbox") or (candidate or {}).get("region_norm")) or [0, 0, 0, 0]
+    attributes = (candidate or {}).get("attributes") if isinstance((candidate or {}).get("attributes"), dict) else {}
+    track_id = str(attributes.get("track_id") or (candidate or {}).get("track_id") or "")
+    quantized = ",".join(str(round(value, 2)) for value in bbox)
+    return str(game_id) + "|" + (track_id if track_id else quantized)
+
+
+def mark_numeric_region_asked(game_id, candidate):
+    NUMERIC_REGION_QUESTION_CACHE[numeric_region_cache_key(game_id, candidate)] = time.time()
+
+
+def build_numeric_region_candidates(frame, game_id, store, ocr_runtime=None, maximum=1):
+    """Build high-information numeric-region candidates without changing the main UI surface."""
+    item = frame if isinstance(frame, dict) else {}
+    existing = []
+    try:
+        existing = store.list_ocr_regions(game_id, False) if store is not None else []
+    except RECOVERABLE_ERRORS:
+        existing = []
+    raw = []
+    for target in item.get("semantic_targets", []) if isinstance(item.get("semantic_targets"), list) else []:
+        if not isinstance(target, dict):
+            continue
+        bbox = _valid_norm_rect(target.get("bbox") or target.get("region_norm"))
+        if bbox is None:
+            continue
+        text = str(target.get("text", "")).strip()
+        parsed = parse_ocr_number(text) if text else {"valid": False, "confidence": 0.0}
+        object_class = str(target.get("class", target.get("generic_class", ""))).casefold()
+        digit_like = sum(character.isdigit() or character in "OoIlBSZ.,:/%+-" for character in text)
+        text_ratio = digit_like / max(1, len(text.replace(" ", ""))) if text else 0.0
+        numeric_probability = max(
+            0.98 if object_class == "number" else 0.80 if object_class == "meter" else 0.0,
+            0.92 if parsed.get("valid") else min(0.80, text_ratio),
+        )
+        if numeric_probability < 0.46 and object_class not in {"number", "meter"}:
+            continue
+        raw.append(
+            {
+                "bbox": bbox,
+                "text": text,
+                "parsed": parsed,
+                "confidence": safe_float(target.get("confidence", 0.0), 0.0, 0.0, 1.0),
+                "class": object_class or "unknown",
+                "attributes": dict(target.get("attributes", {})) if isinstance(target.get("attributes"), dict) else {},
+                "numeric_probability": numeric_probability,
+                "source": str(target.get("source", "semantic_target")),
+            }
+        )
+    for definition in existing:
+        bbox = _valid_norm_rect(definition.get("region_norm"))
+        if bbox is None:
+            continue
+        relation = str(definition.get("goal_relation", "uncertain"))
+        region_type = str(definition.get("region_type", "uncertain"))
+        confidence = safe_float(definition.get("last_confidence", 0.0), 0.0, 0.0, 1.0)
+        stable = safe_int(definition.get("stable_frames", 0), 0, 0, 1000)
+        needs_review = region_type == "uncertain" or relation == "uncertain" or confidence < 0.65 or stable < 3
+        if not needs_review:
+            continue
+        text = str(definition.get("last_text", ""))
+        raw.append(
+            {
+                "bbox": bbox,
+                "text": text,
+                "parsed": parse_ocr_number(text, definition.get("number_format", "auto")),
+                "confidence": confidence,
+                "class": "number" if region_type == "number" else region_type,
+                "attributes": {"region_id": definition.get("id"), "stable_frames": stable},
+                "numeric_probability": 0.96 if region_type == "number" else 0.66,
+                "source": "existing_ocr_region",
+                "definition": dict(definition),
+            }
+        )
+    deduplicated = []
+    for candidate in sorted(raw, key=lambda value: value.get("numeric_probability", 0.0), reverse=True):
+        if any(_rect_iou(candidate["bbox"], old["bbox"]) >= 0.72 for old in deduplicated):
+            continue
+        deduplicated.append(candidate)
+    for candidate in deduplicated[:8]:
+        if ocr_runtime is not None and getattr(ocr_runtime, "ready", False):
+            try:
+                recognized = ocr_runtime.recognize_region(item, candidate["bbox"])
+                recognized_text = str(recognized.get("text", "")).strip()
+                if recognized_text or not candidate.get("text"):
+                    candidate["text"] = recognized_text
+                    candidate["confidence"] = safe_float(recognized.get("confidence", 0.0), 0.0, 0.0, 1.0)
+                    candidate["parsed"] = parse_ocr_number(recognized_text)
+            except RECOVERABLE_ERRORS:
+                pass
+        overlap = max((_rect_iou(candidate["bbox"], value.get("region_norm", [])) for value in existing), default=0.0)
+        stable_frames = safe_int((candidate.get("attributes") or {}).get("stable_frames", 0), 0, 0, 1000)
+        temporal_stability = min(1.0, stable_frames / 5.0)
+        if (candidate.get("attributes") or {}).get("track_id"):
+            temporal_stability = max(temporal_stability, 0.65)
+        region_novelty = 1.0 if overlap < 0.20 else 0.35 if overlap < 0.70 else 0.0
+        policy_relevance = max(
+            safe_float(candidate.get("confidence", 0.0), 0.0, 0.0, 1.0),
+            0.85 if candidate.get("class") in {"number", "meter"} else 0.35,
+        )
+        parse_confidence = safe_float((candidate.get("parsed") or {}).get("confidence", 0.0), 0.0, 0.0, 1.0)
+        ocr_ambiguity = 1.0 - parse_confidence if candidate.get("text") else 0.85
+        score = (
+            2.0 * safe_float(candidate.get("numeric_probability", 0.0), 0.0)
+            + 1.5 * temporal_stability
+            + 1.2 * region_novelty
+            + 1.0 * policy_relevance
+            + 0.8 * ocr_ambiguity
+        )
+        if NUMERIC_REGION_QUESTION_CACHE.get(numeric_region_cache_key(game_id, candidate)) is not None:
+            score -= 4.0
+        candidate.update(
+            {
+                "score": round(score, 6),
+                "temporal_stability": temporal_stability,
+                "region_novelty": region_novelty,
+                "policy_relevance": policy_relevance,
+                "ocr_ambiguity": ocr_ambiguity,
+            }
+        )
+    ranked = sorted(deduplicated, key=lambda value: value.get("score", -999.0), reverse=True)
+    return [dict(value) for value in ranked[: max(0, int(maximum))] if value.get("score", -999.0) > 0.0]
+
+
+def action_quiz_question(frame, choices):
+    options = []
+    for index, entry in enumerate(list(choices)[:4]):
+        options.append(
+            {
+                "code": chr(65 + index),
+                "label": str(entry.get("guidance_label") or "动作" + chr(65 + index)),
+                "value": "choose",
+                "entry": dict(entry),
+            }
+        )
+    options.append({"code": "E", "label": "跳过（未标注）", "value": "skip", "entry": {}})
+    return QuizQuestion(
+        question_id="action|" + uuid.uuid4().hex,
+        question_type=QuizQuestionType.ACTION.value,
+        title="当前画面中，AI 应该执行哪个动作？",
+        frame=frame,
+        options=options,
+        metadata={"instruction": "先选择 A–D 动作或 E 跳过，再点击“提交”。"},
+    ).to_dict()
+
+
+def numeric_region_quiz_question(frame, candidate):
+    text = str(candidate.get("text", ""))
+    parsed = dict(candidate.get("parsed", {})) if isinstance(candidate.get("parsed"), dict) else {}
+    return QuizQuestion(
+        question_id="numeric_region|" + uuid.uuid4().hex,
+        question_type=QuizQuestionType.REGION_IS_NUMERIC.value,
+        title="橙色荧光框 N1 中的内容是否是数字或数值状态？",
+        frame=frame,
+        options=[
+            {"code": "A", "label": "是数字", "value": "number"},
+            {"code": "B", "label": "是数字与上限，例如 35/100", "value": "current_max"},
+            {"code": "C", "label": "是倒计时", "value": "countdown"},
+            {"code": "D", "label": "不是数字", "value": "not_numeric"},
+            {"code": "E", "label": "无法判断", "value": "uncertain"},
+        ],
+        highlighted_regions=[{"label": "N1", "bbox": list(candidate.get("bbox", [])), "color": "#ff8c00"}],
+        metadata={
+            "candidate": dict(candidate),
+            "recognized_text": text,
+            "parsed": parsed,
+            "instruction": "该问题用于监督对象类型、OCR 结果和数值目标语义。",
+        },
+    ).to_dict()
+
+
 class AskQuestionProducer:
     def __init__(self, app, frame_buffer, prototypes, historical, sources, game_id, model_version):
         self.app = app
@@ -11838,11 +12458,51 @@ class AskQuestionProducer:
             try:
                 frame, ranked, decision = self._select_frame(payload)
                 choices, candidates = self._make_choices(frame, ranked)
+                questions = [action_quiz_question(frame, choices)]
+                numeric_candidates = []
+                should_ask_numeric = self.counter % 4 == 0
+                numeric_triggers = {
+                    "unknown_numeric_region",
+                    "low_ocr_confidence",
+                    "ocr_temporal_disagreement",
+                    "numeric_relation_unknown",
+                    "numeric_direction_conflict",
+                    "numeric_value_correlated_with_policy_uncertainty",
+                }
+                if numeric_triggers.intersection(set(decision.get("guidance_trigger", []))):
+                    should_ask_numeric = True
+                if should_ask_numeric:
+                    numeric_candidates = build_numeric_region_candidates(
+                        frame,
+                        self.game_id,
+                        self.app.store,
+                        getattr(self.app, "ocr_runtime", None),
+                        1,
+                    )
+                    if numeric_candidates:
+                        numeric_candidate = numeric_candidates[0]
+                        questions.append(numeric_region_quiz_question(frame, numeric_candidate))
+                        mark_numeric_region_asked(self.game_id, numeric_candidate)
+                        trigger_values = list(decision.get("guidance_trigger", []))
+                        if str(numeric_candidate.get("source")) != "existing_ocr_region":
+                            trigger_values.append("unknown_numeric_region")
+                        if safe_float((numeric_candidate.get("parsed") or {}).get("confidence", 0.0), 0.0) < 0.72:
+                            trigger_values.append("low_ocr_confidence")
+                        definition = (
+                            numeric_candidate.get("definition")
+                            if isinstance(numeric_candidate.get("definition"), dict)
+                            else {}
+                        )
+                        if str(definition.get("goal_relation", "uncertain")) == "uncertain":
+                            trigger_values.append("numeric_relation_unknown")
+                        decision["guidance_trigger"] = list(dict.fromkeys(trigger_values))
                 self.counter += 1
                 self._put_result(
                     {
                         "frame": frame,
+                        "questions": questions,
                         "choices": choices,
+                        "numeric_candidates": numeric_candidates,
                         "candidates": candidates,
                         "decision": decision,
                         "guidance_trigger": decision.get("guidance_trigger", []),
@@ -11852,7 +12512,7 @@ class AskQuestionProducer:
             except InputStopped:
                 break
             except Exception as error:
-                self._put_result({"frame": None, "choices": [], "candidates": [], "error": str(error)})
+                self._put_result({"frame": None, "questions": [], "choices": [], "candidates": [], "error": str(error)})
 
     def get_result(self, timeout=0.0):
         try:
@@ -14554,124 +15214,246 @@ def _serialize_dense_network(network):
         layers.append(
             {"weight": layer.weight.detach().to("cpu").tolist(), "bias": layer.bias.detach().to("cpu").tolist()}
         )
-    return {"layers": layers, "activation": "tanh"}
+    return {
+        "layers": layers,
+        "activation": "tanh",
+        "quantization": {
+            "scheme": "dynamic_int8",
+            "weight_granularity": "per_output_channel",
+            "activation_granularity": "per_row",
+            "fallback": "float32",
+        },
+    }
 
 
-def _dense_network_forward(payload, values):
-    vector = [safe_float(value, 0.0, -8.0, 8.0) for value in values]
+_SERIALIZED_NETWORK_CACHE = BoundedTTLMap(256, 1800.0)
+
+
+def _dense_network_forward_batch(payload, values_batch):
+    rows = [list(values) for values in (values_batch or [])]
+    if not rows:
+        return []
     layers = payload.get("layers", []) if isinstance(payload, dict) else []
+    if not layers:
+        return rows
+    numpy_module = FEATURE_ENGINE.optional_numpy()
+    if numpy_module is not None:
+        cache_key = str(id(payload)) + "|" + str(len(layers))
+        cached = _SERIALIZED_NETWORK_CACHE.get(cache_key)
+        if cached is None:
+            converted = []
+            for layer in layers:
+                weight = numpy_module.asarray(layer.get("weight", []), dtype=numpy_module.float32)
+                bias = numpy_module.asarray(layer.get("bias", []), dtype=numpy_module.float32)
+                if weight.ndim == 2 and weight.size:
+                    weight_scale = numpy_module.maximum(
+                        numpy_module.max(numpy_module.abs(weight), axis=1),
+                        numpy_module.float32(1e-8),
+                    ) / numpy_module.float32(127.0)
+                    quantized_weight = numpy_module.clip(
+                        numpy_module.rint(weight / weight_scale[:, None]), -127, 127
+                    ).astype(numpy_module.int8)
+                else:
+                    weight_scale = numpy_module.asarray([], dtype=numpy_module.float32)
+                    quantized_weight = numpy_module.asarray([], dtype=numpy_module.int8)
+                converted.append((weight, bias, quantized_weight, weight_scale))
+            cached = tuple(converted)
+            _SERIALIZED_NETWORK_CACHE[cache_key] = cached
+        width = int(cached[0][0].shape[1]) if cached and cached[0][0].ndim == 2 else len(rows[0])
+        normalized = [
+            [safe_float(value, 0.0, -8.0, 8.0) for value in (list(row) + [0.0] * width)[:width]]
+            for row in rows
+        ]
+        matrix = numpy_module.asarray(normalized, dtype=numpy_module.float32)
+        quantization = payload.get("quantization", {}) if isinstance(payload, dict) else {}
+        use_dynamic_int8 = bool(
+            isinstance(quantization, dict)
+            and quantization.get("scheme") == "dynamic_int8"
+            and len(rows) >= 4
+        )
+        for index, (weight, bias, quantized_weight, weight_scale) in enumerate(cached):
+            if weight.ndim != 2:
+                return [[] for _ in rows]
+            if matrix.shape[1] != weight.shape[1]:
+                if matrix.shape[1] < weight.shape[1]:
+                    matrix = numpy_module.pad(matrix, ((0, 0), (0, weight.shape[1] - matrix.shape[1])))
+                else:
+                    matrix = matrix[:, : weight.shape[1]]
+            if use_dynamic_int8 and quantized_weight.ndim == 2 and quantized_weight.size:
+                activation_scale = numpy_module.maximum(
+                    numpy_module.max(numpy_module.abs(matrix), axis=1),
+                    numpy_module.float32(1e-8),
+                ) / numpy_module.float32(127.0)
+                quantized_activation = numpy_module.clip(
+                    numpy_module.rint(matrix / activation_scale[:, None]), -127, 127
+                ).astype(numpy_module.int8)
+                accumulated = (
+                    quantized_activation.astype(numpy_module.int32)
+                    @ quantized_weight.T.astype(numpy_module.int32)
+                )
+                matrix = (
+                    accumulated.astype(numpy_module.float32)
+                    * activation_scale[:, None]
+                    * weight_scale[None, :]
+                    + bias
+                )
+            else:
+                matrix = matrix @ weight.T + bias
+            if index + 1 < len(cached):
+                matrix = numpy_module.tanh(matrix)
+        return matrix.astype(numpy_module.float64).tolist()
+    vectors = [[safe_float(value, 0.0, -8.0, 8.0) for value in row] for row in rows]
     for index, layer in enumerate(layers):
         weight = layer.get("weight", []) if isinstance(layer, dict) else []
         bias = layer.get("bias", []) if isinstance(layer, dict) else []
-        output = []
-        for row, row_bias in zip(weight, bias):
-            raw = sum(value * safe_float(coefficient, 0.0) for value, coefficient in zip(vector, row)) + safe_float(
-                row_bias, 0.0
-            )
-            output.append(math.tanh(raw) if index + 1 < len(layers) else raw)
-        vector = output
-    return vector
+        outputs = []
+        for vector in vectors:
+            output = []
+            for row, row_bias in zip(weight, bias):
+                raw = sum(
+                    safe_float(value, 0.0) * safe_float(coefficient, 0.0)
+                    for value, coefficient in zip(vector, row)
+                ) + safe_float(row_bias, 0.0)
+                output.append(math.tanh(raw) if index + 1 < len(layers) else raw)
+            outputs.append(output)
+        vectors = outputs
+    return vectors
 
 
-def _average_dense_networks(payloads):
-    values = [payload for payload in payloads if isinstance(payload, dict) and isinstance(payload.get("layers"), list)]
-    if not values:
-        return {"layers": [], "activation": "tanh"}
-    layers = []
-    for layer_index in range(len(values[0]["layers"])):
-        source = [payload["layers"][layer_index] for payload in values]
-        rows = len(source[0]["weight"])
-        columns = len(source[0]["weight"][0]) if rows else 0
-        weight = [
-            [
-                statistics.fmean(safe_float(layer["weight"][row][column], 0.0) for layer in source)
-                for column in range(columns)
-            ]
-            for row in range(rows)
-        ]
-        bias = [statistics.fmean(safe_float(layer["bias"][row], 0.0) for layer in source) for row in range(rows)]
-        layers.append({"weight": weight, "bias": bias})
-    return {"layers": layers, "activation": "tanh"}
+def _dense_network_forward(payload, values):
+    output = _dense_network_forward_batch(payload, [values])
+    return output[0] if output else []
 
 
-def neural_offline_policy_prediction(model, observation, action_id, task_id="default"):
+def _policy_member_batch(member, states, actions):
+    encoded = (
+        _dense_network_forward_batch(member.get("encoder", {}), states)
+        if isinstance(member.get("encoder"), dict) and member.get("encoder", {}).get("layers")
+        else [list(state) for state in states]
+    )
+    pairs = [list(state) + list(action) for state, action in zip(encoded, actions)]
+    return {
+        "q1": _dense_network_forward_batch(member.get("q1", {}), pairs),
+        "q2": _dense_network_forward_batch(member.get("q2", {}), pairs),
+        "v": _dense_network_forward_batch(member.get("v", {}), encoded),
+        "policy": _dense_network_forward_batch(member.get("policy", {}), pairs),
+        "risk": _dense_network_forward_batch(member.get("risk", {}), pairs),
+        "outcome": _dense_network_forward_batch(member.get("outcome", {}), pairs),
+        "dynamics": _dense_network_forward_batch(member.get("dynamics", {}), pairs)
+        if isinstance(member.get("dynamics"), dict)
+        else [],
+    }
+
+
+def neural_offline_policy_predictions(model, observation, action_ids, task_id="default"):
     value = model if isinstance(model, dict) else {}
     bundle = value.get("neural_bundle", {}) if isinstance(value.get("neural_bundle"), dict) else {}
-    if not bundle.get("trained"):
+    actions_requested = [str(action) for action in action_ids or []]
+    if not bundle.get("trained") or not actions_requested:
         return {}
     state = _policy_state_vector(observation, task_id, bundle.get("semantic_encoder"))
-    action = _policy_action_vector(action_id, None, bundle.get("semantic_encoder"))
-    members = bundle.get("ensemble", []) if isinstance(bundle.get("ensemble"), list) else []
-    distilled = (bundle.get("distillation", {}) if isinstance(bundle.get("distillation"), dict) else {}).get("member")
-    if isinstance(distilled, dict):
-        members = [distilled, *members]
-    predictions = []
-    for member in members:
-        if not isinstance(member, dict):
-            continue
-        pair = state + action
-        q1 = (_dense_network_forward(member.get("q1", {}), pair) + [0.0])[0]
-        q2 = (_dense_network_forward(member.get("q2", {}), pair) + [0.0])[0]
-        state_value = (_dense_network_forward(member.get("v", {}), state) + [0.0])[0]
-        policy_logit = (_dense_network_forward(member.get("policy", {}), pair) + [0.0])[0]
-        risk_logit = (_dense_network_forward(member.get("risk", {}), pair) + [0.0])[0]
-        outcome = _dense_network_forward(member.get("outcome", {}), pair)
-        maximum = max(outcome, default=0.0)
-        probabilities = [math.exp(max(-30.0, min(30.0, entry - maximum))) for entry in outcome]
-        denominator = sum(probabilities) or 1.0
-        probabilities = [entry / denominator for entry in probabilities]
-        predictions.append(
-            {
-                "q1": q1,
-                "q2": q2,
-                "q": min(q1, q2),
-                "v": state_value,
-                "policy_logit": policy_logit,
-                "policy_probability": 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, policy_logit)))),
-                "risk": 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, risk_logit)))),
-                "success": probabilities[1] if len(probabilities) > 1 else 0.0,
-                "failure": probabilities[2] if len(probabilities) > 2 else 0.0,
-            }
-        )
-    if not predictions:
+    action_vectors = [
+        _policy_action_vector(action, None, bundle.get("semantic_encoder")) for action in actions_requested
+    ]
+    states = [state for _ in action_vectors]
+    members = [member for member in bundle.get("ensemble", []) if isinstance(member, dict)]
+    outputs = [_policy_member_batch(member, states, action_vectors) for member in members]
+    if not outputs:
         return {}
     support_map = bundle.get("task_action_support", {}) if isinstance(bundle.get("task_action_support"), dict) else {}
     task = normalized_identifier(task_id, "default", 96)
-    row = support_map.get(task, {}) if isinstance(support_map.get(task), dict) else {}
-    support = safe_int(row.get(str(action_id), 0), 0)
-    maximum_support = max((safe_int(entry, 0) for entry in row.values()), default=0)
-    support_probability = support / max(1, maximum_support) if maximum_support else 0.0
-    q_values = [entry["q"] for entry in predictions]
-    policy_values = [entry["policy_logit"] for entry in predictions]
-    risk_values = [entry["risk"] for entry in predictions]
-    uncertainty = min(
-        1.0,
-        max(
-            statistics.pstdev(q_values) if len(q_values) > 1 else 0.0,
-            statistics.pstdev(policy_values) if len(policy_values) > 1 else 0.0,
-            statistics.pstdev(risk_values) if len(risk_values) > 1 else 0.0,
+    support_row = support_map.get(task, {}) if isinstance(support_map.get(task), dict) else {}
+    maximum_support = max((safe_int(entry, 0) for entry in support_row.values()), default=0)
+    result = {}
+    for action_index, action_id in enumerate(actions_requested):
+        predictions = []
+        for output in outputs:
+            q1 = safe_float((output["q1"][action_index] + [0.0])[0], 0.0)
+            q2 = safe_float((output["q2"][action_index] + [0.0])[0], 0.0)
+            state_value = safe_float((output["v"][action_index] + [0.0])[0], 0.0)
+            policy_logit = safe_float((output["policy"][action_index] + [0.0])[0], 0.0)
+            risk_logit = safe_float((output["risk"][action_index] + [0.0])[0], 0.0)
+            outcome = output["outcome"][action_index]
+            maximum = max(outcome, default=0.0)
+            probabilities = [math.exp(max(-30.0, min(30.0, entry - maximum))) for entry in outcome]
+            denominator = sum(probabilities) or 1.0
+            probabilities = [entry / denominator for entry in probabilities]
+            predictions.append(
+                {
+                    "q1": q1,
+                    "q2": q2,
+                    "q": min(q1, q2),
+                    "v": state_value,
+                    "policy_logit": policy_logit,
+                    "policy_probability": 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, policy_logit)))),
+                    "risk": 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, risk_logit)))),
+                    "success": probabilities[1] if len(probabilities) > 1 else 0.0,
+                    "failure": probabilities[2] if len(probabilities) > 2 else 0.0,
+                }
+            )
+        support = safe_int(support_row.get(action_id, 0), 0)
+        support_probability = support / max(1, maximum_support) if maximum_support else 0.0
+        q_values = [entry["q"] for entry in predictions]
+        policy_values = [entry["policy_logit"] for entry in predictions]
+        risk_values = [entry["risk"] for entry in predictions]
+        uncertainty = min(
+            1.0,
+            max(
+                statistics.pstdev(q_values) if len(q_values) > 1 else 0.0,
+                statistics.pstdev(policy_values) if len(policy_values) > 1 else 0.0,
+                statistics.pstdev(risk_values) if len(risk_values) > 1 else 0.0,
+            )
+            + 1.0 / math.sqrt(max(1, support)),
         )
-        + 1.0 / math.sqrt(max(1, support)),
-    )
-    policy_probability = (
-        0.75 * statistics.fmean(entry["policy_probability"] for entry in predictions) + 0.25 * support_probability
-    )
-    return {
-        "q1": statistics.fmean(entry["q1"] for entry in predictions),
-        "q2": statistics.fmean(entry["q2"] for entry in predictions),
-        "q_value": statistics.fmean(q_values),
-        "state_value": statistics.fmean(entry["v"] for entry in predictions),
-        "advantage": statistics.fmean(q_values) - statistics.fmean(entry["v"] for entry in predictions),
-        "policy_logit": statistics.fmean(policy_values),
-        "behavior_probability": max(0.0, min(1.0, policy_probability)),
-        "risk_probability": statistics.fmean(risk_values),
-        "success_probability": statistics.fmean(entry["success"] for entry in predictions),
-        "failure_probability": statistics.fmean(entry["failure"] for entry in predictions),
-        "uncertainty": uncertainty,
-        "support": support,
-        "member_count": len(predictions),
-        "algorithm": bundle.get("algorithm", ""),
-    }
+        mean_v = statistics.fmean(entry["v"] for entry in predictions)
+        policy_probability = 0.75 * statistics.fmean(
+            entry["policy_probability"] for entry in predictions
+        ) + 0.25 * support_probability
+        result[action_id] = {
+            "q1": statistics.fmean(entry["q1"] for entry in predictions),
+            "q2": statistics.fmean(entry["q2"] for entry in predictions),
+            "q_value": statistics.fmean(q_values),
+            "state_value": mean_v,
+            "advantage": statistics.fmean(q_values) - mean_v,
+            "policy_logit": statistics.fmean(policy_values),
+            "behavior_probability": max(0.0, min(1.0, policy_probability)),
+            "risk_probability": statistics.fmean(risk_values),
+            "success_probability": statistics.fmean(entry["success"] for entry in predictions),
+            "failure_probability": statistics.fmean(entry["failure"] for entry in predictions),
+            "uncertainty": uncertainty,
+            "support": support,
+            "member_count": len(predictions),
+            "algorithm": bundle.get("algorithm", ""),
+            "distillation_member_used": False,
+        }
+    return result
+
+
+def neural_offline_policy_prediction(model, observation, action_id, task_id="default"):
+    return neural_offline_policy_predictions(model, observation, [action_id], task_id).get(str(action_id), {})
+
+def _policy_teacher_soft_labels(ensemble, states, actions):
+    members = [member for member in ensemble or [] if isinstance(member, dict)]
+    outputs = [_policy_member_batch(member, states, actions) for member in members]
+    if not outputs:
+        return {}
+    names = ("q1", "q2", "v", "policy", "risk", "outcome", "dynamics")
+    result = {}
+    for name in names:
+        width = max((len(row) for output in outputs for row in output.get(name, [])), default=0)
+        rows = []
+        for index in range(len(states)):
+            rows.append(
+                [
+                    statistics.fmean(
+                        safe_float((output.get(name, [[]])[index] + [0.0] * width)[column], 0.0)
+                        for output in outputs
+                    )
+                    for column in range(width)
+                ]
+            )
+        result[name] = rows
+    return result
 
 
 def _game_isolated_policy_split(experiences):
@@ -14938,6 +15720,7 @@ class PolicyTrainingTensors:
 
 @dataclass(slots=True)
 class PolicyNetworkSet:
+    encoder: object
     q1: object
     q2: object
     value: object
@@ -14945,6 +15728,7 @@ class PolicyNetworkSet:
     risk: object
     outcome: object
     dynamics: object
+    target_encoder: object
     target_q1: object
     target_q2: object
     parameters: list
@@ -15035,7 +15819,11 @@ class OfflinePolicyModelBuilder:
             "task_action_support": {task: dict(counts) for task, counts in self.task_support.items()},
             "game_isolated_split": self.split,
             "safety_boundary": "risk_prediction_never_bypasses_independent_safety_authorization",
-            "semantic_state": "object_slots+scene_graph+goal+memory",
+            "semantic_state": (
+                "normalized_visual_embedding+object_slots+ocr_subwords+scene_graph+goal+"
+                "recent_action_reward+modality_mask"
+            ),
+            "visual_embedding_size": VISUAL_EMBEDDING_SIZE,
             "behavior_support_constraint": True,
             "target_q_networks": True,
             "terminal_done_mask": True,
@@ -15057,7 +15845,7 @@ class OfflinePolicyModelBuilder:
             dense_type = self._dense_network_type(torch)
             tensors = self._prepare_tensors(torch)
             ensemble, history = self._train_ensemble(torch, dense_type, tensors)
-            self._finalize_training_bundle(ensemble, history, tensors)
+            self._finalize_training_bundle(torch, dense_type, ensemble, history, tensors)
         except RECOVERABLE_ERRORS as error:
             self.training_error = type(error).__name__ + ":" + str(error)
 
@@ -15143,22 +15931,26 @@ class OfflinePolicyModelBuilder:
 
     @staticmethod
     def _create_networks(dense_type, device):
-        pair_size = POLICY_INPUT_SIZE + LATENT_ACTION_SIZE
+        encoder = dense_type(POLICY_INPUT_SIZE, POLICY_HIDDEN_SIZE, POLICY_HIDDEN_SIZE).to(device)
+        pair_size = POLICY_HIDDEN_SIZE + LATENT_ACTION_SIZE
         q1 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
         q2 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
-        value = dense_type(POLICY_INPUT_SIZE, 1, POLICY_HIDDEN_SIZE).to(device)
+        value = dense_type(POLICY_HIDDEN_SIZE, 1, POLICY_HIDDEN_SIZE).to(device)
         policy = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
         risk = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
         outcome = dense_type(pair_size, 3, POLICY_HIDDEN_SIZE).to(device)
         dynamics = dense_type(pair_size, POLICY_INPUT_SIZE, POLICY_HIDDEN_SIZE).to(device)
+        target_encoder = dense_type(POLICY_INPUT_SIZE, POLICY_HIDDEN_SIZE, POLICY_HIDDEN_SIZE).to(device)
         target_q1 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
         target_q2 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
+        target_encoder.load_state_dict(encoder.state_dict())
         target_q1.load_state_dict(q1.state_dict())
         target_q2.load_state_dict(q2.state_dict())
         parameters = []
-        for network in (q1, q2, value, policy, risk, outcome, dynamics):
+        for network in (encoder, q1, q2, value, policy, risk, outcome, dynamics):
             parameters.extend(network.parameters())
         return PolicyNetworkSet(
+            encoder,
             q1,
             q2,
             value,
@@ -15166,6 +15958,7 @@ class OfflinePolicyModelBuilder:
             risk,
             outcome,
             dynamics,
+            target_encoder,
             target_q1,
             target_q2,
             parameters,
@@ -15186,14 +15979,14 @@ class OfflinePolicyModelBuilder:
             ]
             steps = max(36, min(180, len(tensors.train_indices) * 2))
             plan = wait_for_runtime_training_plan()
-            batch_size = max(1, min(32, plan.training_batch_size, len(bootstrap)))
+            batch_size = max(1, min(128, plan.policy_batch_size, len(bootstrap)))
             amp_enabled = torch_device_is_cuda(torch, tensors.device)
             scaler = torch_grad_scaler(torch, amp_enabled)
             completed = 0
             while completed < steps:
                 plan = wait_for_runtime_training_plan()
                 configure_torch_runtime(torch, plan)
-                batch_size = max(1, min(batch_size, plan.training_batch_size, len(bootstrap)))
+                batch_size = max(1, min(batch_size, plan.policy_batch_size, len(bootstrap)))
                 indexes = [bootstrap[rng.randrange(len(bootstrap))] for _ in range(batch_size)]
                 try:
                     losses = self._training_step(
@@ -15238,16 +16031,19 @@ class OfflinePolicyModelBuilder:
         outcome = tensors.outcome[idx]
         action_label = tensors.action_index[idx]
         support = tensors.support_mask[idx]
-        pair = torch.cat([state, action], dim=1)
+        encoded_state = networks.encoder(state)
+        encoded_next_state = networks.encoder(next_state)
+        pair = torch.cat([encoded_state, action], dim=1)
         q1_value = networks.q1(pair)
         q2_value = networks.q2(pair)
         with torch.no_grad():
-            target = reward + self.config.gamma * (1.0 - done) * networks.value(next_state)
-            target_q = torch.minimum(networks.target_q1(pair), networks.target_q2(pair))
+            target = reward + self.config.gamma * (1.0 - done) * networks.value(encoded_next_state)
+            target_pair = torch.cat([networks.target_encoder(state), action], dim=1)
+            target_q = torch.minimum(networks.target_q1(target_pair), networks.target_q2(target_pair))
         sample_weight = 0.20 + 0.80 * confidence
         q1_loss = (sample_weight * (q1_value - target).pow(2)).mean()
         q2_loss = (sample_weight * (q2_value - target).pow(2)).mean()
-        value_delta = target_q - networks.value(state)
+        value_delta = target_q - networks.value(encoded_state)
         expectile_weight = torch.where(
             value_delta >= 0,
             torch.full_like(value_delta, self.config.expectile),
@@ -15256,7 +16052,7 @@ class OfflinePolicyModelBuilder:
         value_loss = (expectile_weight * value_delta.pow(2)).mean()
         batch_count = state.shape[0]
         action_count = tensors.candidate_actions.shape[0]
-        expanded_state = state.unsqueeze(1).expand(batch_count, action_count, POLICY_INPUT_SIZE)
+        expanded_state = encoded_state.unsqueeze(1).expand(batch_count, action_count, POLICY_HIDDEN_SIZE)
         expanded_action = tensors.candidate_actions.unsqueeze(0).expand(
             batch_count,
             action_count,
@@ -15275,7 +16071,7 @@ class OfflinePolicyModelBuilder:
         masked_logits = logits + (support - 1.0) * 8.0
         cross_entropy = torch.nn.functional.cross_entropy(masked_logits, action_label, reduction="none")
         with torch.no_grad():
-            advantage = torch.minimum(q1_value, q2_value) - networks.value(state)
+            advantage = torch.minimum(q1_value, q2_value) - networks.value(encoded_state)
             awr_weight = torch.exp(torch.clamp(advantage / self.config.beta, -5.0, 3.0)).squeeze(1)
         policy_loss = (cross_entropy * awr_weight).mean()
         probabilities = torch.softmax(logits, dim=1)
@@ -15318,6 +16114,8 @@ class OfflinePolicyModelBuilder:
             torch.nn.utils.clip_grad_norm_(networks.parameters, 5.0)
             optimizer.step()
         with torch.no_grad():
+            for target, source in zip(networks.target_encoder.parameters(), networks.encoder.parameters()):
+                target.mul_(0.99).add_(source, alpha=0.01)
             for target, source in zip(networks.target_q1.parameters(), networks.q1.parameters()):
                 target.mul_(0.99).add_(source, alpha=0.01)
             for target, source in zip(networks.target_q2.parameters(), networks.q2.parameters()):
@@ -15326,24 +16124,127 @@ class OfflinePolicyModelBuilder:
     @staticmethod
     def _serialize_member(networks, member_seed, bootstrap_samples):
         return {
+            "encoder": _serialize_dense_network(networks.encoder),
             "q1": _serialize_dense_network(networks.q1),
             "q2": _serialize_dense_network(networks.q2),
             "v": _serialize_dense_network(networks.value),
             "policy": _serialize_dense_network(networks.policy),
             "risk": _serialize_dense_network(networks.risk),
             "outcome": _serialize_dense_network(networks.outcome),
+            "dynamics": _serialize_dense_network(networks.dynamics),
             "seed": member_seed,
             "bootstrap_samples": bootstrap_samples,
         }
 
-    def _finalize_training_bundle(self, ensemble, history, tensors):
+    def _train_distilled_student(self, torch, dense_type, tensors, ensemble):
+        total_rows = len(tensors.filtered)
+        if total_rows < 32 or not ensemble:
+            return {"trained": False, "reason": "insufficient_holdout_soft_labels"}
+        rng = random.Random(self.config.seed ^ 0xD157111)
+        indexes = list(range(total_rows))
+        rng.shuffle(indexes)
+        indexes = indexes[: min(1024, len(indexes))]
+        validation_count = max(8, len(indexes) // 5)
+        validation_indexes = indexes[:validation_count]
+        training_indexes = indexes[validation_count:]
+        if not training_indexes:
+            return {"trained": False, "reason": "empty_student_training_split"}
+        states = tensors.state[indexes].detach().to("cpu").tolist()
+        actions = tensors.action[indexes].detach().to("cpu").tolist()
+        teacher = _policy_teacher_soft_labels(ensemble, states, actions)
+        if not teacher:
+            return {"trained": False, "reason": "teacher_soft_label_generation_failed"}
+        device = tensors.device
+        student = self._create_networks(dense_type, device)
+        optimizer = torch.optim.AdamW(student.parameters, lr=0.0012, weight_decay=0.0001)
+        state_tensor = torch.tensor(states, dtype=torch.float32, device=device)
+        action_tensor = torch.tensor(actions, dtype=torch.float32, device=device)
+        target_tensors = {
+            name: torch.tensor(values, dtype=torch.float32, device=device)
+            for name, values in teacher.items()
+            if values and values[0]
+        }
+        local_training = list(range(validation_count, len(indexes)))
+        plan = wait_for_runtime_training_plan()
+        batch_size = max(1, min(128, plan.policy_batch_size, len(local_training)))
+        steps = max(40, min(140, len(local_training) * 2))
+        for _ in range(steps):
+            chosen = [local_training[rng.randrange(len(local_training))] for _ in range(batch_size)]
+            idx = torch.tensor(chosen, dtype=torch.long, device=device)
+            state = state_tensor[idx]
+            action = action_tensor[idx]
+            encoded = student.encoder(state)
+            pair = torch.cat([encoded, action], dim=1)
+            predictions = {
+                "q1": student.q1(pair),
+                "q2": student.q2(pair),
+                "v": student.value(encoded),
+                "policy": student.policy(pair),
+                "risk": student.risk(pair),
+                "outcome": student.outcome(pair),
+                "dynamics": student.dynamics(pair),
+            }
+            loss = torch.zeros((), dtype=torch.float32, device=device)
+            for name, prediction in predictions.items():
+                target = target_tensors.get(name)
+                if target is not None:
+                    loss = loss + (prediction - target[idx]).pow(2).mean()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(student.parameters, 5.0)
+            optimizer.step()
+        validation_local = list(range(validation_count))
+        with torch.no_grad():
+            idx = torch.tensor(validation_local, dtype=torch.long, device=device)
+            state = state_tensor[idx]
+            action = action_tensor[idx]
+            encoded = student.encoder(state)
+            pair = torch.cat([encoded, action], dim=1)
+            predictions = {
+                "q1": student.q1(pair),
+                "q2": student.q2(pair),
+                "v": student.value(encoded),
+                "policy": student.policy(pair),
+                "risk": student.risk(pair),
+                "outcome": student.outcome(pair),
+                "dynamics": student.dynamics(pair),
+            }
+            errors = []
+            for name, prediction in predictions.items():
+                target = target_tensors.get(name)
+                if target is not None:
+                    errors.append(float((prediction - target[idx]).pow(2).mean().detach().to("cpu").item()))
+            risk_error = float(
+                (
+                    torch.sigmoid(predictions["risk"])
+                    - torch.sigmoid(target_tensors["risk"][idx])
+                ).abs().max().detach().to("cpu").item()
+            )
+        validation_mse = statistics.fmean(errors) if errors else float("inf")
+        accepted = bool(validation_mse <= 0.05 and risk_error <= 0.15)
+        member = self._serialize_member(student, self.config.seed ^ 0x51D3, len(training_indexes)) if accepted else None
+        optimizer.zero_grad(set_to_none=True)
+        release_torch_training_resources(torch)
+        return {
+            "trained": accepted,
+            "method": "holdout_ensemble_soft_label_student",
+            "target": "shared_encoder_multitask_student",
+            "teacher_members": len(ensemble),
+            "training_rows": len(training_indexes),
+            "validation_rows": len(validation_indexes),
+            "validation_mse": validation_mse,
+            "risk_probability_max_error": risk_error,
+            "acceptance_thresholds": {"validation_mse": 0.05, "risk_probability_max_error": 0.15},
+            "member": member,
+            "used_in_uncertainty_ensemble": False,
+            "fallback": "original_ensemble" if not accepted else "student_available_for_export_only",
+        }
+
+    def _finalize_training_bundle(self, torch, dense_type, ensemble, history, tensors):
         for name in self.losses:
             values = history.get(name, [])
             self.losses[name] = statistics.fmean(values[-min(100, len(values)) :]) if values else 0.0
-        distilled = {
-            name: _average_dense_networks([member[name] for member in ensemble])
-            for name in ("q1", "q2", "v", "policy", "risk", "outcome")
-        }
+        distillation = self._train_distilled_student(torch, dense_type, tensors, ensemble)
         self.bundle.update(
             {
                 "trained": True,
@@ -15351,22 +16252,19 @@ class OfflinePolicyModelBuilder:
                 "ensemble_size": len(ensemble),
                 "training_transitions": len(tensors.filtered),
                 "training_game_ids": sorted(tensors.train_games),
-                "distillation": {
-                    "trained": True,
-                    "method": "parameter_mean_ensemble_distillation",
-                    "target": "small_cpu_or_gpu_mlp",
-                    "member": distilled,
-                },
+                "distillation": distillation,
                 "optimizer": "AdamW",
                 "bootstrap_sampling": "independent_with_replacement",
-                "target_network_update": "polyak_0.01",
+                "target_network_update": "polyak_0.01_shared_encoder_and_q_heads",
                 "semantic_encoder": {},
                 "network_contract": {
-                    "q1": "Q1(z,skill)",
-                    "q2": "Q2(z,skill)",
-                    "value": "V(z)",
-                    "policy": "pi(skill|z,goal)",
-                    "risk": "Risk(z,skill)",
+                    "shared_encoder": "E(visual,objects,ocr,goal,history,modalities)",
+                    "q1": "Q1(E(z),skill)",
+                    "q2": "Q2(E(z),skill)",
+                    "value": "V(E(z))",
+                    "policy": "pi(skill|E(z),goal)",
+                    "risk": "Risk(E(z),skill)",
+                    "dynamics": "NextState(E(z),skill) with gradients into E",
                 },
             }
         )
@@ -16270,6 +17168,12 @@ class ReviewExecution:
                 "continuous_no_effect",
                 "low_reward_confidence",
                 "world_model_disagreement",
+                "unknown_numeric_region",
+                "low_ocr_confidence",
+                "ocr_temporal_disagreement",
+                "numeric_relation_unknown",
+                "numeric_direction_conflict",
+                "numeric_value_correlated_with_policy_uncertainty",
             ],
             "question_outputs": [
                 "task_complete",
@@ -16278,6 +17182,11 @@ class ReviewExecution:
                 "action_preference",
                 "object_change",
                 "reusable_skill",
+                "numeric_region_type",
+                "ocr_confirmation",
+                "ocr_correction",
+                "numeric_goal_relation",
+                "numeric_context_rule",
             ],
             "information_gain_ordering": True,
             "resume_from_safe_snapshot": True,
@@ -17524,6 +18433,88 @@ class GuidanceWindow:
     def __init__(self, app):
         self.app = app
 
+    @staticmethod
+    def _ocr_confirmation_question(frame, source_question):
+        metadata = dict(source_question.get("metadata", {}))
+        recognized = str(metadata.get("recognized_text", ""))
+        display = recognized if recognized else "（未识别出文本）"
+        return QuizQuestion(
+            question_id="ocr_confirmation|" + uuid.uuid4().hex,
+            question_type=QuizQuestionType.OCR_CONFIRMATION.value,
+            title="系统识别为“" + display + "”，是否正确？",
+            frame=frame,
+            options=[
+                {"code": "A", "label": "完全正确", "value": "correct"},
+                {"code": "B", "label": "数值正确，但单位或符号不正确", "value": "value_correct_symbol_wrong"},
+                {"code": "C", "label": "识别错误", "value": "incorrect"},
+                {"code": "D", "label": "当前画面无法读清", "value": "unreadable"},
+                {"code": "E", "label": "跳过", "value": "skip"},
+            ],
+            highlighted_regions=list(source_question.get("highlighted_regions", [])),
+            metadata=metadata,
+        ).to_dict()
+
+    @staticmethod
+    def _ocr_correction_question(frame, source_question):
+        metadata = dict(source_question.get("metadata", {}))
+        metadata["correction_purpose"] = "ocr_value"
+        return QuizQuestion(
+            question_id="ocr_correction|" + uuid.uuid4().hex,
+            question_type=QuizQuestionType.OCR_CORRECTION.value,
+            title="请仅用屏幕数字键盘输入正确数值，然后选择处理方式。",
+            frame=frame,
+            options=[
+                {"code": "A", "label": "使用上方输入的数值", "value": "use_keypad"},
+                {"code": "B", "label": "当前画面无法读清", "value": "unreadable"},
+                {"code": "C", "label": "确认它不是数字", "value": "not_numeric"},
+                {"code": "D", "label": "保留原识别并标记低置信度", "value": "keep_low_confidence"},
+                {"code": "E", "label": "跳过", "value": "skip"},
+            ],
+            highlighted_regions=list(source_question.get("highlighted_regions", [])),
+            metadata=metadata,
+        ).to_dict()
+
+    @staticmethod
+    def _numeric_relation_question(frame, source_question):
+        metadata = dict(source_question.get("metadata", {}))
+        return QuizQuestion(
+            question_id="numeric_relation|" + uuid.uuid4().hex,
+            question_type=QuizQuestionType.NUMERIC_RELATION.value,
+            title="这个数值对当前任务意味着什么？",
+            frame=frame,
+            options=[
+                {"code": "A", "label": "通常越大越好", "value": NumericGoalRelation.HIGHER_BETTER.value},
+                {"code": "B", "label": "通常越小越好", "value": NumericGoalRelation.LOWER_BETTER.value},
+                {"code": "C", "label": "与任务好坏无关", "value": NumericGoalRelation.IRRELEVANT.value},
+                {"code": "D", "label": "取决于具体情况", "value": NumericGoalRelation.CONTEXT_DEPENDENT.value},
+                {"code": "E", "label": "不确定", "value": NumericGoalRelation.UNCERTAIN.value},
+            ],
+            highlighted_regions=list(source_question.get("highlighted_regions", [])),
+            metadata=metadata,
+        ).to_dict()
+
+    @staticmethod
+    def _context_rule_question(frame, source_question):
+        metadata = dict(source_question.get("metadata", {}))
+        return QuizQuestion(
+            question_id="numeric_context|" + uuid.uuid4().hex,
+            question_type=QuizQuestionType.CONTEXT_RULE.value,
+            title="请选择最符合该数值的具体规则。",
+            frame=frame,
+            options=[
+                {"code": "A", "label": "越接近某个值越好", "value": "near_target"},
+                {"code": "B", "label": "保持在一个范围内最好", "value": "in_range"},
+                {"code": "C", "label": "低于某个阈值表示危险", "value": "low_threshold_danger"},
+                {"code": "D", "label": "高于某个阈值表示成功", "value": "high_threshold_success"},
+                {"code": "E", "label": "在不同游戏阶段含义不同", "value": "phase_dependent"},
+                {"code": "F", "label": "它是资源值，例如生命值/体力", "value": "resource"},
+                {"code": "G", "label": "它是倒计时", "value": "countdown"},
+                {"code": "H", "label": "暂时不确定", "value": "uncertain"},
+            ],
+            highlighted_regions=list(source_question.get("highlighted_regions", [])),
+            metadata=metadata,
+        ).to_dict()
+
     def open(self, prepared):
         app = self.app
         created = prepared.get("created")
@@ -17536,25 +18527,26 @@ class GuidanceWindow:
             app.lifecycle.mark_running()
             app.api.block_input()
             app.set_input_status("已锁定")
-            app.status.set("做题已开始：先选择A/B/C/D或E，再点击“提交”；点击“结束做题”或按ESC结束")
+            app.status.set("做题已开始：按当前题目选择结构化答案并点击“提交”；点击“结束做题”或按ESC结束")
             win = tk.Toplevel(app.root)
             app.ask_window = win
             win.title("做题")
-            fit_window(win, 780, 720, 560, 420)
+            fit_window(win, 820, 780, 600, 460)
             win.transient(app.root)
             win.bind("<Unmap>", lambda event: buffer.set_preview_active(False))
             win.bind("<Map>", lambda event: buffer.set_preview_active(True))
             win.bind("<FocusOut>", lambda event: buffer.set_preview_active(False))
             win.bind("<FocusIn>", lambda event: buffer.set_preview_active(True))
             frame = scrollable_frame(win, 16, True)
-            ttk.Label(frame, text="请选择当前画面中AI应该执行的鼠标动作", font=("Microsoft YaHei UI", 14, "bold")).pack(
-                anchor="w"
-            )
+            title_var = tk.StringVar(value="等待题目")
+            instruction_var = tk.StringVar(value="所有问题必须先选择，再点击“提交”。")
             ttk.Label(
                 frame,
-                text="主流程严格为选择题：先选择 A / B / C / D / E（跳过并记录为未标注），再点击“提交”；点击“结束做题”或按ESC结束。",
-                wraplength=730,
-            ).pack(anchor="w", pady=(4, 10))
+                textvariable=title_var,
+                font=("Microsoft YaHei UI", 14, "bold"),
+                wraplength=770,
+            ).pack(anchor="w")
+            ttk.Label(frame, textvariable=instruction_var, wraplength=770).pack(anchor="w", pady=(4, 10))
             canvas = tk.Canvas(
                 frame,
                 width=ASK_CANVAS_W,
@@ -17565,13 +18557,22 @@ class GuidanceWindow:
             )
             canvas.pack()
             preview_info = tk.StringVar(value="等待彩色教学预览")
-            ttk.Label(frame, textvariable=preview_info, wraplength=730).pack(anchor="w", fill="x", pady=(6, 0))
+            ttk.Label(frame, textvariable=preview_info, wraplength=770).pack(anchor="w", fill="x", pady=(6, 0))
+            keypad_holder = ttk.Frame(frame)
+            keypad_holder.pack(fill="x", pady=(8, 0))
             choice_frame = ttk.Frame(frame)
-            choice_frame.pack(fill="both", expand=True, pady=(10, 0))
-            answer_buttons = []
+            choice_frame.pack(fill="both", expand=True, pady=(8, 0))
+            tools = ttk.Frame(frame)
+            tools.pack(fill="x", pady=(8, 0))
+            submit_button = ttk.Button(tools, text="提交", state="disabled")
+            submit_button.pack(side="left", fill="x", expand=True, ipady=6)
+            end_button = ttk.Button(tools, text="结束做题", command=lambda: app.close_ask(reason="completed"))
+            end_button.pack(side="left", padx=(8, 0), ipadx=18, ipady=6)
             state = {
                 "frame": None,
-                "choices": [],
+                "questions": [],
+                "question_index": 0,
+                "answers": [],
                 "candidates": [],
                 "guidance_trigger": [],
                 "image": None,
@@ -17580,6 +18581,8 @@ class GuidanceWindow:
                 "recent_actions": deque(["<START>", "<START>"], maxlen=32),
                 "state_since": time.monotonic(),
                 "waiting": False,
+                "buttons": [],
+                "keypad": None,
             }
 
             def schedule(delay, callback):
@@ -17595,18 +18598,38 @@ class GuidanceWindow:
                 holder["id"] = win.after(delay, wrapped)
                 app.ask_after_ids.add(holder["id"])
 
+            def current_question():
+                index = safe_int(state.get("question_index"), 0)
+                questions = state.get("questions", [])
+                return questions[index] if 0 <= index < len(questions) else None
+
             def set_locked(value):
                 state["locked"] = bool(value)
-                for index, button in enumerate(answer_buttons):
-                    button.configure(state="normal" if not value and index < len(state["choices"]) else "disabled")
-                skip_button.configure(state="disabled" if value else "normal")
+                for button in state.get("buttons", []):
+                    button.configure(state="disabled" if value else "normal")
                 submit_button.configure(
                     state="normal" if not value and state.get("selected") is not None else "disabled"
                 )
 
-            def render(packet):
-                question_frame = packet["frame"]
-                choices = packet["choices"][:4]
+            def clear_keypad():
+                for child in keypad_holder.winfo_children():
+                    child.destroy()
+                state["keypad"] = None
+
+            def option_label(question, option):
+                label = str(option.get("label", ""))
+                if question.get("question_type") == QuizQuestionType.ACTION.value:
+                    entry = option.get("entry") if isinstance(option.get("entry"), dict) else {}
+                    if option.get("value") == "choose" and entry.get("a"):
+                        label = str(entry.get("guidance_label") or app.action_text(entry.get("a")))
+                return str(option.get("code", "?")) + ". " + label
+
+            def render_canvas(question):
+                question_frame = (
+                    question.get("frame")
+                    if isinstance(question.get("frame"), dict)
+                    else state.get("frame", {})
+                )
                 preview = preview_rgb_bytes(question_frame.get("preview_rgb")) or bytes(PREVIEW_W * PREVIEW_H * 3)
                 ppm = (
                     b"P6\n"
@@ -17621,30 +18644,56 @@ class GuidanceWindow:
                 state["image"] = (image, scaled)
                 canvas.delete("all")
                 canvas.create_image(ASK_PREVIEW_X, ASK_PREVIEW_Y, image=scaled, anchor="nw")
-                colors = ("#00ffff", "#ffff00", "#ff66ff", "#66ff66")
-                for index, entry in enumerate(choices):
-                    action = normalize_action(entry.get("a"))
-                    if not action or action["kind"] == "no_op":
+                if question.get("question_type") == QuizQuestionType.ACTION.value:
+                    colors = ("#00ffff", "#ffff00", "#ff66ff", "#66ff66")
+                    action_options = [value for value in question.get("options", []) if value.get("value") == "choose"]
+                    for index, option in enumerate(action_options[:4]):
+                        entry = option.get("entry") if isinstance(option.get("entry"), dict) else {}
+                        action = normalize_action(entry.get("coordinate_action")) or normalize_action(entry.get("a"))
+                        if not action or action["kind"] == "no_op":
+                            continue
+                        points = []
+                        for point in action.get("path") or []:
+                            cx, cy = PreviewCoordinateMapper.to_canvas(point)
+                            points.extend([cx, cy])
+                        color = colors[index]
+                        if len(points) >= 4:
+                            canvas.create_line(*points, fill=color, width=3, arrow="last")
+                        if len(points) >= 2:
+                            canvas.create_oval(
+                                points[-2] - 6,
+                                points[-1] - 6,
+                                points[-2] + 6,
+                                points[-1] + 6,
+                                outline=color,
+                                width=3,
+                            )
+                            canvas.create_text(
+                                points[-2] + 10,
+                                points[-1] - 10,
+                                text=option.get("code", chr(65 + index)),
+                                fill=color,
+                                font=("Microsoft YaHei UI", 12, "bold"),
+                                anchor="sw",
+                            )
+                for region in question.get("highlighted_regions", []):
+                    bbox = _valid_norm_rect(region.get("bbox") if isinstance(region, dict) else None)
+                    if bbox is None:
                         continue
-                    points = []
-                    for point in action.get("path") or []:
-                        cx, cy = PreviewCoordinateMapper.to_canvas(point)
-                        points.extend([cx, cy])
-                    color = colors[index]
-                    if len(points) >= 4:
-                        canvas.create_line(*points, fill=color, width=3, arrow="last")
-                    if len(points) >= 2:
-                        canvas.create_oval(
-                            points[-2] - 6, points[-1] - 6, points[-2] + 6, points[-1] + 6, outline=color, width=3
-                        )
-                        canvas.create_text(
-                            points[-2] + 10,
-                            points[-1] - 10,
-                            text=chr(65 + index),
-                            fill=color,
-                            font=("Microsoft YaHei UI", 12, "bold"),
-                            anchor="sw",
-                        )
+                    color = str(region.get("color", "#ff8c00"))
+                    left = ASK_PREVIEW_X + bbox[0] * ASK_PREVIEW_W
+                    top = ASK_PREVIEW_Y + bbox[1] * ASK_PREVIEW_H
+                    right = left + bbox[2] * ASK_PREVIEW_W
+                    bottom = top + bbox[3] * ASK_PREVIEW_H
+                    canvas.create_rectangle(left, top, right, bottom, outline=color, width=4)
+                    canvas.create_text(
+                        left + 5,
+                        max(ASK_PREVIEW_Y + 5, top - 5),
+                        text=str(region.get("label", "N1")),
+                        fill=color,
+                        font=("Microsoft YaHei UI", 12, "bold"),
+                        anchor="sw",
+                    )
                 warnings = []
                 if question_frame.get("protected_or_black"):
                     warnings.append("黑屏/受保护画面")
@@ -17657,7 +18706,8 @@ class GuidanceWindow:
                 if not question_frame.get("capture_valid"):
                     warnings.append("画面无效")
                 stamp = time.strftime(
-                    "%Y-%m-%d %H:%M:%S", time.localtime(float(question_frame.get("wall_time", time.time())))
+                    "%Y-%m-%d %H:%M:%S",
+                    time.localtime(float(question_frame.get("wall_time", time.time()))),
                 )
                 preview_info.set(
                     "采集时间："
@@ -17668,30 +18718,143 @@ class GuidanceWindow:
                     + ("、".join(warnings) if warnings else "无")
                 )
 
+            def select_option(option, button):
+                if state["locked"]:
+                    return
+                state["selected"] = dict(option)
+                question = current_question() or {}
+                for widget, value in zip(state.get("buttons", []), question.get("options", [])):
+                    widget.configure(text=("✓ " if value is option else "") + option_label(question, value))
+                submit_button.configure(state="normal")
+                app.status.set("做题中：已选择" + str(option.get("code", "")) + "，请点击“提交”")
+
+            def render_current_question():
+                question = current_question()
+                if question is None:
+                    return
+                state["selected"] = None
+                title_var.set(str(question.get("title", "请选择答案")))
+                metadata = question.get("metadata") if isinstance(question.get("metadata"), dict) else {}
+                instruction_var.set(str(metadata.get("instruction") or "所有问题必须先选择，再点击“提交”。"))
+                render_canvas(question)
+                clear_keypad()
+                if question.get("question_type") == QuizQuestionType.OCR_CORRECTION.value:
+                    initial_text = str(metadata.get("recognized_text", ""))
+                    keypad = ScreenNumericKeypad(keypad_holder, "屏幕数字键盘（不使用普通键盘文本框）", initial_text)
+                    keypad.frame.pack(fill="x")
+                    state["keypad"] = keypad
+                for child in choice_frame.winfo_children():
+                    child.destroy()
+                state["buttons"] = []
+                for option in question.get("options", []):
+                    button = ttk.Button(choice_frame, text=option_label(question, option))
+                    button.configure(command=lambda option=option, button=button: select_option(option, button))
+                    button.pack(fill="x", pady=3, ipady=5)
+                    state["buttons"].append(button)
+                set_locked(False)
+
+            def insert_followups(question, answer):
+                question_type = str(question.get("question_type", ""))
+                value = str(answer.get("value", ""))
+                followups = []
+                if (
+                    question_type == QuizQuestionType.REGION_IS_NUMERIC.value
+                    and value in {"number", "current_max", "countdown"}
+                ):
+                    metadata = dict(question.get("metadata", {}))
+                    metadata["region_type_answer"] = value
+                    source = dict(question)
+                    source["metadata"] = metadata
+                    followups.append(self._ocr_confirmation_question(question.get("frame", {}), source))
+                elif question_type == QuizQuestionType.OCR_CONFIRMATION.value:
+                    if value == "incorrect":
+                        followups.append(self._ocr_correction_question(question.get("frame", {}), question))
+                    if value not in {"skip"}:
+                        followups.append(self._numeric_relation_question(question.get("frame", {}), question))
+                elif (
+                    question_type == QuizQuestionType.NUMERIC_RELATION.value
+                    and value == NumericGoalRelation.CONTEXT_DEPENDENT.value
+                ):
+                    followups.append(self._context_rule_question(question.get("frame", {}), question))
+                if followups:
+                    index = state["question_index"] + 1
+                    state["questions"][index:index] = followups
+
+            def queue_group_answer():
+                if state["locked"] or app.ask_answer_queue is None:
+                    return
+                set_locked(True)
+                app.ask_answer_queue.put(
+                    {
+                        "kind": "quiz_group",
+                        "frame": state["frame"],
+                        "answers": list(state["answers"]),
+                        "candidates": list(state["candidates"]),
+                        "guidance_trigger": list(state["guidance_trigger"]),
+                        "recent_actions": list(state["recent_actions"]),
+                        "state_since": state["state_since"],
+                        "callback": finish_answer,
+                    }
+                )
+
+            def submit_answer():
+                question = current_question()
+                option = state.get("selected")
+                if question is None or option is None:
+                    win.bell()
+                    app.status.set("请先选择当前题目的答案，再点击“提交”")
+                    return
+                answer = {
+                    "question_id": str(question.get("question_id", "")),
+                    "question_type": str(question.get("question_type", "")),
+                    "code": str(option.get("code", "")),
+                    "label": str(option.get("label", "")),
+                    "value": str(option.get("value", "")),
+                    "entry": dict(option.get("entry", {})) if isinstance(option.get("entry"), dict) else {},
+                    "metadata": (
+                        dict(question.get("metadata", {}))
+                        if isinstance(question.get("metadata"), dict)
+                        else {}
+                    ),
+                    "highlighted_regions": list(question.get("highlighted_regions", [])),
+                }
+                if (
+                    question.get("question_type") == QuizQuestionType.OCR_CORRECTION.value
+                    and option.get("value") == "use_keypad"
+                ):
+                    keypad = state.get("keypad")
+                    try:
+                        answer["corrected_value"] = keypad.get_number()
+                        answer["corrected_text"] = str(keypad.value.get())
+                    except (ValueError, AttributeError) as error:
+                        win.bell()
+                        app.status.set(str(error))
+                        return
+                state["answers"].append(answer)
+                insert_followups(question, answer)
+                state["question_index"] += 1
+                if state["question_index"] < len(state["questions"]):
+                    render_current_question()
+                else:
+                    queue_group_answer()
+
+            submit_button.configure(command=submit_answer)
+            win.bind("<Return>", lambda event: submit_answer())
+
             def apply_packet(packet):
                 if app.ask_window is None:
                     return
                 state["waiting"] = False
-                state["frame"] = packet["frame"]
-                state["choices"] = packet["choices"][:4]
+                state["frame"] = packet.get("frame") or {}
+                questions = [dict(value) for value in packet.get("questions", []) if isinstance(value, dict)]
+                if not questions:
+                    questions = [action_quiz_question(state["frame"], packet.get("choices", []))]
+                state["questions"] = questions
+                state["question_index"] = 0
+                state["answers"] = []
                 state["candidates"] = list(packet.get("candidates", []))
                 state["guidance_trigger"] = list(packet.get("guidance_trigger", []))
-                state["selected"] = None
-                render(packet)
-                for index, button in enumerate(answer_buttons):
-                    if index < len(state["choices"]):
-                        button.configure(
-                            text=chr(65 + index)
-                            + ". "
-                            + str(
-                                state["choices"][index].get("guidance_label")
-                                or app.action_text(state["choices"][index]["a"])
-                            )
-                        )
-                    else:
-                        button.configure(text=chr(65 + index) + ". 无可用答案")
-                skip_button.configure(text="E. 跳过（未标注）")
-                set_locked(False)
+                render_current_question()
 
             def poll_question():
                 if app.ask_window is None or app.stop_event is None or app.stop_event.is_set():
@@ -17726,78 +18889,18 @@ class GuidanceWindow:
                     state["state_since"] = time.monotonic()
                 counts = app.ask_counts or {}
                 app.status.set(
-                    "做题中：已保存"
+                    "做题中：动作保存"
                     + str(counts.get("saved", 0))
-                    + "，重复未保存"
+                    + "，重复"
                     + str(counts.get("duplicates", 0))
                     + "，跳过"
                     + str(counts.get("skipped", 0))
-                    + "；模型需要睡眠"
+                    + "，数值监督"
+                    + str(counts.get("numeric_questions", 0))
+                    + "，OCR纠正"
+                    + str(counts.get("ocr_corrections", 0))
                 )
                 schedule(100, request_question)
-
-            def queue_answer(kind, entry=None):
-                if state["locked"] or app.ask_answer_queue is None:
-                    return
-                set_locked(True)
-                state["selected"] = None
-                app.ask_answer_queue.put(
-                    {
-                        "kind": kind,
-                        "frame": state["frame"],
-                        "entry": entry or {},
-                        "candidates": list(state["candidates"]),
-                        "guidance_trigger": list(state["guidance_trigger"]),
-                        "recent_actions": list(state["recent_actions"]),
-                        "state_since": state["state_since"],
-                        "callback": finish_answer,
-                    }
-                )
-
-            def select_answer(kind, entry=None, index=None):
-                if state["locked"]:
-                    return
-                state["selected"] = {"kind": kind, "entry": entry or {}, "index": index}
-                for position, button in enumerate(answer_buttons):
-                    if position < len(state["choices"]):
-                        label = (
-                            chr(65 + position)
-                            + ". "
-                            + str(
-                                state["choices"][position].get("guidance_label")
-                                or app.action_text(state["choices"][position]["a"])
-                            )
-                        )
-                        button.configure(text=("✓ " if index == position else "") + label)
-                skip_button.configure(text=("✓ " if kind == "skip" else "") + "E. 跳过（未标注）")
-                submit_button.configure(state="normal")
-                app.status.set("做题中：已选择" + ("E" if kind == "skip" else chr(65 + int(index))) + "，请点击“提交”")
-
-            def submit_answer():
-                selected = state.get("selected")
-                if selected is None:
-                    win.bell()
-                    app.status.set("请先选择A/B/C/D或E，再点击“提交”")
-                    return
-                queue_answer(selected["kind"], selected.get("entry"))
-
-            def choose(index):
-                if index < len(state["choices"]):
-                    select_answer("choose", state["choices"][index], index)
-
-            for index in range(4):
-                button = ttk.Button(choice_frame, text=chr(65 + index), command=lambda position=index: choose(position))
-                button.pack(fill="x", pady=3, ipady=6)
-                answer_buttons.append(button)
-            tools = ttk.Frame(frame)
-            tools.pack(fill="x", pady=(8, 0))
-            skip_button = ttk.Button(tools, text="E. 跳过（未标注）", command=lambda: select_answer("skip"))
-            skip_button.pack(side="left", fill="x", expand=True, ipady=6)
-            submit_button = ttk.Button(tools, text="提交", command=submit_answer, state="disabled")
-            submit_button.pack(side="left", padx=(8, 0), ipadx=24, ipady=6)
-            end_button = ttk.Button(tools, text="结束做题", command=lambda: app.close_ask(reason="completed"))
-            end_button.pack(side="left", padx=(8, 0), ipadx=18, ipady=6)
-            win.bind("<Return>", lambda event: submit_answer())
 
             def refuse_close():
                 win.bell()
@@ -17827,6 +18930,178 @@ class GuidanceWindow:
         finally:
             if created is not None:
                 created.set()
+
+def compile_numeric_supervision(app, game_id, frame, answers):
+    by_type = defaultdict(list)
+    for answer in answers or []:
+        if isinstance(answer, dict):
+            by_type[str(answer.get("question_type", ""))].append(answer)
+    region_answers = by_type.get(QuizQuestionType.REGION_IS_NUMERIC.value, [])
+    if not region_answers:
+        return {"ocr_values": [], "numeric_questions": 0, "ocr_corrections": 0, "numeric_relations": 0}
+    region_answer = region_answers[-1]
+    metadata = dict(region_answer.get("metadata", {})) if isinstance(region_answer.get("metadata"), dict) else {}
+    candidate = dict(metadata.get("candidate", {})) if isinstance(metadata.get("candidate"), dict) else {}
+    bbox = _valid_norm_rect(candidate.get("bbox") or candidate.get("region_norm"))
+    recognized_text = str(metadata.get("recognized_text", candidate.get("text", "")))
+    parsed = (
+        dict(metadata.get("parsed", {}))
+        if isinstance(metadata.get("parsed"), dict)
+        else parse_ocr_number(recognized_text)
+    )
+    region_value = str(region_answer.get("value", "uncertain"))
+    is_numeric = region_value in {"number", "current_max", "countdown"}
+    result = {"ocr_values": [], "numeric_questions": 1, "ocr_corrections": 0, "numeric_relations": 0}
+    if bbox is None:
+        return result
+    if not is_numeric:
+        app.store.append_guidance_event(
+            game_id,
+            "numeric_region_supervision",
+            {
+                "frame_digest": frame_digest(frame),
+                "bbox": bbox,
+                "is_numeric": False,
+                "region_answer": region_value,
+                "ocr_raw": recognized_text,
+                "human_confirmed": True,
+            },
+        )
+        return result
+    confirmation = (by_type.get(QuizQuestionType.OCR_CONFIRMATION.value) or [{}])[-1]
+    confirmation_value = str(confirmation.get("value", "skip"))
+    corrected_value = parsed.get("value") if parsed.get("valid") else None
+    corrected_text = str(parsed.get("normalized", recognized_text))
+    ocr_correct = confirmation_value == "correct"
+    confidence = 1.0 if confirmation_value in {"correct", "value_correct_symbol_wrong"} else 0.35
+    correction = (by_type.get(QuizQuestionType.OCR_CORRECTION.value) or [{}])[-1]
+    if correction:
+        result["ocr_corrections"] = 1
+        correction_value = str(correction.get("value", ""))
+        if correction_value == "use_keypad" and finite_number(correction.get("corrected_value")):
+            corrected_value = safe_float(correction.get("corrected_value"))
+            corrected_text = str(correction.get("corrected_text", corrected_value))
+            ocr_correct = False
+            confidence = 1.0
+        elif correction_value == "not_numeric":
+            app.store.append_guidance_event(
+                game_id,
+                "numeric_region_supervision",
+                {
+                    "frame_digest": frame_digest(frame),
+                    "bbox": bbox,
+                    "is_numeric": False,
+                    "region_answer": "corrected_not_numeric",
+                    "ocr_raw": recognized_text,
+                    "human_confirmed": True,
+                },
+            )
+            return result
+        elif correction_value in {"unreadable", "skip"}:
+            corrected_value = None
+            confidence = 0.0
+        elif correction_value == "keep_low_confidence":
+            confidence = min(confidence, 0.35)
+    relation_answer = (by_type.get(QuizQuestionType.NUMERIC_RELATION.value) or [{}])[-1]
+    relation = str(relation_answer.get("value", NumericGoalRelation.UNCERTAIN.value))
+    if relation_answer:
+        result["numeric_relations"] = 1
+    context_answer = (by_type.get(QuizQuestionType.CONTEXT_RULE.value) or [{}])[-1]
+    context_rule = str(context_answer.get("value", ""))
+    relation_config = {
+        "rule": context_rule,
+        "task_phase": str(frame.get("task_phase", "unknown")),
+        "subgoal_id": str(frame.get("subgoal_id", "")),
+        "human_confirmed": True,
+    }
+    if (
+        context_rule in {"low_threshold_danger", "high_threshold_success", "near_target"}
+        and finite_number(corrected_value)
+    ):
+        relation_config["threshold"] = safe_float(corrected_value)
+    if context_rule == "phase_dependent":
+        relation_config["phase_rules"] = {
+            str(frame.get("task_phase", "unknown")): NumericGoalRelation.UNCERTAIN.value
+        }
+    number_format = (
+        "time"
+        if region_value == "countdown"
+        else "current_max"
+        if region_value == "current_max"
+        else str(parsed.get("kind", "auto"))
+    )
+    if region_value == "countdown" and relation == NumericGoalRelation.UNCERTAIN.value:
+        relation = "countdown"
+    goal_relation = relation
+    if (
+        relation == NumericGoalRelation.CONTEXT_DEPENDENT.value
+        and context_rule in {"near_target", "in_range", "resource", "countdown"}
+    ):
+        goal_relation = relation
+    stable_frames = max(1, safe_int((candidate.get("attributes") or {}).get("stable_frames", 1), 1, 1, 1000))
+    saved_region = app.store.save_ocr_region(
+        game_id,
+        {
+            "region_norm": bbox,
+            "region_type": "number",
+            "number_format": number_format,
+            "goal_relation": goal_relation,
+            "relation_config": relation_config,
+            "target_min": relation_config.get("threshold") if context_rule == "near_target" else None,
+            "target_max": None,
+            "recognized_text": corrected_text,
+            "last_value": corrected_value,
+            "confidence": confidence,
+            "stable_frames": stable_frames,
+            "unit": str(parsed.get("unit", "")),
+        },
+    )
+    event_payload = {
+        "frame_digest": frame_digest(frame),
+        "region_id": saved_region["id"],
+        "bbox": bbox,
+        "is_numeric": True,
+        "region_type": region_value,
+        "ocr_raw": recognized_text,
+        "ocr_correct": ocr_correct,
+        "ocr_confirmation": confirmation_value,
+        "corrected_text": corrected_text,
+        "corrected_value": corrected_value,
+        "goal_relation": relation,
+        "context_rule": context_rule,
+        "relation_config": relation_config,
+        "human_confirmed": True,
+    }
+    app.store.append_guidance_event(game_id, "numeric_region_supervision", event_payload)
+    parsed_observation = parse_ocr_number(corrected_text, number_format) if corrected_text else {"valid": False}
+    app.store.append_ocr_observation(
+        game_id,
+        saved_region["id"],
+        recognized_text,
+        parsed_observation,
+        confidence,
+        stable_frames,
+        {
+            "status": "human_confirmed",
+            "numeric_value": corrected_value,
+            "progress": 0.0,
+            "terminal": "",
+            "reset": "",
+            "semantic_version": OCR_SEMANTIC_VERSION,
+        },
+    )
+    result["ocr_values"] = [
+        {
+            "region_id": saved_region["id"],
+            "value": corrected_value,
+            "text": corrected_text,
+            "confidence": confidence,
+            "goal_relation": relation,
+            "relation_config": relation_config,
+            "human_confirmed": True,
+        }
+    ]
+    return result
 
 
 class TeachingController:
@@ -17926,7 +19201,15 @@ class TeachingController:
             app.ask_session_id = session_id
             app.ask_buffer = buffer
             app.ask_producer = producer
-            app.ask_counts = {"saved": 0, "duplicates": 0, "skipped": 0}
+            app.ask_counts = {
+                "saved": 0,
+                "duplicates": 0,
+                "skipped": 0,
+                "action_questions": 0,
+                "numeric_questions": 0,
+                "ocr_corrections": 0,
+                "numeric_relations": 0,
+            }
             answer_queue = queue.Queue()
             app.ask_answer_queue = answer_queue
             producer.request(deque(["<START>", "<START>"], maxlen=4), time.monotonic())
@@ -17967,13 +19250,27 @@ class TeachingController:
                 callback = command.get("callback")
                 try:
                     kind = str(command.get("kind", ""))
+                    if kind != "quiz_group":
+                        raise RuntimeError("做题主流程仅接受结构化题组，并要求每题选择后提交")
                     frame = command.get("frame") or {}
-                    entry = command.get("entry") or {}
+                    answers = [value for value in command.get("answers", []) if isinstance(value, dict)]
                     recent_actions = command.get("recent_actions") or ["<START>", "<START>"]
                     state_since = safe_float(command.get("state_since"), time.monotonic())
                     candidates = list(command.get("candidates", []))
                     guidance_trigger = list(command.get("guidance_trigger", []))
-                    if kind == "skip":
+                    numeric_result = compile_numeric_supervision(app, game["id"], frame, answers)
+                    for counter_name in ("numeric_questions", "ocr_corrections", "numeric_relations"):
+                        app.ask_counts[counter_name] += safe_int(numeric_result.get(counter_name), 0)
+                    action_answers = [
+                        value for value in answers if value.get("question_type") == QuizQuestionType.ACTION.value
+                    ]
+                    if not action_answers:
+                        raise RuntimeError("题组缺少动作监督答案")
+                    action_answer = action_answers[-1]
+                    app.ask_counts["action_questions"] += 1
+                    action_value = str(action_answer.get("value", "skip"))
+                    entry = dict(action_answer.get("entry", {})) if isinstance(action_answer.get("entry"), dict) else {}
+                    if action_value == "skip":
                         app.ask_counts["skipped"] += 1
                         rejection_context = {
                             "session_id": session_id,
@@ -17983,6 +19280,7 @@ class TeachingController:
                             "guidance_reason": guidance_trigger,
                             "failure_recovery": False,
                             "human_override": True,
+                            "ocr_values": list(numeric_result.get("ocr_values", [])),
                         }
                         if feature_valid(frame.get("f")) and sample_rgb_valid(frame.get("rgb")) and candidates:
                             app.store.append_rejection(
@@ -17995,7 +19293,7 @@ class TeachingController:
                                 rejection_context,
                             )
                         result = {"saved": False, "action": None}
-                    else:
+                    elif action_value == "choose":
                         if not frame.get("usable_for_teaching"):
                             raise CaptureUnavailable("当前画面不可用于做题")
                         temporal = app.build_temporal_context(buffer, frame, recent_actions, state_since)
@@ -18017,11 +19315,18 @@ class TeachingController:
                                 "step_id": safe_int(app.ask_counts.get("saved"), 0),
                                 "action_delay": None,
                                 "human_override": True,
-                                "trajectory_schema_version": 2,
+                                "trajectory_schema_version": TRAJECTORY_SCHEMA_VERSION,
+                                "ocr_values": list(numeric_result.get("ocr_values", [])),
+                                "quiz_answers": [
+                                    {
+                                        "question_type": value.get("question_type"),
+                                        "value": value.get("value"),
+                                        "code": value.get("code"),
+                                    }
+                                    for value in answers
+                                ],
                             }
                         )
-                        if kind != "choose":
-                            raise RuntimeError("做题主流程仅接受A/B/C/D或E跳过，并要求点击提交")
                         semantic = normalize_semantic_action(entry.get("a")) or semantic_action_from_interaction(
                             entry.get("coordinate_action") or entry.get("a"), frame.get("semantic_targets", [])
                         )
@@ -18061,6 +19366,7 @@ class TeachingController:
                                 "reusable_skill": semantic_skill(semantic).skill_id,
                                 "guidance_trigger": guidance_trigger,
                                 "frame_lineage": context.get("data_lineage", {}),
+                                "ocr_values": context.get("ocr_values", []),
                             },
                         )
                         saved = app.store.append_sample(
@@ -18095,10 +19401,13 @@ class TeachingController:
                                     "should_wait": False,
                                     "failure_recovery": context.get("failure_recovery"),
                                     "human_override": True,
+                                    "ocr_values": context.get("ocr_values", []),
                                 },
                             )
                         app.ask_counts["saved" if saved else "duplicates"] += 1
                         result = {"saved": saved, "action": semantic}
+                    else:
+                        raise RuntimeError("动作题答案无效")
                     if callback:
                         app.ui(lambda callback=callback, result=result: callback(result, None))
                 except Exception as error:
@@ -18114,14 +19423,28 @@ class TeachingController:
             )
         else:
             app.store.validate_learning_session(game["id"], session_id)
-        counts = app.ask_counts if isinstance(app.ask_counts, dict) else {"saved": 0, "duplicates": 0, "skipped": 0}
+        counts = app.ask_counts if isinstance(app.ask_counts, dict) else {
+            "saved": 0,
+            "duplicates": 0,
+            "skipped": 0,
+            "action_questions": 0,
+            "numeric_questions": 0,
+            "ocr_corrections": 0,
+            "numeric_relations": 0,
+        }
         summary = (
-            "做题已结束：已保存"
+            "做题已结束：动作保存"
             + str(counts.get("saved", 0))
             + "，重复未保存"
             + str(counts.get("duplicates", 0))
             + "，跳过"
             + str(counts.get("skipped", 0))
+            + "，数值问题"
+            + str(counts.get("numeric_questions", 0))
+            + "，OCR纠正"
+            + str(counts.get("ocr_corrections", 0))
+            + "，数值关系"
+            + str(counts.get("numeric_relations", 0))
             + "；模型需要睡眠"
         )
         if status == "failed":
@@ -18133,12 +19456,20 @@ class TeachingController:
             summary,
             {
                 "samples": stats.get("valid", 0),
-                "choices_only": True,
+                "structured_questions_only": True,
+                "action_question": safe_int(counts.get("action_questions"), 0) >= 0,
+                "numeric_region_question": safe_int(counts.get("numeric_questions"), 0) >= 0,
+                "ocr_confirmation": True,
+                "numeric_relation_question": True,
                 "submit_required": True,
                 "finish_button": final_status == "completed" and "ESC" not in reason.upper(),
                 "escape_used": final_status == "stopped" and bool(app.escape_metrics.get("pressed")),
-                "question_options": ["A", "B", "C", "D", "E跳过"],
-                "submission_flow": ["select", "submit"],
+                "action_questions": safe_int(counts.get("action_questions"), 0),
+                "numeric_questions": safe_int(counts.get("numeric_questions"), 0),
+                "ocr_corrections": safe_int(counts.get("ocr_corrections"), 0),
+                "numeric_relations": safe_int(counts.get("numeric_relations"), 0),
+                "question_options": ["A", "B", "C", "D", "E", "F", "G", "H"],
+                "submission_flow": ["select", "submit", "optional_followup"],
             },
         )
 
@@ -18534,7 +19865,7 @@ class DataStoreLifecycleMixin:
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_capture_calibrations_saved ON capture_calibrations(saved DESC)")
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS ocr_regions(id TEXT PRIMARY KEY,game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,created REAL NOT NULL,"
-            "updated REAL NOT NULL,region_norm TEXT NOT NULL,region_type TEXT NOT NULL,number_format TEXT NOT NULL,goal_relation TEXT NOT NULL,target_min REAL,"
+            "updated REAL NOT NULL,region_norm TEXT NOT NULL,region_type TEXT NOT NULL,number_format TEXT NOT NULL,goal_relation TEXT NOT NULL,relation_config TEXT NOT NULL DEFAULT '{}',target_min REAL,"
             "target_max REAL,special_value REAL,special_meaning TEXT NOT NULL,reset_meaning TEXT NOT NULL,unit TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,"
             "last_text TEXT NOT NULL,last_value REAL,last_confidence REAL NOT NULL DEFAULT 0,stable_frames INTEGER NOT NULL DEFAULT 0,checksum TEXT NOT NULL)"
         )
@@ -18769,6 +20100,40 @@ class DataStoreLifecycleMixin:
                             "CREATE INDEX IF NOT EXISTS idx_samples_game_visual_hash ON samples(game_id,visual_hash)"
                         )
                         version = 13
+                    elif version == 13:
+                        ocr_columns = self._columns("ocr_regions")
+                        if "relation_config" not in ocr_columns:
+                            self.db.execute(
+                                "ALTER TABLE ocr_regions ADD COLUMN "
+                                "relation_config TEXT NOT NULL DEFAULT '{}'"
+                            )
+                        rows = list(iter_rows(self.db.execute("SELECT * FROM ocr_regions"), 128))
+                        for row in rows:
+                            item = dict(row)
+                            try:
+                                relation_config = json.loads(item.get("relation_config") or "{}")
+                            except (json.JSONDecodeError, TypeError, ValueError):
+                                relation_config = {}
+                            item["relation_config"] = relation_config if isinstance(relation_config, dict) else {}
+                            try:
+                                item["region_norm"] = json.loads(item.get("region_norm") or "[]")
+                            except (json.JSONDecodeError, TypeError, ValueError):
+                                item["region_norm"] = []
+                            checksum = hashlib.sha256(canonical_bytes(ocr_region_checksum_payload(item))).hexdigest()
+                            self.db.execute(
+                                "UPDATE ocr_regions SET relation_config=?,checksum=? WHERE id=?",
+                                (
+                                    json.dumps(
+                                        item["relation_config"],
+                                        ensure_ascii=False,
+                                        sort_keys=True,
+                                        separators=(",", ":"),
+                                    ),
+                                    checksum,
+                                    str(item.get("id", "")),
+                                ),
+                            )
+                        version = 14
                     else:
                         raise RuntimeError("没有从数据库版本" + str(version) + "开始的迁移路径")
                     self.db.execute(
@@ -22265,6 +23630,7 @@ class DataStoreOCRVisionMixin:
             "region_type": str(value.get("region_type", "uncertain")),
             "number_format": str(value.get("number_format", "auto")),
             "goal_relation": str(value.get("goal_relation", "uncertain")),
+            "relation_config": normalize_relation_config(value.get("relation_config", {})),
             "target_min": safe_float(value.get("target_min")) if finite_number(value.get("target_min")) else None,
             "target_max": safe_float(value.get("target_max")) if finite_number(value.get("target_max")) else None,
             "special_value": (
@@ -22279,14 +23645,14 @@ class DataStoreOCRVisionMixin:
             "last_confidence": safe_float(value.get("confidence", 0.0), 0.0, 0.0, 1.0),
             "stable_frames": safe_int(value.get("stable_frames", 0), 0, 0, 1000),
         }
-        checksum = hashlib.sha256(canonical_bytes(row)).hexdigest()
+        checksum = hashlib.sha256(canonical_bytes(ocr_region_checksum_payload(row))).hexdigest()
         with self.lock, self.db:
             ocr_upsert_sql = (
                 "INSERT OR REPLACE INTO ocr_regions("
                 "id,game_id,created,updated,region_norm,region_type,number_format,"
-                "goal_relation,target_min,target_max,special_value,special_meaning,"
+                "goal_relation,relation_config,target_min,target_max,special_value,special_meaning,"
                 "reset_meaning,unit,enabled,last_text,last_value,last_confidence,"
-                "stable_frames,checksum) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                "stable_frames,checksum) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             )
             self.db.execute(
                 ocr_upsert_sql,
@@ -22299,6 +23665,7 @@ class DataStoreOCRVisionMixin:
                     row["region_type"],
                     row["number_format"],
                     row["goal_relation"],
+                    json.dumps(row["relation_config"], ensure_ascii=False, sort_keys=True, separators=(",", ":")),
                     row["target_min"],
                     row["target_max"],
                     row["special_value"],
@@ -22330,30 +23697,8 @@ class DataStoreOCRVisionMixin:
             try:
                 item = dict(row)
                 item["region_norm"] = json.loads(item["region_norm"])
-                verification = {
-                    key: item[key]
-                    for key in (
-                        "id",
-                        "game_id",
-                        "created",
-                        "updated",
-                        "region_norm",
-                        "region_type",
-                        "number_format",
-                        "goal_relation",
-                        "target_min",
-                        "target_max",
-                        "special_value",
-                        "special_meaning",
-                        "reset_meaning",
-                        "unit",
-                        "enabled",
-                        "last_text",
-                        "last_value",
-                        "last_confidence",
-                        "stable_frames",
-                    )
-                }
+                item["relation_config"] = normalize_relation_config(item.get("relation_config", {}))
+                verification = ocr_region_checksum_payload(item)
                 if hashlib.sha256(canonical_bytes(verification)).hexdigest() != str(item.get("checksum", "")):
                     continue
                 result.append(item)
@@ -25451,6 +26796,14 @@ class ActionCandidateRanker:
         visual_matches = self._visual_matches()
         self._prepare_policy_models()
         grouped = self._group_matches(visual_matches)
+        self.neural_prediction_cache = {}
+        if grouped and isinstance(self.value_model, dict):
+            self.neural_prediction_cache = neural_offline_policy_predictions(
+                self.value_model,
+                self.query_observation.to_dict(),
+                list(grouped),
+                self.active_task_id,
+            )
         self.total_support = sum(
             max(
                 1,
@@ -25814,6 +27167,9 @@ class ActionCandidateRanker:
         return CandidatePolicyEstimate(scores, failure_score, uncertainty, awr_weight, neural, count, advantage)
 
     def _neural_prediction(self, decision_id):
+        cached = getattr(self, "neural_prediction_cache", {})
+        if isinstance(cached, dict) and str(decision_id) in cached:
+            return cached[str(decision_id)]
         if not isinstance(self.value_model, dict):
             return {}
         return neural_offline_policy_prediction(
@@ -26458,13 +27814,25 @@ class AppModeService(AppServiceBase):
                 item["rule_audit_score"] = item.get("score")
                 item["ranker_fallback_used"] = True
             return ranked
-        for item in ranked:
-            prediction = world_model_prediction(
-                world,
+        world_predictions = {}
+        grouped_rollouts = defaultdict(list)
+        for index, item in enumerate(ranked):
+            group_key = (
                 item.get("task_id") or runtime.get("default_task_id"),
                 item.get("observation_state_id"),
-                item.get("skill_key", item.get("cluster_id")),
             )
+            grouped_rollouts[group_key].append((index, item.get("skill_key", item.get("cluster_id"))))
+        for (rollout_task, rollout_state), entries in grouped_rollouts.items():
+            batch = world_model_rollout_candidates(
+                world,
+                rollout_task,
+                rollout_state,
+                [action for _, action in entries],
+            )
+            for local_index, (global_index, _) in enumerate(entries):
+                world_predictions[global_index] = batch.get(str(local_index), {})
+        for item_index, item in enumerate(ranked):
+            prediction = world_predictions.get(item_index, {})
             item["success_probability"] = 0.65 * safe_float(item.get("success_probability"), 0.0) + 0.35 * safe_float(
                 prediction.get("success_probability"), 0.0
             )
@@ -27468,6 +28836,8 @@ class AppStorageService(AppServiceBase):
         )
         old_selection = (self.selected_game, self.selected_window, self.window_recommendation, self.storage_fault)
         if candidate.same:
+            materialize_entry_script(candidate.destination)
+            materialize_selected_folder_layout(candidate.destination)
             candidate.closed = True
             candidate.store = None
             candidate.source_paused = False
@@ -27619,6 +28989,7 @@ class AppStorageService(AppServiceBase):
                 bool(vision is not None and vision.ready and ocr is not None and ocr.ready)
             )
             self.data_dir_text.set(str(base))
+            verify_selected_folder_layout(base)
             if DEVELOPER_MODE:
                 materialize_project_layout(base)
             self._update_runtime_status()
@@ -28864,15 +30235,17 @@ class App:
                 details,
             )
         elif normalize_mode_id(name) == ModeId.QUIZ.value:
-            self.record_acceptance_case(
-                MODE_LABELS[ModeId.QUIZ], "choices_only", "passed" if details.get("choices_only") else "failed", details
-            )
-            self.record_acceptance_case(
-                MODE_LABELS[ModeId.QUIZ],
-                "submit_required",
-                "passed" if details.get("submit_required") else "failed",
-                details,
-            )
+            for case, key in (
+                ("structured_questions_only", "structured_questions_only"),
+                ("action_question", "action_question"),
+                ("numeric_region_question", "numeric_region_question"),
+                ("ocr_confirmation", "ocr_confirmation"),
+                ("numeric_relation_question", "numeric_relation_question"),
+                ("submit_required", "submit_required"),
+            ):
+                self.record_acceptance_case(
+                    MODE_LABELS[ModeId.QUIZ], case, "passed" if details.get(key) else "failed", details
+                )
             self.record_acceptance_case(
                 MODE_LABELS[ModeId.QUIZ],
                 "finish_button",
@@ -29733,9 +31106,9 @@ def run_acceptance_test(path=None):
     return strict_acceptance_gate(path)
 
 
-EXTENSION_SCHEMA_VERSION = 4
-VISION_ARCHITECTURE_VERSION = 2
-OCR_SEMANTIC_VERSION = 1
+EXTENSION_SCHEMA_VERSION = 5
+VISION_ARCHITECTURE_VERSION = 3
+OCR_SEMANTIC_VERSION = 2
 
 
 class SemanticEventHub:
@@ -30207,6 +31580,79 @@ def materialize_project_layout(base):
     if contract_builder is not None:
         contract_builder.materialize_contract(base)
     return root
+
+
+def materialize_selected_folder_layout(base):
+    root = Path(base).expanduser().resolve()
+    source = Path(__file__).read_text(encoding="utf-8")
+    modules = project_module_templates(source)
+    payload = {
+        relative: content
+        for relative, content in modules.items()
+        if relative.startswith("src/") or relative.startswith("tests/")
+    }
+    payload["runtime/runtime_manifest.json"] = json.dumps(
+        {
+            "layout_version": RUNTIME_LAYOUT_VERSION,
+            "runtime_install_state": "pending_or_managed",
+            "entrypoint": "../main.py",
+            "integrity": "manifests/source_manifest.json",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    entries = []
+    for relative, content in sorted(payload.items()):
+        target = root / relative
+        encoded = content.encode("utf-8")
+        durable_atomic_write(target, encoded, root)
+        actual = target.read_bytes()
+        expected_hash = hashlib.sha256(encoded).hexdigest()
+        if actual != encoded or hashlib.sha256(actual).hexdigest() != expected_hash:
+            raise RuntimeError("自解包文件SHA-256校验失败：" + relative)
+        entries.append({"path": relative, "size": len(encoded), "sha256": expected_hash})
+    manifest = {
+        "format": 1,
+        "layout": ["runtime", "src", "tests", "manifests"],
+        "entrypoint": "main.py",
+        "entrypoint_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "files": entries,
+        "file_count": len(entries),
+        "generated": time.time(),
+    }
+    manifest_bytes = json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    durable_atomic_write(root / "manifests/source_manifest.json", manifest_bytes, root)
+    verify_selected_folder_layout(root)
+    return manifest
+
+
+def verify_selected_folder_layout(base):
+    root = Path(base).expanduser().resolve()
+    path = root / "manifests/source_manifest.json"
+    if not path.is_file():
+        raise RuntimeError("自解包目录缺少源文件清单")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    entrypoint = root / str(manifest.get("entrypoint", "main.py"))
+    expected_main = str(manifest.get("entrypoint_sha256", ""))
+    if not entrypoint.is_file() or len(expected_main) != 64 or sha256_file(entrypoint) != expected_main:
+        raise RuntimeError("自解包main.py校验失败")
+    for item in manifest.get("files", []):
+        relative = str(item.get("path", ""))
+        target = root / relative
+        try:
+            target.relative_to(root)
+        except ValueError as error:
+            raise RuntimeError("自解包清单路径越界：" + relative) from error
+        if (
+            not target.is_file()
+            or target.stat().st_size != safe_int(item.get("size"), -1)
+            or sha256_file(target) != str(item.get("sha256", ""))
+        ):
+            raise RuntimeError("自解包文件SHA-256校验失败：" + relative)
+    return manifest
 
 
 def configure_data_directory(path, context=None):
@@ -30856,6 +32302,7 @@ def prepare_data_directory(path, stop_event=None, progress=None, source_store=No
         ):
             (staging / name).mkdir(parents=True, exist_ok=True)
         main_hash = materialize_entry_script(staging)
+        materialize_selected_folder_layout(staging)
         if DEVELOPER_MODE:
             materialize_project_layout(staging)
         if progress is not None:
@@ -32350,12 +33797,12 @@ class GameSpecificVisionTrainer:
         ]
         output = [self.runtime._sigmoid(value) for value in pre_output]
         output_gradient = [
-            2.0 * (output[k] - target[k]) * (1.0 if 0.0 < pre_output[k] < 1.0 else 0.0)
+            2.0 * (output[k] - target[k]) * output[k] * (1.0 - output[k])
             for k in range(3)
         ]
         latent_gradient = [
             sum(output_gradient[k] * decoder_weights[k][j] for k in range(3))
-            * (1.0 if 0.0 < pre_latent[j] < 1.0 else 0.0)
+            * latent[j] * (1.0 - latent[j])
             for j in range(4)
         ]
         for k in range(3):
@@ -32431,7 +33878,7 @@ class GameSpecificVisionTrainer:
             while completed_steps < data.total_steps:
                 self._raise_if_stopped("PyTorch离线视觉模型训练已停止")
                 plan = self._wait_for_training_plan()
-                data.batch_size = max(1, min(data.batch_size, plan.training_batch_size, len(valid)))
+                data.batch_size = max(1, min(data.batch_size, plan.vision_batch_size, len(valid)))
                 try:
                     self._torch_training_step(data, valid)
                     completed_steps += 1
@@ -32484,8 +33931,12 @@ class GameSpecificVisionTrainer:
         autoencoder = self._autoencoder_type(torch)
         model = autoencoder(training_encoder, len(action_vocabulary)).to(self.runtime.device)
         model.train()
-        for parameter in list(model.encoder.c1.parameters()) + list(model.encoder.c2.parameters()):
-            parameter.requires_grad = False
+        frozen_modules = [model.encoder.c1, model.encoder.c2]
+        if hasattr(model.encoder, "c1_norm"):
+            frozen_modules.append(model.encoder.c1_norm)
+        for module in frozen_modules:
+            for parameter in module.parameters():
+                parameter.requires_grad = False
         optimizer = torch.optim.AdamW(
             [parameter for parameter in model.parameters() if parameter.requires_grad],
             lr=0.0012,
@@ -32528,7 +33979,7 @@ class GameSpecificVisionTrainer:
             generator,
             torch_generator,
             max(32, min(320, len(valid) * 4)),
-            max(1, min(plan.training_batch_size, len(valid))),
+            max(1, min(plan.vision_batch_size, len(valid))),
             amp_enabled,
             scaler,
         )
@@ -32829,6 +34280,7 @@ class OfflineVisionRuntime:
                 self.device_name = "NumPy CPU可训练编码器" if self.np is not None else "内置CPU可训练编码器"
                 if selected_family != "windows-x64-cpu":
                     raise RuntimeError("所选GPU后端加载失败，拒绝在正式流程中静默切换设备：" + str(error)) from error
+            run_startup_microbenchmark(self.base, self.torch, self.device, selected_family)
         except RECOVERABLE_ERRORS as error:
             self.ready = False
             self.error = str(error)
@@ -32846,22 +34298,78 @@ class OfflineVisionRuntime:
 
     def _build_model(self):
         torch = self.torch
+        backend = str((self.runtime_manifest or {}).get("runtime_family", "windows-x64-cpu"))
+        gpu_profile = backend.startswith("windows-x64-nvidia") or backend == "windows-x64-directml"
+
+        class InvertedResidual(torch.nn.Module):
+            def __init__(self, input_channels, output_channels, expansion_channels, stride=1):
+                super().__init__()
+                self.use_residual = stride == 1 and input_channels == output_channels
+                self.expand = torch.nn.Conv2d(input_channels, expansion_channels, 1, bias=False)
+                self.expand_norm = torch.nn.BatchNorm2d(expansion_channels)
+                self.depthwise = torch.nn.Conv2d(
+                    expansion_channels,
+                    expansion_channels,
+                    3,
+                    stride=stride,
+                    padding=1,
+                    groups=expansion_channels,
+                    bias=False,
+                )
+                self.depthwise_norm = torch.nn.BatchNorm2d(expansion_channels)
+                self.project = torch.nn.Conv2d(expansion_channels, output_channels, 1, bias=False)
+                self.project_norm = torch.nn.BatchNorm2d(output_channels)
+
+            def forward(self, value):
+                residual = value
+                value = torch.nn.functional.hardswish(self.expand_norm(self.expand(value)))
+                value = torch.nn.functional.hardswish(self.depthwise_norm(self.depthwise(value)))
+                value = self.project_norm(self.project(value))
+                return value + residual if self.use_residual else value
 
         class Encoder(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.c1 = torch.nn.Conv2d(3, 24, 3, padding=1)
-                self.c2 = torch.nn.Conv2d(24, 32, 3, padding=1)
-                self.c3 = torch.nn.Conv2d(32, 32, 3, padding=1)
-                self.out = torch.nn.Conv2d(32, 4, 1)
+                stem_channels = 24 if not gpu_profile else 32
+                stage_channels = (32, 48, 64, 96) if not gpu_profile else (40, 64, 96, 128)
+                expansions = (96, 128, 192, 256) if not gpu_profile else (128, 192, 288, 384)
+                self.c1 = torch.nn.Conv2d(3, stem_channels, 3, padding=1, bias=False)
+                self.c1_norm = torch.nn.BatchNorm2d(stem_channels)
+                self.c2 = InvertedResidual(stem_channels, stage_channels[0], expansions[0])
+                self.c3 = InvertedResidual(stage_channels[0], stage_channels[1], expansions[1])
+                self.c4 = InvertedResidual(stage_channels[1], stage_channels[2], expansions[2])
+                self.c5 = InvertedResidual(stage_channels[2], stage_channels[3], expansions[3])
+                self.embedding_projection = torch.nn.Conv2d(stage_channels[3], VISUAL_EMBEDDING_SIZE, 1, bias=False)
+                self.embedding_norm = torch.nn.BatchNorm2d(VISUAL_EMBEDDING_SIZE)
+                self.out = torch.nn.Conv2d(VISUAL_EMBEDDING_SIZE, 4, 1)
+
+            def forward_features(self, value):
+                low = torch.nn.functional.hardswish(self.c1_norm(self.c1(value)))
+                middle = self.c3(self.c2(low))
+                high = self.c5(self.c4(middle))
+                embedding_map = torch.nn.functional.hardswish(
+                    self.embedding_norm(self.embedding_projection(high))
+                )
+                return low, middle, embedding_map
+
+            def global_embedding(self, value):
+                embedding_map = self.forward_features(value)[-1]
+                pooled = torch.nn.functional.adaptive_avg_pool2d(embedding_map, 1).flatten(1)
+                return torch.nn.functional.normalize(pooled, dim=1)
 
             def forward(self, value):
-                value = torch.nn.functional.gelu(self.c1(value))
-                value = torch.nn.functional.gelu(self.c2(value))
-                value = torch.nn.functional.gelu(self.c3(value))
-                return torch.sigmoid(self.out(value))
+                embedding_map = self.forward_features(value)[-1]
+                return torch.sigmoid(self.out(embedding_map))
 
-        return Encoder().to(self.device)
+        model = Encoder().to(self.device)
+        model.backbone_contract = {
+            "family": "mobilenet_v3_small_like_depthwise",
+            "pretrained_source": "bundled_shared_backbone_or_deterministic_generic_initialization",
+            "embedding_size": VISUAL_EMBEDDING_SIZE,
+            "multiscale": True,
+            "compatibility_projection_channels": 4,
+        }
+        return model
 
     def _path_for(self, game_id):
         safe = hashlib.sha256(str(game_id).encode("utf-8", "replace")).hexdigest()
@@ -33028,8 +34536,10 @@ class OfflineVisionRuntime:
         state = self._save_builtin_state(state)
         return state
 
-    def _sigmoid(value):
-        return max(0.0, min(1.0, float(value)))
+    @staticmethod
+    def _sigmoid(value: float) -> float:
+        value = max(-30.0, min(30.0, float(value)))
+        return 1.0 / (1.0 + math.exp(-value))
 
     def _activate_game_base(self, game_id):
         self.require_ready()
@@ -33127,6 +34637,13 @@ class OfflineVisionRuntime:
             "explicit_temporal_pairs": not builtin or self.trained_steps > 0,
             "shared_base_encoder": shared_path.exists(),
             "multiscale_state": True,
+            "global_scene_embedding_size": VISUAL_EMBEDDING_SIZE,
+            "backbone_family": (
+                "mobilenet_v3_small_like_depthwise"
+                if not builtin
+                else "stable_sigmoid_linear_safety_fallback"
+            ),
+            "compatibility_projection_only": 4,
             "action_prediction_objective": self.trained_steps > 0,
             "next_state_prediction_objective": self.trained_steps > 0,
             "interactive_object_and_terminal_objectives": self.trained_steps > 0,
@@ -34469,6 +35986,47 @@ class OCRRuntimeProxy:
         return self.worker.request("ocr_recognize_region", {"frame": dict(frame), "norm": norm}, 45.0)
 
 
+def normalize_relation_config(value):
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value or "{}")
+            return dict(parsed) if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
+    return {}
+
+
+def ocr_region_checksum_payload(item):
+    value = dict(item) if isinstance(item, dict) else {}
+    return {
+        key: value.get(key)
+        for key in (
+            "id",
+            "game_id",
+            "created",
+            "updated",
+            "region_norm",
+            "region_type",
+            "number_format",
+            "goal_relation",
+            "relation_config",
+            "target_min",
+            "target_max",
+            "special_value",
+            "special_meaning",
+            "reset_meaning",
+            "unit",
+            "enabled",
+            "last_text",
+            "last_value",
+            "last_confidence",
+            "stable_frames",
+        )
+    }
+
+
 def _rect_iou(first, second):
     ax, ay, aw, ah = [safe_float(value) for value in first]
     bx, by, bw, bh = [safe_float(value) for value in second]
@@ -34481,9 +36039,44 @@ def _rect_iou(first, second):
     return intersection / union
 
 
-def parse_ocr_number(text, number_format="auto"):
-    import re
+OCR_DIGIT_CONFUSIONS = {
+    "O": "0",
+    "o": "0",
+    "I": "1",
+    "l": "1",
+}
+OCR_OPTIONAL_DIGIT_CONFUSIONS = {
+    "B": "8",
+    "S": "5",
+    "Z": "2",
+}
 
+
+def normalize_numeric_token(token):
+    compact = str(token or "").strip()
+    digit_like = sum(character.isdigit() or character in "OoIlBSZ.,:/%+-KkMmBb" for character in compact)
+    if digit_like / max(1, len(compact)) < 0.70:
+        return compact
+    return "".join(OCR_DIGIT_CONFUSIONS.get(character, character) for character in compact)
+
+
+def _numeric_variant_values(token):
+    variants = {normalize_numeric_token(token)}
+    base = normalize_numeric_token(token)
+    for index, character in enumerate(base):
+        replacement = OCR_OPTIONAL_DIGIT_CONFUSIONS.get(character)
+        if replacement:
+            variants.add(base[:index] + replacement + base[index + 1 :])
+        if character == "8":
+            variants.add(base[:index] + "3" + base[index + 1 :])
+        elif character == "6":
+            variants.add(base[:index] + "8" + base[index + 1 :])
+        elif character == "0":
+            variants.add(base[:index] + "6" + base[index + 1 :])
+    return list(variants)[:8]
+
+
+def parse_ocr_number(text, number_format="auto"):
     raw = (
         str(text or "")
         .strip()
@@ -34492,8 +36085,6 @@ def parse_ocr_number(text, number_format="auto"):
         .replace("：", ":")
         .replace("／", "/")
         .replace("−", "-")
-        .replace("O", "0")
-        .replace("o", "0")
     )
     compact = re.sub(r"\s+", "", raw)
     result = {
@@ -34504,46 +36095,237 @@ def parse_ocr_number(text, number_format="auto"):
         "seconds": None,
         "unit": "",
         "normalized": compact,
+        "confidence": 0.0,
+        "alternatives": [],
+        "ambiguities": [],
+        "raw_token": "",
     }
     if not compact:
         return result
-    time_match = re.fullmatch(r"(-?\d+):([0-5]?\d)(?::([0-5]?\d))?", compact)
+    ambiguity_labels = []
+    for character in compact:
+        if character in "Oo":
+            ambiguity_labels.append("0/O")
+        elif character in "Il":
+            ambiguity_labels.append("1/I/l")
+        elif character == "B":
+            ambiguity_labels.append("8/B")
+        elif character == "S":
+            ambiguity_labels.append("5/S")
+        elif character == "Z":
+            ambiguity_labels.append("2/Z")
+    token_patterns = [
+        r"[-+]?[0-9OoIl]{1,5}:[0-9OoIl]{1,2}(?::[0-9OoIl]{1,2})?",
+        r"[-+]?[0-9OoIlBSZ]+(?:[.,][0-9OoIlBSZ]+)?/[-+]?[0-9OoIlBSZ]+(?:[.,][0-9OoIlBSZ]+)?",
+        r"[-+]?[0-9OoIlBSZ]+(?:[.,][0-9OoIlBSZ]+)?(?:[%KkMmBb])?",
+    ]
+    tokens = []
+    for pattern in token_patterns:
+        for match in re.finditer(pattern, compact):
+            token = match.group(0)
+            if not any(character.isdigit() for character in token):
+                continue
+            tokens.append((match.start(), -len(token), token))
+    if not tokens:
+        return result
+    _, _, token = sorted(tokens)[0]
+    normalized = normalize_numeric_token(token)
+    normalized = "".join(OCR_OPTIONAL_DIGIT_CONFUSIONS.get(character, character) for character in normalized)
+    result["raw_token"] = token
+    result["normalized"] = normalized
+    result["ambiguities"] = list(dict.fromkeys(ambiguity_labels))
+    ambiguity_count = len(result["ambiguities"])
+    digit_ratio = sum(character.isdigit() for character in normalized) / max(1, len(normalized))
+    confidence = max(0.20, min(0.99, 0.96 - 0.09 * ambiguity_count + 0.08 * digit_ratio))
+    time_match = re.fullmatch(r"(-?\d+):([0-5]?\d)(?::([0-5]?\d))?", normalized)
     if time_match:
         parts = [int(value) for value in time_match.groups() if value is not None]
         seconds = parts[0] * 60 + parts[1] if len(parts) == 2 else parts[0] * 3600 + parts[1] * 60 + parts[2]
-        result.update({"valid": True, "kind": "time", "seconds": float(seconds), "value": float(seconds)})
-        return result
-    pair = re.search(r"(-?\d+(?:\.\d+)?)[/](-?\d+(?:\.\d+)?)", compact)
-    if pair:
         result.update(
-            {"valid": True, "kind": "current_max", "value": float(pair.group(1)), "maximum": float(pair.group(2))}
+            {
+                "valid": True,
+                "kind": "time",
+                "seconds": float(seconds),
+                "value": float(seconds),
+                "confidence": confidence,
+            }
         )
+        result["alternatives"] = [float(seconds)]
         return result
-    match = re.search(r"[-+]?\d+(?:[.,]\d+)?", compact)
+    pair = re.fullmatch(r"(-?\d+(?:\.\d+)?)[/](-?\d+(?:\.\d+)?)", normalized.replace(",", "."))
+    if pair:
+        current = float(pair.group(1))
+        maximum = float(pair.group(2))
+        result.update(
+            {
+                "valid": True,
+                "kind": "current_max",
+                "value": current,
+                "maximum": maximum,
+                "confidence": confidence,
+            }
+        )
+        result["alternatives"] = [current]
+        return result
+    match = re.fullmatch(r"([-+]?\d+(?:[.,]\d+)?)([%KkMmBb]?)", normalized)
     if not match:
         return result
-    number = float(match.group(0).replace(",", "."))
-    suffix = compact[match.end() :].upper()
+    number = float(match.group(1).replace(",", "."))
+    suffix = match.group(2).upper()
     multiplier = 1.0
     unit = suffix
-    if suffix.startswith("K"):
+    if suffix == "K":
         multiplier = 1000.0
-        unit = "K"
-    elif suffix.startswith("M"):
+    elif suffix == "M":
         multiplier = 1000000.0
-        unit = "M"
-    elif suffix.startswith("B"):
+    elif suffix == "B":
         multiplier = 1000000000.0
-        unit = "B"
     value = number * multiplier
-    kind = "decimal" if "." in match.group(0) or "," in match.group(0) else "integer"
-    if "%" in compact:
+    kind = "decimal" if "." in match.group(1) or "," in match.group(1) else "integer"
+    if suffix == "%":
         kind = "percent"
     elif multiplier != 1.0:
         kind = "unit"
     elif any(symbol in compact for symbol in ("$", "¥", "￥", "€", "£", "分")):
         kind = "currency_or_score"
-    result.update({"valid": True, "kind": kind, "value": value, "unit": unit})
+    alternatives = []
+    for variant in _numeric_variant_values(token):
+        candidate = "".join(OCR_OPTIONAL_DIGIT_CONFUSIONS.get(character, character) for character in variant)
+        candidate_match = re.fullmatch(r"([-+]?\d+(?:[.,]\d+)?)([%KkMmBb]?)", candidate)
+        if not candidate_match:
+            continue
+        candidate_number = float(candidate_match.group(1).replace(",", "."))
+        candidate_suffix = candidate_match.group(2).upper()
+        candidate_multiplier = (
+            1000.0
+            if candidate_suffix == "K"
+            else 1000000.0
+            if candidate_suffix == "M"
+            else 1000000000.0
+            if candidate_suffix == "B"
+            else 1.0
+        )
+        alternatives.append(candidate_number * candidate_multiplier)
+    alternatives = list(dict.fromkeys(alternatives))[:6]
+    if value not in alternatives:
+        alternatives.insert(0, value)
+    result.update(
+        {
+            "valid": True,
+            "kind": kind,
+            "value": value,
+            "unit": unit,
+            "confidence": confidence,
+            "alternatives": alternatives,
+        }
+    )
+    return result
+
+
+class OCRConsensusTracker:
+    def __init__(self, window_size=5):
+        self.window_size = max(3, int(window_size))
+        self.history = defaultdict(lambda: deque(maxlen=self.window_size))
+        self.lock = threading.RLock()
+
+    def update(self, region_id, text, value, confidence):
+        token = str(region_id)
+        number = safe_float(value) if finite_number(value) else None
+        record = {
+            "text": str(text or ""),
+            "normalized": normalize_numeric_token(str(text or "")),
+            "value": number,
+            "confidence": safe_float(confidence, 0.0, 0.0, 1.0),
+        }
+        with self.lock:
+            history = self.history[token]
+            history.append(record)
+            values = [item["value"] for item in history if item["value"] is not None]
+            normalized = [item["normalized"] for item in history if item["normalized"]]
+        stable_frames = 0
+        consensus_value = number
+        if values:
+            median = statistics.median(values)
+            tolerance = max(1e-6, max(abs(median), 1.0) * 0.002)
+            for old in reversed(values):
+                if abs(old - median) <= tolerance:
+                    stable_frames += 1
+                else:
+                    break
+            consensus_value = median if stable_frames >= 3 else number
+        text_counts = Counter(normalized)
+        consensus_text = text_counts.most_common(1)[0][0] if text_counts else str(text or "")
+        distinct_values = []
+        for item in values:
+            if not any(abs(item - old) <= max(1e-6, abs(old) * 0.002) for old in distinct_values):
+                distinct_values.append(item)
+        conflict = len(distinct_values) >= 3 and stable_frames < 2
+        average_confidence = statistics.fmean(item["confidence"] for item in list(self.history[token]))
+        adjusted = max(
+            0.0,
+            min(
+                1.0,
+                average_confidence
+                + min(0.24, stable_frames * 0.06)
+                - (0.28 if conflict else 0.0),
+            ),
+        )
+        return {
+            "text": consensus_text,
+            "value": consensus_value,
+            "confidence": adjusted,
+            "stable_frames": stable_frames,
+            "conflict": conflict,
+            "history_size": len(self.history[token]),
+        }
+
+
+def evaluate_numeric_context_rule(relation_config, current, previous, runtime_context=None):
+    config = normalize_relation_config(relation_config)
+    context = dict(runtime_context) if isinstance(runtime_context, dict) else {}
+    rule = str(config.get("rule", "uncertain"))
+    result = {"progress": 0.0, "status": "context_dependent", "terminal": "", "reset": ""}
+    delta = current - previous if previous is not None else 0.0
+    threshold = config.get("threshold")
+    if rule == "near_target" and finite_number(threshold) and previous is not None:
+        target = safe_float(threshold)
+        result["progress"] = (
+            1.0
+            if abs(current - target) < abs(previous - target)
+            else -1.0
+            if abs(current - target) > abs(previous - target)
+            else 0.0
+        )
+        result["status"] = "near_target"
+    elif rule == "in_range":
+        low = config.get("minimum", config.get("target_min"))
+        high = config.get("maximum", config.get("target_max"))
+        if finite_number(low) and finite_number(high):
+            low_value, high_value = sorted((safe_float(low), safe_float(high)))
+            result["status"] = "in_range" if low_value <= current <= high_value else "out_of_range"
+    elif rule == "low_threshold_danger" and finite_number(threshold):
+        result["status"] = "danger" if current < safe_float(threshold) else "safe"
+    elif rule == "high_threshold_success" and finite_number(threshold):
+        if current >= safe_float(threshold):
+            result["terminal"] = "success"
+            result["status"] = "success_threshold"
+    elif rule == "resource":
+        result["progress"] = 1.0 if delta > 0 else -1.0 if delta < 0 else 0.0
+        result["status"] = "resource"
+    elif rule == "countdown":
+        result["progress"] = 1.0 if delta < 0 else -1.0 if delta > 0 else 0.0
+        result["status"] = "countdown"
+    elif rule == "phase_dependent":
+        phase = str(context.get("task_phase", "unknown"))
+        phase_rules = config.get("phase_rules") if isinstance(config.get("phase_rules"), dict) else {}
+        phase_relation = str(phase_rules.get(phase, phase_rules.get("default", "uncertain")))
+        if phase_relation == NumericGoalRelation.HIGHER_BETTER.value:
+            result["progress"] = 1.0 if delta > 0 else -1.0 if delta < 0 else 0.0
+        elif phase_relation == NumericGoalRelation.LOWER_BETTER.value:
+            result["progress"] = 1.0 if delta < 0 else -1.0 if delta > 0 else 0.0
+        result["status"] = "phase:" + phase
+    else:
+        result["status"] = "context_uncertain"
     return result
 
 
@@ -34552,7 +36334,7 @@ class OCRSemanticEngine:
         self.previous = {}
         self.lock = threading.RLock()
 
-    def evaluate(self, definition, parsed):
+    def evaluate(self, definition, parsed, runtime_context=None):
         region_id = str(definition.get("id", ""))
         event = {
             "terminal": "",
@@ -34598,7 +36380,10 @@ class OCRSemanticEngine:
                     event["progress"] = 1.0 if delta < 0 else -1.0
                 elif relation == "near_target" and finite_number(target_min):
                     event["progress"] = (
-                        1.0 if abs(current - safe_float(target_min)) < abs(previous - safe_float(target_min)) else -1.0
+                        1.0
+                        if abs(current - safe_float(target_min))
+                        < abs(previous - safe_float(target_min))
+                        else -1.0
                     )
                 elif relation == "in_range" and finite_number(target_min) and finite_number(target_max):
                     low = min(safe_float(target_min), safe_float(target_max))
@@ -34606,13 +36391,36 @@ class OCRSemanticEngine:
                     before = 0.0 if low <= previous <= high else min(abs(previous - low), abs(previous - high))
                     after = 0.0 if low <= current <= high else min(abs(current - low), abs(current - high))
                     event["progress"] = 1.0 if after < before else -1.0 if after > before else 0.0
+                elif relation == NumericGoalRelation.IRRELEVANT.value:
+                    event["progress"] = 0.0
+                elif relation == NumericGoalRelation.CONTEXT_DEPENDENT.value:
+                    event.update(
+                        evaluate_numeric_context_rule(
+                            definition.get("relation_config", {}),
+                            current,
+                            previous,
+                            runtime_context,
+                        )
+                    )
             if previous != 0 and abs(current - previous) > max(10.0, abs(previous) * 0.65):
                 reset = str(definition.get("reset_meaning", "uncertain"))
                 if reset in {"new_round", "level_change", "player_failure", "cycle", "normal"}:
                     event["reset"] = reset
                 if reset == "player_failure":
                     event["terminal"] = "failure"
-        if relation == "in_range" and finite_number(target_min) and finite_number(target_max):
+        if relation == NumericGoalRelation.IRRELEVANT.value:
+            event["progress"] = 0.0
+            event["status"] = "informational"
+        elif relation == NumericGoalRelation.CONTEXT_DEPENDENT.value and previous is None:
+            event.update(
+                evaluate_numeric_context_rule(
+                    definition.get("relation_config", {}),
+                    current,
+                    previous,
+                    runtime_context,
+                )
+            )
+        elif relation == "in_range" and finite_number(target_min) and finite_number(target_max):
             low = min(safe_float(target_min), safe_float(target_max))
             high = max(safe_float(target_min), safe_float(target_max))
             event["status"] = "in_range" if low <= current <= high else "out_of_range"
@@ -34640,6 +36448,7 @@ class OCRMonitor:
         self.thread = None
         self.last_stamp = 0.0
         self.last_saved = defaultdict(float)
+        self.consensus = OCRConsensusTracker(5)
 
     def start(self):
         self.thread = threading.Thread(target=self._run, name="UniversalGameAI-OCR-" + self.purpose, daemon=True)
@@ -34652,14 +36461,14 @@ class OCRMonitor:
             definitions = self.app.store.list_ocr_regions(game["id"], True)
             if not definitions:
                 return
-            while not self.stop_event.is_set() and not self.context.callbacks.should_stop():
+            while not self.stop_event.is_set() and not self.app.should_stop():
                 frame = self.frame_buffer.latest(None, 1.0)
                 if frame is None or frame.get("time") == self.last_stamp or not frame.get("capture_valid"):
                     self.stop_event.wait(0.12)
                     continue
                 self.last_stamp = frame.get("time")
                 for definition in definitions:
-                    if self.stop_event.is_set() or self.context.callbacks.should_stop():
+                    if self.stop_event.is_set() or self.app.should_stop():
                         break
                     try:
                         recognized = self.app.ocr_runtime.recognize_region(frame, definition["region_norm"])
@@ -34668,8 +36477,30 @@ class OCRMonitor:
                             if definition.get("region_type") == "number"
                             else {"valid": False}
                         )
+                        consensus = self.consensus.update(
+                            definition["id"],
+                            recognized.get("text", ""),
+                            parsed.get("value") if isinstance(parsed, dict) else None,
+                            recognized.get("confidence", 0.0),
+                        )
+                        if parsed.get("valid") and finite_number(consensus.get("value")):
+                            parsed = dict(parsed)
+                            parsed["value"] = safe_float(consensus.get("value"))
+                            parsed["confidence"] = max(
+                                safe_float(parsed.get("confidence", 0.0), 0.0),
+                                safe_float(consensus.get("confidence", 0.0), 0.0),
+                            )
+                            parsed["consensus_text"] = str(consensus.get("text", ""))
+                            parsed["stable_frames"] = safe_int(consensus.get("stable_frames"), 0)
+                            parsed["temporal_disagreement"] = bool(consensus.get("conflict"))
+                        runtime_context = {
+                            "task_phase": str(frame.get("task_phase", "unknown")),
+                            "subgoal_id": str(frame.get("subgoal_id", "")),
+                            "terminal_state": str(frame.get("terminal_state", "")),
+                            "recent_actions": list(frame.get("recent_actions", []))[-8:],
+                        }
                         event = (
-                            OCR_SEMANTIC_ENGINE.evaluate(definition, parsed)
+                            OCR_SEMANTIC_ENGINE.evaluate(definition, parsed, runtime_context)
                             if definition.get("region_type") == "number"
                             else {
                                 "terminal": "",
@@ -34679,6 +36510,8 @@ class OCRMonitor:
                                 "semantic_version": OCR_SEMANTIC_VERSION,
                             }
                         )
+                        event["ocr_temporal_disagreement"] = bool(consensus.get("conflict"))
+                        event["stable_frames"] = safe_int(consensus.get("stable_frames"), 0)
                         SEMANTIC_EVENT_HUB.publish(game["id"], definition["id"], event)
                         now = time.monotonic()
                         if now - self.last_saved[definition["id"]] >= 0.8:
@@ -34688,8 +36521,8 @@ class OCRMonitor:
                                 definition["id"],
                                 recognized.get("text", ""),
                                 parsed,
-                                recognized.get("confidence", 0.0),
-                                1,
+                                consensus.get("confidence", recognized.get("confidence", 0.0)),
+                                consensus.get("stable_frames", 0),
                                 event,
                             )
                     except Exception as error:
@@ -37698,6 +39531,79 @@ def shared_multiscale_feature_maps(frame):
     }
 
 
+def normalized_visual_embedding(shared_maps=None, objects=None, size=VISUAL_EMBEDDING_SIZE):
+    """Project real multiscale numeric visual evidence into a stable normalized vector."""
+    maps = shared_maps if isinstance(shared_maps, dict) else {}
+    object_values = objects if isinstance(objects, (list, tuple)) else []
+    output_size = max(16, min(256, safe_int(size, VISUAL_EMBEDDING_SIZE, 16, 256)))
+    accumulator = [0.0] * output_size
+    counts = [0] * output_size
+
+    def add(value, ordinal, namespace):
+        number = safe_float(value, 0.0, -8.0, 8.0)
+        digest = hashlib.blake2b((str(namespace) + "|" + str(ordinal)).encode("utf-8"), digest_size=4).digest()
+        first = int.from_bytes(digest[:2], "little") % output_size
+        second = int.from_bytes(digest[2:], "little") % output_size
+        sign = -1.0 if digest[0] & 1 else 1.0
+        accumulator[first] += sign * number
+        accumulator[second] += 0.5 * number
+        counts[first] += 1
+        counts[second] += 1
+
+    ordinal = 0
+    levels = maps.get("levels", {}) if isinstance(maps.get("levels"), dict) else {}
+    for level_name in sorted(levels):
+        values = levels.get(level_name, [])
+        if not isinstance(values, (list, tuple)):
+            continue
+        step = max(1, len(values) // 1024)
+        for value in values[::step]:
+            add(value, ordinal, "level:" + level_name)
+            ordinal += 1
+    for value in maps.get("motion", []) if isinstance(maps.get("motion"), list) else []:
+        add(value, ordinal, "motion")
+        ordinal += 1
+    tokens = maps.get("semantic_tokens", []) if isinstance(maps.get("semantic_tokens"), list) else []
+    for token_index, token in enumerate(tokens[:256]):
+        if not isinstance(token, (list, tuple)):
+            continue
+        for column, value in enumerate(token[:64]):
+            add(value, column, "semantic:" + str(token_index))
+    for object_index, item in enumerate(object_values[:32]):
+        if not isinstance(item, dict):
+            continue
+        appearance = item.get("appearance", item.get("appearance_embedding", []))
+        if isinstance(appearance, (list, tuple)):
+            for column, value in enumerate(appearance[:32]):
+                add(value, column, "object:" + str(object_index))
+        bbox = item.get("bbox", [])
+        if isinstance(bbox, (list, tuple)):
+            for column, value in enumerate(bbox[:4]):
+                add(value, column, "bbox:" + str(object_index))
+    vector = [accumulator[index] / math.sqrt(max(1, counts[index])) for index in range(output_size)]
+    mean = statistics.fmean(vector) if vector else 0.0
+    centered = [value - mean for value in vector]
+    norm = math.sqrt(sum(value * value for value in centered)) or 1.0
+    return [round(value / norm, 7) for value in centered]
+
+
+def observation_visual_embedding(observation, size=VISUAL_EMBEDDING_SIZE):
+    item = observation if isinstance(observation, dict) else {}
+    internal = item.get("internal_state", {}) if isinstance(item.get("internal_state"), dict) else {}
+    stored = internal.get("visual_embedding", item.get("visual_embedding", []))
+    if isinstance(stored, (list, tuple)) and stored:
+        values = [safe_float(value, 0.0, -4.0, 4.0) for value in stored[:size]]
+        norm = math.sqrt(sum(value * value for value in values)) or 1.0
+        return [(value / norm) for value in (values + [0.0] * size)[:size]]
+    maps = (
+        internal.get("shared_multiscale_backbone", {})
+        if isinstance(internal.get("shared_multiscale_backbone"), dict)
+        else {}
+    )
+    objects = item.get("objects", []) if isinstance(item.get("objects"), list) else []
+    return normalized_visual_embedding(maps, objects, size)
+
+
 class ObjectCentricObservationEncoder(MultiScaleObservationEncoder):
     def __init__(self):
         super().__init__(AUTONOMOUS_OBJECT_DETECTOR)
@@ -37820,11 +39726,17 @@ class ObjectCentricObservationEncoder(MultiScaleObservationEncoder):
         }
         state_id = hashlib.sha256(canonical_bytes(state_material)).hexdigest()[:32]
         semantic_model = context.get("semantic_encoder") if isinstance(context.get("semantic_encoder"), dict) else None
+        internal["visual_embedding"] = normalized_visual_embedding(
+            shared_maps,
+            object_material,
+            VISUAL_EMBEDDING_SIZE,
+        )
         internal["continuous_state_embedding"] = semantic_embedding(
             {
                 "objects": object_material,
                 "task": base.task,
                 "memory": memory,
+                "visual_embedding": internal["visual_embedding"],
                 "visual_tokens": shared_maps.get("semantic_tokens", [])[:128],
                 "visual_backend": shared_maps.get("semantic_backend", ""),
             },
@@ -38352,21 +40264,42 @@ class SharedSemanticEncoder:
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0])):
                 result.extend(self.tokens(key))
                 result.extend(self.tokens(item))
-            return result
+            return list(dict.fromkeys(result))[:192]
         if isinstance(value, (list, tuple, set, deque)):
             result = []
             for item in value:
                 result.extend(self.tokens(item))
-            return result
+            return list(dict.fromkeys(result))[:192]
         text = self.normalize(value)
         if not text:
             return []
         result = []
-        for alias, concept in sorted(self.aliases.items(), key=lambda pair: len(pair[0]), reverse=True):
-            if alias and alias in text:
-                result.append("concept:" + concept)
-        result.extend(re.findall(r"[a-z0-9]+|[\u3400-\u9fff]", text))
-        return list(dict.fromkeys(result))[:96]
+        occupied = [False] * len(text)
+        for alias, concept in sorted(self.aliases.items(), key=lambda pair: (-len(pair[0]), pair[0])):
+            if not alias:
+                continue
+            start = 0
+            while True:
+                position = text.find(alias, start)
+                if position < 0:
+                    break
+                end = position + len(alias)
+                if not any(occupied[position:end]):
+                    result.extend(("concept:" + concept, "phrase:" + alias))
+                    for index in range(position, min(end, len(occupied))):
+                        occupied[index] = True
+                start = position + 1
+        for token in re.findall(r"[a-z0-9]+", text):
+            result.append("word:" + token)
+        han_runs = re.findall(r"[\u3400-\u9fff]+", text)
+        for run in han_runs:
+            result.extend("han1:" + character for character in run)
+            for width in (2, 3):
+                result.extend(
+                    "han" + str(width) + ":" + run[index : index + width]
+                    for index in range(len(run) - width + 1)
+                )
+        return list(dict.fromkeys(result))[:192]
 
     @staticmethod
     def _basis(index, size):
@@ -38422,14 +40355,18 @@ class SharedSemanticEncoder:
             vectors[token] = [round(value / norm, 7) for value in vector]
         payload = {
             "schema_version": SEMANTIC_ENCODER_SCHEMA_VERSION,
-            "algorithm": "multilingual_cooccurrence_semantic_encoder",
+            "algorithm": "multilingual_longest_match_subword_contrastive_encoder",
             "size": size,
             "vectors": vectors,
             "aliases": aliases,
             "vocabulary_size": len(vectors),
             "training_documents": len(docs),
             "languages": ["zh", "en", "game_specific"],
-            "objectives": ["context_cooccurrence", "multilingual_synonym_alignment", "goal_ocr_action_shared_space"],
+            "objectives": [
+                "subword_context_cooccurrence",
+                "multilingual_synonym_alignment",
+                "ocr_button_action_result_goal_contrastive_alignment",
+            ],
             "hash_embedding_used": False,
         }
         payload["checksum"] = hashlib.sha256(
@@ -38985,9 +40922,12 @@ def train_auditable_transition_model(experiences):
 
 def latent_observation_vector(observation, state_id="", size=LATENT_STATE_SIZE, semantic_model=None):
     item = dict(observation) if isinstance(observation, dict) else {}
+    visual_size = min(VISUAL_EMBEDDING_SIZE, max(0, int(size)))
+    visual_features = observation_visual_embedding(item, visual_size)
     objects = [value for value in item.get("objects", []) if isinstance(value, dict)]
     classes = Counter(str(value.get("class", "unknown")) for value in objects)
-    features = [min(1.0, classes.get(name, 0) / 6.0) for name in GENERAL_OBJECT_CLASSES]
+    features = list(visual_features)
+    features.extend(min(1.0, classes.get(name, 0) / 6.0) for name in GENERAL_OBJECT_CLASSES)
     confidences = [safe_float(value.get("confidence"), 0.0) for value in objects]
     uncertainties = [
         safe_float(value.get("uncertainty", 1.0 - safe_float(value.get("confidence"), 0.0)), 1.0) for value in objects
@@ -39092,11 +41032,33 @@ def latent_observation_vector(observation, state_id="", size=LATENT_STATE_SIZE, 
     return [safe_float(value, 0.0, -2.0, 2.0) for value in (features + [0.0] * size)[:size]]
 
 
-def _latent_action_vector(action_id, size=LATENT_ACTION_SIZE, semantic_model=None):
-    return semantic_embedding({"semantic_action": action_id}, size, semantic_model)
+def _latent_action_vector(action_id, size=LATENT_ACTION_SIZE, semantic_model=None, timing=None):
+    timing_value = timing if isinstance(timing, dict) else {}
+    duration = max(
+        0.0,
+        safe_float(
+            timing_value.get("duration", timing_value.get("action_duration", 0.0)),
+            0.0,
+            0.0,
+            120.0,
+        ),
+    )
+    effect_delay = max(
+        0.0,
+        safe_float(
+            timing_value.get("effect_delay", timing_value.get("action_effect_delay", 0.0)),
+            0.0,
+            0.0,
+            120.0,
+        ),
+    )
+    delta = max(0.0, safe_float(timing_value.get("delta_time", timing_value.get("dt", 0.0)), 0.0, 0.0, 120.0))
+    semantic_size = max(1, int(size) - 3)
+    base = semantic_embedding({"semantic_action": action_id}, semantic_size, semantic_model)
+    return (base + [math.tanh(duration / 5.0), math.tanh(effect_delay / 5.0), math.tanh(delta / 5.0)])[:size]
 
 
-def _sequence_latent_state(ordered, index, window=12, semantic_model=None):
+def _sequence_latent_state(ordered, index, window=32, semantic_model=None):
     vectors = []
     start = max(0, int(index) - max(1, int(window)) + 1)
     for position in range(start, int(index) + 1):
@@ -39126,82 +41088,114 @@ def _serialize_gru_cell(cell):
     }
 
 
-def _average_gru_cells(payloads):
-    values = [value for value in payloads if isinstance(value, dict)]
-    if not values:
-        return {}
-
-    def average_matrix(name):
-        rows = len(values[0][name])
-        columns = len(values[0][name][0]) if rows else 0
-        return [
-            [
-                statistics.fmean(safe_float(value[name][row][column], 0.0) for value in values)
-                for column in range(columns)
-            ]
-            for row in range(rows)
-        ]
-
-    def average_vector(name):
-        return [
-            statistics.fmean(safe_float(value[name][index], 0.0) for value in values)
-            for index in range(len(values[0][name]))
-        ]
-
-    return {
-        "weight_ih": average_matrix("weight_ih"),
-        "weight_hh": average_matrix("weight_hh"),
-        "bias_ih": average_vector("bias_ih"),
-        "bias_hh": average_vector("bias_hh"),
-        "hidden_size": safe_int(values[0].get("hidden_size"), LATENT_STATE_SIZE),
-        "input_size": safe_int(values[0].get("input_size"), LATENT_ACTION_SIZE),
-    }
+_SERIALIZED_GRU_CACHE = BoundedTTLMap(64, 1800.0)
 
 
-def _gru_cell_forward(payload, action, hidden):
+def _gru_cell_forward_batch(payload, actions, hidden_states):
+    action_rows = [list(value) for value in actions or []]
+    hidden_rows = [list(value) for value in hidden_states or []]
+    if not action_rows or len(action_rows) != len(hidden_rows):
+        return []
     hidden_size = safe_int(payload.get("hidden_size", LATENT_STATE_SIZE), LATENT_STATE_SIZE, 1, 2048)
+    input_size = safe_int(payload.get("input_size", LATENT_ACTION_SIZE), LATENT_ACTION_SIZE, 1, 2048)
+    numpy_module = FEATURE_ENGINE.optional_numpy()
+    if numpy_module is not None:
+        cache_key = str(id(payload)) + "|" + str(hidden_size) + "|" + str(input_size)
+        cached = _SERIALIZED_GRU_CACHE.get(cache_key)
+        if cached is None:
+            cached = (
+                numpy_module.asarray(payload.get("weight_ih", []), dtype=numpy_module.float32),
+                numpy_module.asarray(payload.get("weight_hh", []), dtype=numpy_module.float32),
+                numpy_module.asarray(payload.get("bias_ih", []), dtype=numpy_module.float32),
+                numpy_module.asarray(payload.get("bias_hh", []), dtype=numpy_module.float32),
+            )
+            _SERIALIZED_GRU_CACHE[cache_key] = cached
+        weight_ih, weight_hh, bias_ih, bias_hh = cached
+        action_matrix = numpy_module.asarray(
+            [[safe_float(v, 0.0, -8.0, 8.0) for v in (row + [0.0] * input_size)[:input_size]] for row in action_rows],
+            dtype=numpy_module.float32,
+        )
+        hidden_matrix = numpy_module.asarray(
+            [[safe_float(v, 0.0, -8.0, 8.0) for v in (row + [0.0] * hidden_size)[:hidden_size]] for row in hidden_rows],
+            dtype=numpy_module.float32,
+        )
+        if weight_ih.shape != (3 * hidden_size, input_size) or weight_hh.shape != (3 * hidden_size, hidden_size):
+            return [[0.0] * hidden_size for _ in action_rows]
+        input_terms = action_matrix @ weight_ih.T + bias_ih
+        hidden_terms = hidden_matrix @ weight_hh.T + bias_hh
+        reset = 1.0 / (1.0 + numpy_module.exp(-numpy_module.clip(
+            input_terms[:, :hidden_size] + hidden_terms[:, :hidden_size], -30.0, 30.0
+        )))
+        update = 1.0 / (1.0 + numpy_module.exp(-numpy_module.clip(
+            input_terms[:, hidden_size:2 * hidden_size] + hidden_terms[:, hidden_size:2 * hidden_size], -30.0, 30.0
+        )))
+        candidate = numpy_module.tanh(
+            input_terms[:, 2 * hidden_size:] + reset * hidden_terms[:, 2 * hidden_size:]
+        )
+        output = (1.0 - update) * candidate + update * hidden_matrix
+        return output.astype(numpy_module.float64).tolist()
+    result = []
     weight_ih = payload.get("weight_ih", [])
     weight_hh = payload.get("weight_hh", [])
     bias_ih = payload.get("bias_ih", [])
     bias_hh = payload.get("bias_hh", [])
-    input_terms = []
-    hidden_terms = []
-    for index in range(min(len(weight_ih), 3 * hidden_size)):
-        input_terms.append(
-            sum(
-                safe_float(value, 0.0) * safe_float(coefficient, 0.0)
-                for value, coefficient in zip(action, weight_ih[index])
+    for action, hidden in zip(action_rows, hidden_rows):
+        input_terms = []
+        hidden_terms = []
+        for index in range(min(len(weight_ih), 3 * hidden_size)):
+            input_terms.append(
+                sum(
+                    safe_float(value, 0.0) * safe_float(coefficient, 0.0)
+                    for value, coefficient in zip(action, weight_ih[index])
+                )
+                + safe_float(bias_ih[index] if index < len(bias_ih) else 0.0, 0.0)
             )
-            + safe_float(bias_ih[index] if index < len(bias_ih) else 0.0, 0.0)
-        )
-        hidden_terms.append(
-            sum(
-                safe_float(value, 0.0) * safe_float(coefficient, 0.0)
-                for value, coefficient in zip(hidden, weight_hh[index])
+            hidden_terms.append(
+                sum(
+                    safe_float(value, 0.0) * safe_float(coefficient, 0.0)
+                    for value, coefficient in zip(hidden, weight_hh[index])
+                )
+                + safe_float(bias_hh[index] if index < len(bias_hh) else 0.0, 0.0)
             )
-            + safe_float(bias_hh[index] if index < len(bias_hh) else 0.0, 0.0)
+        input_terms = (input_terms + [0.0] * (3 * hidden_size))[: 3 * hidden_size]
+        hidden_terms = (hidden_terms + [0.0] * (3 * hidden_size))[: 3 * hidden_size]
+        reset = [
+            1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, input_terms[i] + hidden_terms[i]))))
+            for i in range(hidden_size)
+        ]
+        update = [
+            1.0
+            / (
+                1.0
+                + math.exp(
+                    -max(
+                        -30.0,
+                        min(30.0, input_terms[hidden_size + i] + hidden_terms[hidden_size + i]),
+                    )
+                )
+            )
+            for i in range(hidden_size)
+        ]
+        candidate = [
+            math.tanh(
+                input_terms[2 * hidden_size + i]
+                + reset[i] * hidden_terms[2 * hidden_size + i]
+            )
+            for i in range(hidden_size)
+        ]
+        result.append(
+            [
+                (1.0 - update[i]) * candidate[i]
+                + update[i] * safe_float(hidden[i] if i < len(hidden) else 0.0, 0.0)
+                for i in range(hidden_size)
+            ]
         )
-    input_terms = (input_terms + [0.0] * (3 * hidden_size))[: 3 * hidden_size]
-    hidden_terms = (hidden_terms + [0.0] * (3 * hidden_size))[: 3 * hidden_size]
-    reset = [
-        1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, input_terms[index] + hidden_terms[index]))))
-        for index in range(hidden_size)
-    ]
-    update = [
-        1.0
-        / (1.0 + math.exp(-max(-30.0, min(30.0, input_terms[hidden_size + index] + hidden_terms[hidden_size + index]))))
-        for index in range(hidden_size)
-    ]
-    candidate = [
-        math.tanh(input_terms[2 * hidden_size + index] + reset[index] * hidden_terms[2 * hidden_size + index])
-        for index in range(hidden_size)
-    ]
-    return [
-        (1.0 - update[index]) * candidate[index]
-        + update[index] * safe_float(hidden[index] if index < len(hidden) else 0.0, 0.0)
-        for index in range(hidden_size)
-    ]
+    return result
 
+
+def _gru_cell_forward(payload, action, hidden):
+    output = _gru_cell_forward_batch(payload, [action], [hidden])
+    return output[0] if output else [0.0] * safe_int(payload.get("hidden_size", LATENT_STATE_SIZE), LATENT_STATE_SIZE)
 
 def _world_action_continuation_plan(model, task_id, state_id, action_id, horizon):
     task = normalized_identifier(task_id, "default", 96)
@@ -39250,7 +41244,7 @@ def _world_model_rows(experiences, semantic_model=None):
         for index, experience in enumerate(ordered):
             task = normalized_identifier(experience.get("task_id"), "default", 96)
             state = str(experience.get("state_t", experience.get("state", "")))
-            initial = _sequence_latent_state(ordered, index, 12, semantic_model)
+            initial = _sequence_latent_state(ordered, index, 32, semantic_model)
             state_latents[task + "|" + state] = initial
             all_states.append(initial)
             action_ids = []
@@ -39258,7 +41252,7 @@ def _world_model_rows(experiences, semantic_model=None):
             target_states = []
             auxiliary = []
             confidences = []
-            for offset in range(8):
+            for offset in range(32):
                 position = index + offset
                 if position >= len(ordered):
                     break
@@ -39273,8 +41267,48 @@ def _world_model_rows(experiences, semantic_model=None):
                 context = item.get("context", {}) if isinstance(item.get("context"), dict) else {}
                 reward = safe_float(item.get("reward_t", item.get("reward", 0.0)), 0.0, -2.0, 2.0)
                 changed = bool(item.get("environment_changed", True))
+                previous_created = (
+                    safe_float(
+                        ordered[position - 1].get(
+                            "created_t+1", ordered[position - 1].get("created_t", 0.0)
+                        ),
+                        0.0,
+                    )
+                    if position > 0
+                    else safe_float(item.get("created_t", 0.0), 0.0)
+                )
+                current_created = safe_float(item.get("created_t", previous_created), previous_created)
+                duration = max(
+                    0.0,
+                    safe_float(
+                        item.get(
+                            "action_duration",
+                            context.get("action_duration", item.get("duration", 0.0)),
+                        ),
+                        0.0,
+                        0.0,
+                        120.0,
+                    ),
+                )
+                effect_delay = max(
+                    0.0,
+                    safe_float(
+                        item.get(
+                            "action_effect_delay",
+                            context.get("action_effect_delay", item.get("effect_delay", 0.0)),
+                        ),
+                        0.0,
+                        0.0,
+                        120.0,
+                    ),
+                )
+                timing = {
+                    "duration": duration,
+                    "effect_delay": effect_delay,
+                    "delta_time": max(0.0, current_created - previous_created),
+                }
                 action_ids.append(action)
-                action_vectors.append(_latent_action_vector(action, LATENT_ACTION_SIZE, semantic_model))
+                action_vectors.append(_latent_action_vector(action, LATENT_ACTION_SIZE, semantic_model, timing))
                 target_states.append(after)
                 auxiliary.append(
                     [
@@ -39286,6 +41320,8 @@ def _world_model_rows(experiences, semantic_model=None):
                         float(bool(item.get("window_focus_lost") or context.get("window_focus_lost"))),
                         float(bool(item.get("capture_frozen") or context.get("capture_frozen"))),
                         float(bool(item.get("reset"))),
+                        min(1.0, duration / 10.0),
+                        min(1.0, effect_delay / 10.0),
                     ]
                 )
                 confidences.append(max(0.15, safe_float(item.get("reward_confidence", 0.0), 0.0, 0.0, 1.0)))
@@ -39333,12 +41369,14 @@ def _world_model_validation(model, rows, split):
             "one_step_object_prediction_error": None,
             "rollout_4_step_error": None,
             "rollout_8_step_error": None,
+            "rollout_16_step_error": None,
+            "rollout_32_step_error": None,
             "reward_calibration_error": None,
             "termination_precision": None,
             "termination_recall": None,
             "uncertainty_error_correlation": None,
         }
-    errors = {1: [], 4: [], 8: []}
+    errors = {1: [], 4: [], 8: [], 16: [], 32: []}
     reward_errors = []
     terminal_truth = []
     terminal_score = []
@@ -39355,7 +41393,7 @@ def _world_model_validation(model, rows, split):
                 aux = [1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, value)))) for value in raw]
                 predictions.append((list(hidden), aux))
             member_outputs.append(predictions)
-        for horizon in (1, 4, 8):
+        for horizon in (1, 4, 8, 16, 32):
             index = min(horizon, len(row["targets"])) - 1
             if index < 0:
                 continue
@@ -39374,7 +41412,7 @@ def _world_model_validation(model, rows, split):
             uncertainty_pairs.append((spread, error))
         first_aux = [member[0][1] for member in member_outputs if member]
         if first_aux:
-            mean_aux = [statistics.fmean(value[index] for value in first_aux) for index in range(8)]
+            mean_aux = [statistics.fmean(value[index] for value in first_aux) for index in range(10)]
             reward_errors.append(abs((mean_aux[0] * 4.0 - 2.0) - (row["auxiliary"][0][0] * 4.0 - 2.0)))
             truth = bool(row["auxiliary"][0][1] >= 0.5 or row["auxiliary"][0][2] >= 0.5)
             score = max(mean_aux[1], mean_aux[2])
@@ -39400,12 +41438,44 @@ def _world_model_validation(model, rows, split):
         "one_step_object_prediction_error": statistics.fmean(errors[1]) if errors[1] else None,
         "rollout_4_step_error": statistics.fmean(errors[4]) if errors[4] else None,
         "rollout_8_step_error": statistics.fmean(errors[8]) if errors[8] else None,
+        "rollout_16_step_error": statistics.fmean(errors[16]) if errors[16] else None,
+        "rollout_32_step_error": statistics.fmean(errors[32]) if errors[32] else None,
         "reward_calibration_error": statistics.fmean(reward_errors) if reward_errors else None,
         "termination_precision": tp / max(1, tp + fp),
         "termination_recall": tp / max(1, tp + fn),
         "uncertainty_error_correlation": correlation,
         "metrics_are_game_id_isolated": True,
     }
+
+
+def _world_teacher_soft_sequences(ensemble, rows):
+    result = []
+    members = [member for member in ensemble or [] if isinstance(member, dict)]
+    for row in rows:
+        member_hidden = [list(row["initial"]) for _ in members]
+        sequence = []
+        for action in row["actions"]:
+            raw_values = []
+            next_hidden = []
+            for index, member in enumerate(members):
+                hidden = _gru_cell_forward(member.get("gru", {}), action, member_hidden[index])
+                raw = _dense_network_forward(member.get("auxiliary", {}), hidden)
+                next_hidden.append(hidden)
+                raw_values.append((raw + [0.0] * 10)[:10])
+            member_hidden = next_hidden
+            sequence.append(
+                {
+                    "hidden": [
+                        statistics.fmean(hidden[column] for hidden in member_hidden)
+                        for column in range(LATENT_STATE_SIZE)
+                    ],
+                    "auxiliary_logits": [
+                        statistics.fmean(raw[column] for raw in raw_values) for column in range(10)
+                    ],
+                }
+            )
+        result.append(sequence)
+    return result
 
 
 def train_latent_world_model(experiences, semantic_model=None):
@@ -39419,18 +41489,19 @@ def train_latent_world_model(experiences, semantic_model=None):
     split = _game_isolated_policy_split([value for value in experiences or [] if isinstance(value, dict)])
     base = {
         "schema_version": SEQUENCE_WORLD_MODEL_SCHEMA_VERSION,
-        "algorithm": "object_slot_action_sequence_gru_ensemble",
+        "algorithm": "multiscale_variable_time_action_sequence_gru_ensemble",
         "auditable_transition_model": auditable,
         "state_latents": dict(list(state_latents.items())[:4096]),
         "default_state_latent": default_state,
-        "horizon": 8,
+        "horizon": 32,
         "latent_state_size": LATENT_STATE_SIZE,
         "latent_action_size": LATENT_ACTION_SIZE,
         "semantic_encoder_checksum": str((semantic_model or {}).get("checksum", "")),
-        "time_scales_ms": [100, 500, 2000],
+        "time_scales_ms": [50, 100, 250, 500, 1000, 2000, 5000],
         "action_continuations": continuations,
         "game_isolated_split": split,
         "predicts": [
+            "next_visual_object_state",
             "next_object_slots",
             "object_birth",
             "object_death",
@@ -39444,10 +41515,14 @@ def train_latent_world_model(experiences, semantic_model=None):
             "loading",
             "window_focus_lost",
             "capture_frozen",
+            "action_duration",
+            "action_effect_delay",
             "epistemic_uncertainty",
         ],
         "safety_boundary": "prediction_only_reorders_candidates_and_never_bypasses_independent_action_authorization",
         "training_uses_actual_action_sequences": True,
+        "variable_time_interval_encoding": True,
+        "multi_candidate_rollout": True,
         "single_action_repetition_forbidden": True,
     }
     if len(rows) < 8:
@@ -39483,36 +41558,41 @@ def train_latent_world_model(experiences, semantic_model=None):
             def __init__(self, input_size, output_size, hidden_size):
                 super().__init__()
                 self.layers = torch.nn.ModuleList(
-                    [torch.nn.Linear(input_size, hidden_size), torch.nn.Linear(hidden_size, output_size)]
+                    [
+                        torch.nn.Linear(input_size, hidden_size),
+                        torch.nn.Linear(hidden_size, hidden_size),
+                        torch.nn.Linear(hidden_size, output_size),
+                    ]
                 )
 
             def forward(self, value):
-                return self.layers[-1](torch.tanh(self.layers[0](value)))
+                value = torch.tanh(self.layers[0](value))
+                value = torch.tanh(self.layers[1](value))
+                return self.layers[2](value)
 
         train_games = set(split.get("train_game_ids", []))
         train_rows = [row for row in rows if row.get("game_id") in train_games] or rows
         train_rows = train_rows[:5000]
         ensemble = []
         histories = defaultdict(list)
-        minimum_batch = 1
         for member_index in range(LATENT_WORLD_ENSEMBLE_SIZE):
             member_seed = (seed + member_index * 130363) % (2**63 - 1)
             torch.manual_seed(member_seed)
             rng = random.Random(member_seed)
             gru = torch.nn.GRUCell(LATENT_ACTION_SIZE, LATENT_STATE_SIZE).to(device)
-            auxiliary = DenseNetwork(LATENT_STATE_SIZE, 8, POLICY_HIDDEN_SIZE).to(device)
+            auxiliary = DenseNetwork(LATENT_STATE_SIZE, 10, POLICY_HIDDEN_SIZE).to(device)
             parameters = list(gru.parameters()) + list(auxiliary.parameters())
-            optimizer = torch.optim.AdamW(parameters, lr=0.0015, weight_decay=0.0001)
+            optimizer = torch.optim.AdamW(parameters, lr=0.0012, weight_decay=0.0001)
             scaler = torch_grad_scaler(torch, amp_enabled)
-            bootstrap = [train_rows[rng.randrange(len(train_rows))] for _ in range(max(24, len(train_rows)))]
-            steps = max(48, min(220, len(train_rows) * 2))
+            bootstrap = [train_rows[rng.randrange(len(train_rows))] for _ in range(max(32, len(train_rows)))]
+            steps = max(64, min(300, len(train_rows) * 2))
             plan = wait_for_runtime_training_plan()
-            batch_size = max(minimum_batch, min(24, plan.training_batch_size, len(bootstrap)))
+            batch_size = max(1, min(128, plan.policy_batch_size, len(bootstrap)))
             completed = 0
             while completed < steps:
                 plan = wait_for_runtime_training_plan()
                 configure_torch_runtime(torch, plan)
-                batch_size = max(minimum_batch, min(batch_size, plan.training_batch_size, len(bootstrap)))
+                batch_size = max(1, min(batch_size, plan.policy_batch_size, len(bootstrap)))
                 batch = [bootstrap[rng.randrange(len(bootstrap))] for _ in range(batch_size)]
                 try:
                     autocast = (
@@ -39521,10 +41601,8 @@ def train_latent_world_model(experiences, semantic_model=None):
                         else nullcontext()
                     )
                     with autocast:
-                        hidden = torch.tensor(
-                            [row["initial"] for row in batch], dtype=torch.float32, device=device
-                        )
-                        maximum = max(row["length"] for row in batch)
+                        hidden = torch.tensor([row["initial"] for row in batch], dtype=torch.float32, device=device)
+                        maximum = min(32, max(row["length"] for row in batch))
                         state_loss = torch.zeros((), dtype=torch.float32, device=device)
                         auxiliary_loss = torch.zeros((), dtype=torch.float32, device=device)
                         denominator = 0.0
@@ -39558,26 +41636,21 @@ def train_latent_world_model(experiences, semantic_model=None):
                                 [
                                     row["auxiliary"][position]
                                     if position < row["length"]
-                                    else [0.0] * 8
+                                    else [0.0] * 10
                                     for row in batch
                                 ],
                                 dtype=torch.float32,
                                 device=device,
                             )
                             confidence = torch.tensor(
-                                [
-                                    row["confidences"][position]
-                                    if position < row["length"]
-                                    else 0.0
-                                    for row in batch
-                                ],
+                                [row["confidences"][position] if position < row["length"] else 0.0 for row in batch],
                                 dtype=torch.float32,
                                 device=device,
                             ).unsqueeze(1)
                             predicted = gru(action, hidden)
                             active_hidden = mask * predicted + (1.0 - mask) * hidden
                             probability = torch.sigmoid(auxiliary(active_hidden))
-                            horizon_weight = 1.0 + 0.18 * math.log2(position + 1)
+                            horizon_weight = 1.0 + 0.14 * math.log2(position + 1)
                             weight = mask * (0.2 + 0.8 * confidence) * horizon_weight
                             state_loss = state_loss + (
                                 weight * (active_hidden - target).pow(2).mean(dim=1, keepdim=True)
@@ -39627,18 +41700,127 @@ def train_latent_world_model(experiences, semantic_model=None):
             optimizer.zero_grad(set_to_none=True)
             scaler = None
             release_torch_training_resources(torch)
-        distilled = {
-            "gru": _average_gru_cells([member["gru"] for member in ensemble]),
-            "auxiliary": _average_dense_networks([member["auxiliary"] for member in ensemble]),
+
+        rng = random.Random(seed ^ 0xD157111)
+        distill_rows = list(rows[: min(768, len(rows))])
+        rng.shuffle(distill_rows)
+        validation_count = max(4, len(distill_rows) // 5)
+        validation_rows = distill_rows[:validation_count]
+        student_rows = distill_rows[validation_count:]
+        teacher_sequences = _world_teacher_soft_sequences(ensemble, distill_rows)
+        student_gru = torch.nn.GRUCell(LATENT_ACTION_SIZE, LATENT_STATE_SIZE).to(device)
+        student_auxiliary = DenseNetwork(LATENT_STATE_SIZE, 10, POLICY_HIDDEN_SIZE).to(device)
+        student_parameters = list(student_gru.parameters()) + list(student_auxiliary.parameters())
+        student_optimizer = torch.optim.AdamW(student_parameters, lr=0.0012, weight_decay=0.0001)
+        training_positions = list(range(validation_count, len(distill_rows)))
+        student_steps = max(40, min(180, len(training_positions) * 2)) if training_positions else 0
+        for _ in range(student_steps):
+            selected_positions = [
+                training_positions[rng.randrange(len(training_positions))]
+                for _ in range(min(32, len(training_positions)))
+            ]
+            batch_rows = [distill_rows[index] for index in selected_positions]
+            batch_teachers = [teacher_sequences[index] for index in selected_positions]
+            hidden = torch.tensor([row["initial"] for row in batch_rows], dtype=torch.float32, device=device)
+            maximum = min(32, max(row["length"] for row in batch_rows))
+            loss = torch.zeros((), dtype=torch.float32, device=device)
+            denominator = 0.0
+            for position in range(maximum):
+                mask = torch.tensor(
+                    [1.0 if position < row["length"] else 0.0 for row in batch_rows],
+                    dtype=torch.float32,
+                    device=device,
+                ).unsqueeze(1)
+                action = torch.tensor(
+                    [
+                        row["actions"][position]
+                        if position < row["length"]
+                        else [0.0] * LATENT_ACTION_SIZE
+                        for row in batch_rows
+                    ],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                target_hidden = torch.tensor(
+                    [
+                        teacher[position]["hidden"]
+                        if position < len(teacher)
+                        else teacher[-1]["hidden"]
+                        for teacher in batch_teachers
+                    ],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                target_auxiliary = torch.tensor(
+                    [
+                        teacher[position]["auxiliary_logits"]
+                        if position < len(teacher)
+                        else teacher[-1]["auxiliary_logits"]
+                        for teacher in batch_teachers
+                    ],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                predicted_hidden = student_gru(action, hidden)
+                active_hidden = mask * predicted_hidden + (1.0 - mask) * hidden
+                predicted_auxiliary = student_auxiliary(active_hidden)
+                loss = loss + (mask * (active_hidden - target_hidden).pow(2).mean(dim=1, keepdim=True)).sum()
+                loss = loss + 0.5 * (
+                    mask * (predicted_auxiliary - target_auxiliary).pow(2).mean(dim=1, keepdim=True)
+                ).sum()
+                denominator += float(mask.sum().detach().to("cpu").item())
+                hidden = active_hidden
+            loss = loss / max(1.0, denominator)
+            student_optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(student_parameters, 5.0)
+            student_optimizer.step()
+        state_errors = []
+        auxiliary_errors = []
+        with torch.no_grad():
+            for row, teacher in zip(validation_rows, teacher_sequences[:validation_count]):
+                hidden = torch.tensor([row["initial"]], dtype=torch.float32, device=device)
+                for position, action_values in enumerate(row["actions"][:32]):
+                    action = torch.tensor([action_values], dtype=torch.float32, device=device)
+                    hidden = student_gru(action, hidden)
+                    auxiliary_output = student_auxiliary(hidden)
+                    target_hidden = torch.tensor([teacher[position]["hidden"]], dtype=torch.float32, device=device)
+                    target_auxiliary = torch.tensor(
+                        [teacher[position]["auxiliary_logits"]],
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    state_errors.append(float((hidden - target_hidden).pow(2).mean().to("cpu").item()))
+                    auxiliary_errors.append(float((auxiliary_output - target_auxiliary).pow(2).mean().to("cpu").item()))
+        state_mse = statistics.fmean(state_errors) if state_errors else float("inf")
+        auxiliary_mse = statistics.fmean(auxiliary_errors) if auxiliary_errors else float("inf")
+        student_accepted = bool(state_mse <= 0.08 and auxiliary_mse <= 0.08)
+        distillation = {
+            "trained": student_accepted,
+            "method": "holdout_ensemble_soft_label_sequence_student",
+            "teacher_members": len(ensemble),
+            "training_sequences": len(student_rows),
+            "validation_sequences": len(validation_rows),
+            "state_mse": state_mse,
+            "auxiliary_logit_mse": auxiliary_mse,
+            "acceptance_thresholds": {"state_mse": 0.08, "auxiliary_logit_mse": 0.08},
+            "member": {
+                "gru": _serialize_gru_cell(student_gru),
+                "auxiliary": _serialize_dense_network(student_auxiliary),
+            } if student_accepted else None,
+            "used_in_uncertainty_ensemble": False,
+            "fallback": "original_ensemble" if not student_accepted else "student_available_for_export_only",
         }
+        student_optimizer.zero_grad(set_to_none=True)
+        release_torch_training_resources(torch)
         model = {
             **base,
             "trained": True,
             "ensemble": ensemble,
             "ensemble_size": len(ensemble),
             "training_sequences": len(train_rows),
-            "sequence_window": 12,
-            "multi_step_horizons": [1, 4, 8],
+            "sequence_window": 32,
+            "multi_step_horizons": [1, 4, 8, 16, 32],
             "training_backend": str(device),
             "automatic_mixed_precision": bool(amp_enabled),
             "torch_threads": int(RESOURCE_GOVERNOR.current_plan().torch_threads),
@@ -39647,12 +41829,7 @@ def train_latent_world_model(experiences, semantic_model=None):
                 name: statistics.fmean(values[-min(100, len(values)) :]) if values else 0.0
                 for name, values in histories.items()
             },
-            "distillation": {
-                "trained": True,
-                "method": "parameter_mean_sequence_model",
-                "member": distilled,
-                "target": "small_cpu_or_gpu_gru",
-            },
+            "distillation": distillation,
         }
         model["validation"] = _world_model_validation(model, rows, split)
         return model
@@ -39666,20 +41843,31 @@ def train_latent_world_model(experiences, semantic_model=None):
             "validation": _world_model_validation({"ensemble": []}, rows, split),
         }
 
-
-def world_model_prediction(model, task_id, state_id, action_id):
+def world_model_rollout_candidates(model, task_id, state_id, candidate_action_ids):
     if not isinstance(model, dict):
         return {}
     task = normalized_identifier(task_id, "default", 96)
-    first_action = str(action_id[0]) if isinstance(action_id, (list, tuple)) and action_id else str(action_id)
+    horizon = max(1, min(32, safe_int(model.get("horizon", 32), 32, 1, 32)))
     auditable = (
-        model.get("auditable_transition_model", {}) if isinstance(model.get("auditable_transition_model"), dict) else {}
+        model.get("auditable_transition_model", {})
+        if isinstance(model.get("auditable_transition_model"), dict)
+        else {}
     )
-    exact = (auditable.get("state_action") or {}).get(task + "|" + str(state_id) + "|" + first_action)
-    prior = (auditable.get("action_prior") or {}).get(task + "|" + first_action)
-    audit = dict(exact) if isinstance(exact, dict) else dict(prior) if isinstance(prior, dict) else {}
+    prepared = []
+    for candidate_index, candidate in enumerate(candidate_action_ids or []):
+        plan, plan_source = _world_action_continuation_plan(model, task, state_id, candidate, horizon)
+        if not plan:
+            continue
+        first_action = str(plan[0])
+        exact = (auditable.get("state_action") or {}).get(task + "|" + str(state_id) + "|" + first_action)
+        prior = (auditable.get("action_prior") or {}).get(task + "|" + first_action)
+        audit = dict(exact) if isinstance(exact, dict) else dict(prior) if isinstance(prior, dict) else {}
+        key = str(candidate_index)
+        prepared.append({"key": key, "candidate": candidate, "plan": plan, "plan_source": plan_source, "audit": audit})
+    if not prepared:
+        return {}
     if not model.get("trained") or not isinstance(model.get("ensemble"), list):
-        return audit
+        return {entry["key"]: dict(entry["audit"]) for entry in prepared}
     latent = (model.get("state_latents") or {}).get(task + "|" + str(state_id))
     fallback = model.get("default_state_latent", [0.0] * LATENT_STATE_SIZE)
     current = (
@@ -39688,78 +41876,134 @@ def world_model_prediction(model, task_id, state_id, action_id):
         else [safe_float(value, 0.0, -3.0, 3.0) for value in fallback]
     )
     current = (current + [0.0] * LATENT_STATE_SIZE)[:LATENT_STATE_SIZE]
-    horizon = max(1, min(8, safe_int(model.get("horizon", 8), 8, 1, 8)))
-    plan, plan_source = _world_action_continuation_plan(model, task, state_id, action_id, horizon)
-    if not plan:
-        return audit
-    members = []
-    source_members = list(model.get("ensemble", []))
-    distilled = (model.get("distillation", {}) if isinstance(model.get("distillation"), dict) else {}).get("member")
-    if isinstance(distilled, dict):
-        source_members = [distilled, *source_members]
+    source_members = [member for member in model.get("ensemble", []) if isinstance(member, dict)]
+    per_candidate_members = [[] for _ in prepared]
+    maximum_steps = max(len(entry["plan"]) for entry in prepared)
     for member in source_members:
-        hidden = list(current)
-        series = {
-            name: []
-            for name in ("reward", "success", "failure", "no_effect", "loading", "focus_lost", "frozen", "reset")
-        }
-        for action in plan:
-            action_vector = _latent_action_vector(action, LATENT_ACTION_SIZE, model.get("semantic_encoder"))
-            hidden = _gru_cell_forward(member.get("gru", {}), action_vector, hidden)
-            raw = _dense_network_forward(member.get("auxiliary", {}), hidden)
-            auxiliary = [1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, value)))) for value in raw]
-            auxiliary = (auxiliary + [0.0] * 8)[:8]
-            series["reward"].append(auxiliary[0] * 4.0 - 2.0)
-            for offset, name in enumerate(
-                ("success", "failure", "no_effect", "loading", "focus_lost", "frozen", "reset"), 1
+        hidden_states = [list(current) for _ in prepared]
+        series = [defaultdict(list) for _ in prepared]
+        for position in range(maximum_steps):
+            active = [index for index, entry in enumerate(prepared) if position < len(entry["plan"])]
+            if not active:
+                break
+            action_vectors = [
+                _latent_action_vector(
+                    prepared[index]["plan"][position],
+                    LATENT_ACTION_SIZE,
+                    model.get("semantic_encoder"),
+                    {"duration": 0.0, "effect_delay": 0.0, "delta_time": 0.0},
+                )
+                for index in active
+            ]
+            active_hidden = [hidden_states[index] for index in active]
+            predicted_hidden = _gru_cell_forward_batch(member.get("gru", {}), action_vectors, active_hidden)
+            raw_batch = _dense_network_forward_batch(member.get("auxiliary", {}), predicted_hidden)
+            for local_index, candidate_index in enumerate(active):
+                hidden_states[candidate_index] = predicted_hidden[local_index]
+                raw = (raw_batch[local_index] + [0.0] * 10)[:10]
+                auxiliary = [1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, value)))) for value in raw]
+                candidate_series = series[candidate_index]
+                candidate_series["reward"].append(auxiliary[0] * 4.0 - 2.0)
+                for offset, name in enumerate(
+                    (
+                        "success",
+                        "failure",
+                        "no_effect",
+                        "loading",
+                        "focus_lost",
+                        "frozen",
+                        "reset",
+                    ),
+                    1,
+                ):
+                    candidate_series[name].append(auxiliary[offset])
+                candidate_series["duration"].append(auxiliary[8] * 10.0)
+                candidate_series["effect_delay"].append(auxiliary[9] * 10.0)
+        for candidate_index, candidate_series in enumerate(series):
+            summary = {"latent": hidden_states[candidate_index]}
+            for name in (
+                "reward",
+                "success",
+                "failure",
+                "no_effect",
+                "loading",
+                "focus_lost",
+                "frozen",
+                "reset",
+                "duration",
+                "effect_delay",
             ):
-                series[name].append(auxiliary[offset])
-        members.append(
+                values = candidate_series.get(name, [])
+                if not values:
+                    summary[name] = 0.0
+                elif name in {"success", "failure", "loading", "focus_lost", "frozen", "reset"}:
+                    summary[name] = max(values)
+                else:
+                    summary[name] = statistics.fmean(values)
+            per_candidate_members[candidate_index].append(summary)
+    results = {}
+    for candidate_index, entry in enumerate(prepared):
+        members = per_candidate_members[candidate_index]
+        if not members:
+            results[entry["key"]] = dict(entry["audit"])
+            continue
+        uncertainty_terms = []
+        for name in (
+            "reward",
+            "success",
+            "failure",
+            "no_effect",
+            "loading",
+            "focus_lost",
+            "frozen",
+            "reset",
+            "duration",
+            "effect_delay",
+        ):
+            values = [member[name] for member in members]
+            uncertainty_terms.append(statistics.pstdev(values) if len(values) > 1 else 0.0)
+        latent_spread = max(
+            (statistics.pstdev([member["latent"][index] for member in members]) for index in range(LATENT_STATE_SIZE)),
+            default=0.0,
+        )
+        uncertainty = min(1.0, max([latent_spread, *uncertainty_terms]))
+        result = dict(entry["audit"])
+        result.update(
             {
-                "latent": hidden,
-                **{
-                    name: (
-                        max(values)
-                        if name in {"success", "failure", "loading", "focus_lost", "frozen", "reset"}
-                        else statistics.fmean(values)
-                    )
-                    for name, values in series.items()
-                },
+                "expected_reward": statistics.fmean(member["reward"] for member in members),
+                "success_probability": statistics.fmean(member["success"] for member in members),
+                "failure_probability": statistics.fmean(member["failure"] for member in members),
+                "no_effect_probability": statistics.fmean(member["no_effect"] for member in members),
+                "loading_probability": statistics.fmean(member["loading"] for member in members),
+                "window_focus_lost_probability": statistics.fmean(member["focus_lost"] for member in members),
+                "capture_frozen_probability": statistics.fmean(member["frozen"] for member in members),
+                "reset_probability": statistics.fmean(member["reset"] for member in members),
+                "predicted_action_duration": statistics.fmean(member["duration"] for member in members),
+                "predicted_effect_delay": statistics.fmean(member["effect_delay"] for member in members),
+                "uncertainty": max(safe_float(entry["audit"].get("uncertainty"), 0.0), uncertainty),
+                "rollout_uncertainty": uncertainty,
+                "horizon": len(entry["plan"]),
+                "model": "multiscale_variable_time_action_sequence_gru_ensemble",
+                "member_count": len(members),
+                "state_fallback": (
+                    "learned_default_object_state"
+                    if not isinstance(latent, list)
+                    else "exact_state_latent"
+                ),
+                "action_sequence": entry["plan"],
+                "action_sequence_source": entry["plan_source"],
+                "single_action_repetition_used": False,
+                "distillation_member_used": False,
+                "safety_boundary": model.get("safety_boundary"),
             }
         )
-    uncertainty_terms = []
-    for name in ("reward", "success", "failure", "no_effect", "loading", "focus_lost", "frozen", "reset"):
-        values = [entry[name] for entry in members]
-        uncertainty_terms.append(statistics.pstdev(values) if len(values) > 1 else 0.0)
-    latent_spread = max(
-        (statistics.pstdev([entry["latent"][index] for entry in members]) for index in range(LATENT_STATE_SIZE)),
-        default=0.0,
-    )
-    uncertainty = min(1.0, max([latent_spread, *uncertainty_terms]))
-    result = dict(audit)
-    result.update(
-        {
-            "expected_reward": statistics.fmean(entry["reward"] for entry in members),
-            "success_probability": statistics.fmean(entry["success"] for entry in members),
-            "failure_probability": statistics.fmean(entry["failure"] for entry in members),
-            "no_effect_probability": statistics.fmean(entry["no_effect"] for entry in members),
-            "loading_probability": statistics.fmean(entry["loading"] for entry in members),
-            "window_focus_lost_probability": statistics.fmean(entry["focus_lost"] for entry in members),
-            "capture_frozen_probability": statistics.fmean(entry["frozen"] for entry in members),
-            "reset_probability": statistics.fmean(entry["reset"] for entry in members),
-            "uncertainty": max(safe_float(audit.get("uncertainty"), 0.0), uncertainty),
-            "rollout_uncertainty": uncertainty,
-            "horizon": len(plan),
-            "model": "object_slot_action_sequence_gru_ensemble",
-            "member_count": len(members),
-            "state_fallback": "learned_default_object_state" if not isinstance(latent, list) else "exact_state_latent",
-            "action_sequence": plan,
-            "action_sequence_source": plan_source,
-            "single_action_repetition_used": False,
-            "safety_boundary": model.get("safety_boundary"),
-        }
-    )
-    return result
+        results[entry["key"]] = result
+    return results
+
+
+def world_model_prediction(model, task_id, state_id, action_id):
+    results = world_model_rollout_candidates(model, task_id, state_id, [action_id])
+    return results.get("0", {})
 
 
 GENERALIZATION_LEVELS = {
@@ -41958,8 +44202,9 @@ class TaskInductionEngine:
         repeated_visits = defaultdict(set)
         success_visits = Counter()
         failure_visits = Counter()
-        numeric_success = Counter()
-        numeric_failure = Counter()
+        direction_evidence = defaultdict(Counter)
+        phase_direction_evidence = defaultdict(lambda: defaultdict(Counter))
+        human_numeric_relations = {}
         sequences = Counter()
         sequence_success = Counter()
         sequence_failure = Counter()
@@ -41986,13 +44231,43 @@ class TaskInductionEngine:
                     repeated_visits[identity].add(episode_id)
                 before_values = cls._numeric_values(before_objects)
                 after_values = cls._numeric_values(after_objects)
+                phase = cls._scene_phase(item)
+                for observed in list(before_objects) + list(after_objects):
+                    identity = cls._object_identity(observed)
+                    relation = str(observed.get("goal_relation", ""))
+                    if bool(observed.get("human_confirmed")) and relation in {
+                        NumericGoalRelation.HIGHER_BETTER.value,
+                        NumericGoalRelation.LOWER_BETTER.value,
+                        NumericGoalRelation.IRRELEVANT.value,
+                        NumericGoalRelation.CONTEXT_DEPENDENT.value,
+                        NumericGoalRelation.UNCERTAIN.value,
+                    }:
+                        human_numeric_relations[identity] = relation
+                for supervised in item.get("ocr_values", []) if isinstance(item.get("ocr_values"), list) else []:
+                    if not isinstance(supervised, dict):
+                        continue
+                    identity = str(supervised.get("region_id") or supervised.get("text") or "numeric")
+                    relation = str(supervised.get("goal_relation", ""))
+                    if bool(supervised.get("human_confirmed")) and relation:
+                        human_numeric_relations[identity] = relation
                 for identity, after_value in after_values.items():
                     delta = after_value - before_values.get(identity, after_value)
-                    if delta > 0:
-                        if success:
-                            numeric_success[identity] += 1
-                        if failure:
-                            numeric_failure[identity] += 1
+                    tolerance = max(
+                        1e-6,
+                        max(
+                            abs(after_value),
+                            abs(before_values.get(identity, after_value)),
+                            1.0,
+                        )
+                        * 0.0005,
+                    )
+                    direction = "unchanged" if abs(delta) <= tolerance else "up" if delta > 0 else "down"
+                    if success:
+                        direction_evidence[identity][direction + "_success"] += 1
+                        phase_direction_evidence[identity][phase][direction + "_success"] += 1
+                    if failure:
+                        direction_evidence[identity][direction + "_failure"] += 1
+                        phase_direction_evidence[identity][phase][direction + "_failure"] += 1
                 before_ids = {cls._object_identity(value) for value in before_objects}
                 after_ids = {cls._object_identity(value) for value in after_objects}
                 born = sorted(after_ids - before_ids)[:4]
@@ -42027,18 +44302,90 @@ class TaskInductionEngine:
                     "evidence": {"visited_episode_count": len(episode_ids), "object_identity": identity},
                 }
             )
-        for identity, support in numeric_success.most_common(12):
-            contradictions = numeric_failure[identity]
-            confidence = cls._hypothesis_confidence(support, contradictions, episode_count, 0.42)
+        numeric_ranked = sorted(
+            direction_evidence.items(),
+            key=lambda pair: (-sum(pair[1].values()), pair[0]),
+        )[:16]
+        for identity, evidence in numeric_ranked:
+            higher_score = evidence["up_success"] + evidence["down_failure"]
+            lower_score = evidence["down_success"] + evidence["up_failure"]
+            unrelated_score = evidence["unchanged_success"] + evidence["unchanged_failure"]
+            phase_relations = set()
+            for phase, phase_evidence in phase_direction_evidence[identity].items():
+                phase_higher = phase_evidence["up_success"] + phase_evidence["down_failure"]
+                phase_lower = phase_evidence["down_success"] + phase_evidence["up_failure"]
+                if phase_higher >= phase_lower + 2:
+                    phase_relations.add(NumericGoalRelation.HIGHER_BETTER.value)
+                elif phase_lower >= phase_higher + 2:
+                    phase_relations.add(NumericGoalRelation.LOWER_BETTER.value)
+            inferred = NumericGoalRelation.UNCERTAIN.value
+            support = max(higher_score, lower_score, unrelated_score)
+            contradictions = min(higher_score, lower_score)
+            if len(phase_relations) >= 2:
+                inferred = NumericGoalRelation.CONTEXT_DEPENDENT.value
+                support = higher_score + lower_score
+                contradictions = 0
+            elif higher_score >= lower_score + 2 and higher_score >= unrelated_score + 1:
+                inferred = NumericGoalRelation.HIGHER_BETTER.value
+                support, contradictions = higher_score, lower_score
+            elif lower_score >= higher_score + 2 and lower_score >= unrelated_score + 1:
+                inferred = NumericGoalRelation.LOWER_BETTER.value
+                support, contradictions = lower_score, higher_score
+            elif unrelated_score >= max(higher_score, lower_score) + 2:
+                inferred = NumericGoalRelation.IRRELEVANT.value
+                support, contradictions = unrelated_score, max(higher_score, lower_score)
+            human_relation = human_numeric_relations.get(identity)
+            conflict = bool(
+                human_relation
+                and human_relation != NumericGoalRelation.UNCERTAIN.value
+                and inferred != NumericGoalRelation.UNCERTAIN.value
+                and human_relation != inferred
+            )
+            final_relation = human_relation or inferred
+            descriptions = {
+                NumericGoalRelation.HIGHER_BETTER.value: "数值越大通常越有利",
+                NumericGoalRelation.LOWER_BETTER.value: "数值越小通常越有利",
+                NumericGoalRelation.IRRELEVANT.value: "数值变化与任务成败基本无关",
+                NumericGoalRelation.CONTEXT_DEPENDENT.value: "数值方向随游戏阶段或子目标变化",
+                NumericGoalRelation.UNCERTAIN.value: "数值方向尚不确定",
+            }
+            confidence = cls._hypothesis_confidence(support, contradictions, episode_count, 0.40)
+            if human_relation and not conflict:
+                confidence = max(confidence, 0.95)
             hypotheses.append(
                 {
-                    "hypothesis": "使 ‘" + identity + "’ 的数值上升与成功相关",
-                    "kind": "numeric_progress",
+                    "hypothesis": (
+                        "‘"
+                        + identity
+                        + "’："
+                        + descriptions.get(
+                            final_relation,
+                            descriptions[NumericGoalRelation.UNCERTAIN.value],
+                        )
+                    ),
+                    "kind": "numeric_direction_conflict" if conflict else "numeric_progress",
                     "confidence": round(confidence, 6),
                     "supporting_episodes": support,
                     "contradicting_episodes": contradictions,
-                    "requires_guidance": confidence < 0.85,
-                    "evidence": {"numeric_object": identity, "positive_success_transitions": support},
+                    "requires_guidance": (
+                        conflict
+                        or final_relation == NumericGoalRelation.UNCERTAIN.value
+                        or confidence < 0.85
+                    ),
+                    "evidence": {
+                        "numeric_object": identity,
+                        "direction_evidence": dict(evidence),
+                        "phase_direction_evidence": {
+                            phase: dict(values) for phase, values in phase_direction_evidence[identity].items()
+                        },
+                        "higher_score": higher_score,
+                        "lower_score": lower_score,
+                        "unrelated_score": unrelated_score,
+                        "automatic_inference": inferred,
+                        "human_relation": human_relation,
+                        "human_priority": bool(human_relation),
+                        "conflict_requires_new_quiz": conflict,
+                    },
                 }
             )
         for sequence, support_count in sequences.most_common(20):
@@ -43013,12 +45360,13 @@ class PairedHumanAIBenchmark:
                 observation = row.get("observation_t", {}) if isinstance(row.get("observation_t"), dict) else {}
                 task_id = normalized_identifier(row.get("task_id"), task_default, 96)
                 best = None
+                batch_predictions = (
+                    neural_offline_policy_predictions({"neural_bundle": bundle}, observation, vocabulary, task_id)
+                    if bundle.get("trained")
+                    else {}
+                )
                 for action_id in vocabulary:
-                    prediction = (
-                        neural_offline_policy_prediction({"neural_bundle": bundle}, observation, action_id, task_id)
-                        if bundle.get("trained")
-                        else {}
-                    )
+                    prediction = batch_predictions.get(str(action_id), {})
                     score = (
                         safe_float(prediction.get("q_value"), 0.0)
                         - 2.0 * safe_float(prediction.get("risk_probability"), 1.0)
