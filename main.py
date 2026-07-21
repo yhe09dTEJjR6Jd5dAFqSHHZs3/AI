@@ -106,7 +106,7 @@ TEMPORAL_TERMINATION_SCHEMA_VERSION = 1
 SKILL_DISCOVERY_SCHEMA_VERSION = 2
 MODEL_PROMOTION_SCHEMA_VERSION = 2
 ONLINE_ACCEPTANCE_SCHEMA_VERSION = 1
-HARDWARE_PROFILE_SCHEMA_VERSION = 4
+HARDWARE_PROFILE_SCHEMA_VERSION = 5
 EXPERIENCE_PORTFOLIO_SCHEMA_VERSION = 2
 REALTIME_BUDGET_MS = {
     "capture_p95": 35.0,
@@ -185,11 +185,11 @@ MODE_RUNNING = "RUNNING"
 MODE_STOPPING = "STOPPING"
 MODE_STATES = {MODE_IDLE, MODE_STARTING, MODE_RUNNING, MODE_STOPPING}
 DEVELOPER_MODE = "--developer-mode" in sys.argv
-AI_WORKER_PROTOCOL_VERSION = 4
+AI_WORKER_PROTOCOL_VERSION = 5
 RUNTIME_INSTALL_PROTOCOL_VERSION = 2
 REVIEW_PROCESS_PROTOCOL_VERSION = 2
 TEST_WORKER_PROTOCOL_VERSION = 2
-STATIC_CONTRACT_VERSION = 12
+STATIC_CONTRACT_VERSION = 13
 EXTERNAL_REQUIREMENT_SPEC_JSON = (
     '{"default_buttons":["选择文件夹","检查文件完整性","游戏名称","选择窗口","人","做题","升级","AI"],'
     '"capture_toggles":["鼠标","键盘","手柄","声音"],"success_confirmation_surface":"main_window",'
@@ -1245,6 +1245,12 @@ class HardwareSnapshot:
     disk_write_p95_ms: float
     end_to_end_p95_ms: float = 0.0
     end_to_end_p99_ms: float = 0.0
+    dedicated_vram_used: int | None = None
+    shared_vram_used: int | None = None
+    gpu_queue_wait_p95_ms: float = 0.0
+    cpu_to_gpu_copy_p95_ms: float = 0.0
+    device_removed_count: int = 0
+    device_reset_count: int = 0
 
 
 def physical_core_count():
@@ -1279,6 +1285,154 @@ class RuntimePlan:
     ocr_roi_scale: float = 1.0
     motion_capture_fps: int = 30
     resolution_tier: str = "low"
+    model_tier: str = "Tiny"
+    policy_state_size: int = POLICY_INPUT_SIZE
+    policy_hidden_size: int = POLICY_HIDDEN_SIZE
+    policy_ensemble_size: int = POLICY_ENSEMBLE_SIZE
+    temporal_context_length: int = 32
+    world_model_horizon: int = 3
+    object_slot_count: int = 24
+    vision_width_multiplier: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class ModelTierSpec:
+    name: str
+    state_size: int
+    hidden_size: int
+    ensemble_size: int
+    temporal_context: int
+    planning_horizon: int
+    object_slots: int
+    vision_width_multiplier: float
+    semantic_size: tuple
+    ocr_scale: float
+
+
+MODEL_TIER_SPECS = {
+    "Tiny": ModelTierSpec("Tiny", 192, 128, 5, 32, 3, 24, 1.0, (224, 126), 1.0),
+    "Base": ModelTierSpec("Base", 384, 256, 5, 64, 6, 48, 1.5, (320, 180), 1.35),
+    "Large": ModelTierSpec("Large", 512, 512, 7, 128, 16, 72, 2.0, (384, 216), 1.6),
+}
+
+
+def normalize_model_tier(value):
+    token = str(value or "").strip().casefold()
+    if token == "large":
+        return "Large"
+    if token == "base":
+        return "Base"
+    return "Tiny"
+
+
+def model_tier_spec(value=None):
+    if isinstance(value, RuntimePlan):
+        name = value.model_tier
+    elif isinstance(value, dict):
+        name = value.get("model_tier", value.get("capability_tier", "Tiny"))
+    else:
+        name = value
+    return MODEL_TIER_SPECS[normalize_model_tier(name)]
+
+
+def select_model_tier(backend, end_to_end_p95_ms, score_ms=None, free_vram=0, available_ram=0):
+    family = str(backend or "").casefold()
+    latency = float(end_to_end_p95_ms or score_ms or 9999.0)
+    score = float(score_ms or latency)
+    vram = int(free_vram or 0)
+    ram = int(available_ram or 0)
+    accelerated = "nvidia" in family or "directml" in family
+    if accelerated and latency <= 42.0 and score <= 85.0 and (vram == 0 or vram >= 3 * 1024**3):
+        return "Large"
+    if latency <= 80.0 and score <= 160.0 and (accelerated or ram == 0 or ram >= 8 * 1024**3):
+        return "Base"
+    return "Tiny"
+
+
+def classify_accelerator_fault(error):
+    message = (type(error).__name__ + ":" + str(error)).casefold()
+    oom = any(token in message for token in ("out of memory", "cuda oom", "e_outofmemory", "显存不足"))
+    removed = any(token in message for token in ("device removed", "dxgi_error_device_removed", "device lost"))
+    reset = any(token in message for token in ("device reset", "dxgi_error_device_reset", "driver reset", "tdr"))
+    directml = any(token in message for token in ("directml", "privateuseone", "dml"))
+    cuda = any(token in message for token in ("cuda", "cudnn", "cublas", "nvidia"))
+    unsupported = any(
+        token in message
+        for token in ("not implemented", "unsupported operator", "operator is not supported")
+    )
+    return {
+        "accelerator_fault": bool(oom or removed or reset or (directml or cuda) and not unsupported),
+        "oom": bool(oom),
+        "device_removed": bool(removed),
+        "device_reset": bool(reset),
+        "directml": bool(directml),
+        "cuda": bool(cuda),
+        "signature": hashlib.sha256(message.encode("utf-8", "replace")).hexdigest(),
+    }
+
+
+class WindowsGpuTelemetry:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.cache = (0.0, {})
+
+    def sample(self, backend, cache_seconds=3.0):
+        if os.name != "nt":
+            return {}
+        family = str(backend or "").casefold()
+        if "directml" not in family and "nvidia" not in family:
+            return {}
+        now = time.monotonic()
+        with self.lock:
+            if now - self.cache[0] <= max(0.25, float(cache_seconds)):
+                return dict(self.cache[1])
+        command = (
+            r"$p=@('\GPU Engine(*)\Utilization Percentage',"
+            r"'\GPU Adapter Memory(*)\Dedicated Usage',"
+            r"'\GPU Adapter Memory(*)\Shared Usage');"
+            "$s=(Get-Counter -Counter $p -MaxSamples 1 -ErrorAction Stop).CounterSamples;"
+            "$s|Select-Object Path,CookedValue|ConvertTo-Json -Compress"
+        )
+        result = {}
+        try:
+            output = subprocess.check_output(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                creationflags=0x08000000,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            rows = json.loads(output) if output else []
+            if isinstance(rows, dict):
+                rows = [rows]
+            utilization = []
+            dedicated = []
+            shared = []
+            for row in rows if isinstance(rows, list) else []:
+                path_value = str(row.get("Path", "")).casefold()
+                cooked = max(0.0, float(row.get("CookedValue", 0.0) or 0.0))
+                if "utilization percentage" in path_value:
+                    utilization.append(cooked)
+                elif "dedicated usage" in path_value:
+                    dedicated.append(cooked)
+                elif "shared usage" in path_value:
+                    shared.append(cooked)
+            result = {
+                "gpu_utilization": min(100.0, sum(utilization)),
+                "dedicated_vram_used": int(max(dedicated) if dedicated else 0),
+                "shared_vram_used": int(max(shared) if shared else 0),
+                "source": "windows_performance_counters",
+            }
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError, json.JSONDecodeError):
+            result = {}
+        with self.lock:
+            self.cache = (now, dict(result))
+        return result
+
+
+WINDOWS_GPU_TELEMETRY = WindowsGpuTelemetry()
 
 
 class ResourceGovernor:
@@ -1293,10 +1447,12 @@ class ResourceGovernor:
             "vision_batch": 8,
             "policy_batch": 24,
             "capture_fps": 30,
+            "motion_capture_fps": 30,
             "semantic_interval": 4,
             "ocr_interval": 6,
             "precision": "fp32",
             "torch_threads": cores,
+            "model_tier": "Tiny",
         }
         self.plan = self._plan_for_state(ResourceState.NORMAL, "windows-x64-cpu")
         self.recovery_since = None
@@ -1346,6 +1502,15 @@ class ResourceGovernor:
                             120,
                         ),
                     ),
+                    "motion_capture_fps": max(
+                        5,
+                        safe_int(
+                            value.get("motion_capture_fps", value.get("capture_fps")),
+                            self.benchmark_profile.get("motion_capture_fps", 30),
+                            5,
+                            120,
+                        ),
+                    ),
                     "semantic_interval": max(
                         1,
                         safe_int(
@@ -1365,6 +1530,9 @@ class ResourceGovernor:
                         ),
                     ),
                     "precision": str(value.get("precision", self.benchmark_profile.get("precision", "fp32"))),
+                    "model_tier": normalize_model_tier(
+                        value.get("model_tier", self.benchmark_profile.get("model_tier", "Tiny"))
+                    ),
                     "torch_threads": max(
                         1,
                         min(
@@ -1407,6 +1575,22 @@ class ResourceGovernor:
         with self.lock:
             self.disk_writes.append((time.monotonic(), value))
         RUNTIME_METRICS.observe("disk_write_ms", value)
+
+    def report_gpu_queue_wait(self, milliseconds):
+        RUNTIME_METRICS.observe("gpu_queue_wait_ms", max(0.0, float(milliseconds)))
+
+    def report_cpu_to_gpu_copy(self, milliseconds):
+        RUNTIME_METRICS.observe("cpu_to_gpu_copy_ms", max(0.0, float(milliseconds)))
+
+    def report_accelerator_fault(self, error):
+        details = classify_accelerator_fault(error)
+        if details["device_removed"]:
+            RUNTIME_METRICS.increment("gpu_device_removed")
+        if details["device_reset"]:
+            RUNTIME_METRICS.increment("gpu_device_reset")
+        if details["oom"]:
+            RUNTIME_METRICS.increment("gpu_oom")
+        return details
 
     @staticmethod
     def _filetime_value(value):
@@ -1509,8 +1693,12 @@ class ResourceGovernor:
             if runtime is not None:
                 status = getattr(getattr(runtime, "worker", None), "status", {})
                 manifest = status.get("runtime_manifest", {}) if isinstance(status, dict) else {}
-                if isinstance(manifest, dict) and manifest.get("runtime_family"):
-                    return str(manifest["runtime_family"])
+                if isinstance(manifest, dict) and (
+                    manifest.get("effective_runtime_family") or manifest.get("runtime_family")
+                ):
+                    return str(
+                        manifest.get("effective_runtime_family") or manifest.get("runtime_family")
+                    )
                 value = runtime.manifest() if getattr(runtime, "active_game", "") else {}
                 fingerprint = value.get("runtime_fingerprint", {}) if isinstance(value, dict) else {}
                 backend = str(fingerprint.get("gpu_backend", ""))
@@ -1521,30 +1709,42 @@ class ResourceGovernor:
         return "windows-x64-cpu"
 
     def _gpu_values(self, backend):
-        if "nvidia" not in str(backend).casefold():
-            return None, None
+        family = str(backend).casefold()
+        counter_values = WINDOWS_GPU_TELEMETRY.sample(backend)
+        if "nvidia" not in family:
+            return (
+                counter_values.get("gpu_utilization"),
+                None,
+                counter_values.get("dedicated_vram_used"),
+                counter_values.get("shared_vram_used"),
+            )
         now = time.monotonic()
         cached_at, utilization, free_vram = self._gpu_cache
-        if now - cached_at < 5.0:
-            return utilization, free_vram
-        try:
-            creationflags = 0x08000000 if os.name == "nt" else 0
-            output = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.free", "--format=csv,noheader,nounits"],
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=3,
-                creationflags=creationflags,
-                stderr=subprocess.DEVNULL,
-            )
-            first = output.strip().splitlines()[0].split(",")
-            utilization = max(0.0, min(100.0, float(first[0].strip())))
-            free_vram = max(0, int(float(first[1].strip()) * 1024 * 1024))
-        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-            utilization, free_vram = None, None
-        self._gpu_cache = (now, utilization, free_vram)
-        return utilization, free_vram
+        if now - cached_at >= 5.0:
+            try:
+                creationflags = 0x08000000 if os.name == "nt" else 0
+                output = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.free", "--format=csv,noheader,nounits"],
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=3,
+                    creationflags=creationflags,
+                    stderr=subprocess.DEVNULL,
+                )
+                first = output.strip().splitlines()[0].split(",")
+                utilization = max(0.0, min(100.0, float(first[0].strip())))
+                free_vram = max(0, int(float(first[1].strip()) * 1024 * 1024))
+            except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+                utilization = counter_values.get("gpu_utilization")
+                free_vram = None
+            self._gpu_cache = (now, utilization, free_vram)
+        return (
+            utilization,
+            free_vram,
+            counter_values.get("dedicated_vram_used"),
+            counter_values.get("shared_vram_used"),
+        )
 
     @staticmethod
     def _series_p95(name):
@@ -1575,7 +1775,7 @@ class ResourceGovernor:
         cpu, process_cpu = self._cpu_values()
         available_ram, process_rss = self._memory_values()
         backend = self._manifest_backend()
-        gpu_utilization, free_vram = self._gpu_values(backend)
+        gpu_utilization, free_vram, dedicated_vram_used, shared_vram_used = self._gpu_values(backend)
         queue_ratio, queue_oldest = self._queue_values()
         perception_p95 = self._series_p95("end_to_end_perception_ms")
         decision_p95 = self._series_p95("end_to_end_decision_ms")
@@ -1598,6 +1798,12 @@ class ResourceGovernor:
             round(self._disk_p95(), 3),
             round(end_to_end_p95, 3),
             round(end_to_end_p99, 3),
+            dedicated_vram_used,
+            shared_vram_used,
+            round(self._series_p95("gpu_queue_wait_ms"), 3),
+            round(self._series_p95("cpu_to_gpu_copy_ms"), 3),
+            int(RUNTIME_METRICS.counters.get("gpu_device_removed", 0)),
+            int(RUNTIME_METRICS.counters.get("gpu_device_reset", 0)),
         )
         with self.lock:
             self.history.append(snapshot)
@@ -1624,6 +1830,10 @@ class ResourceGovernor:
             or current.cpu_percent > 97.0
             or current.gpu_utilization is not None and current.gpu_utilization > 98.0
             or current.free_vram is not None and current.free_vram < thresholds.free_vram_red_bytes
+            or current.gpu_queue_wait_p95_ms > 40.0
+            or current.cpu_to_gpu_copy_p95_ms > 30.0
+            or current.device_removed_count > 0
+            or current.device_reset_count > 0
         )
         warning = bool(
             severe
@@ -1636,6 +1846,9 @@ class ResourceGovernor:
             or current.process_cpu_percent > 85.0
             or current.gpu_utilization is not None and current.gpu_utilization > 94.0
             or current.free_vram is not None and current.free_vram < thresholds.free_vram_yellow_bytes
+            or current.gpu_queue_wait_p95_ms > 18.0
+            or current.cpu_to_gpu_copy_p95_ms > 12.0
+            or current.shared_vram_used is not None and current.shared_vram_used > 2 * 1024**3
         )
         desired = ResourceState.RED if severe else ResourceState.YELLOW if warning else ResourceState.NORMAL
         rank = {ResourceState.NORMAL: 0, ResourceState.YELLOW: 1, ResourceState.RED: 2}
@@ -1677,11 +1890,18 @@ class ResourceGovernor:
             ),
         )
         capture = bounded_integer(profile.get("capture_fps"), 30, 5, 120)
+        motion_capture = bounded_integer(profile.get("motion_capture_fps"), capture, 5, 120)
         semantic = bounded_integer(profile.get("semantic_interval"), 4, 1, 60)
         ocr = bounded_integer(profile.get("ocr_interval"), semantic + 2, semantic, 120)
         vision_batch = bounded_integer(profile.get("vision_batch"), 8, 1, 1024)
         policy_batch = bounded_integer(profile.get("policy_batch"), 24, 1, 4096)
         precision = str(profile.get("precision", "fp32"))
+        model_name = normalize_model_tier(profile.get("model_tier", "Tiny"))
+        if state is ResourceState.YELLOW and model_name == "Large":
+            model_name = "Base"
+        elif state is ResourceState.RED:
+            model_name = "Tiny"
+        model_spec = model_tier_spec(model_name)
         tier = str(profile.get("resolution_tier", "low"))
         tier_sizes = {
             "low": (64, 36, 224, 126, 1.0),
@@ -1690,6 +1910,11 @@ class ResourceGovernor:
         }
         if tier not in tier_sizes:
             tier = "low"
+        if state is ResourceState.NORMAL:
+            tier_order = {"low": 0, "medium": 1, "high": 2}
+            model_floor = {"Tiny": "low", "Base": "medium", "Large": "high"}[model_spec.name]
+            if tier_order[tier] < tier_order[model_floor]:
+                tier = model_floor
         if state is ResourceState.YELLOW:
             tier = "medium" if tier == "high" else "low"
         elif state is ResourceState.RED:
@@ -1712,8 +1937,16 @@ class ResourceGovernor:
                 semantic_w,
                 semantic_h,
                 ocr_scale,
-                max(20, capture),
+                max(20, min(motion_capture, capture)),
                 tier,
+                model_spec.name,
+                model_spec.state_size,
+                model_spec.hidden_size,
+                model_spec.ensemble_size,
+                model_spec.temporal_context,
+                model_spec.planning_horizon,
+                model_spec.object_slots,
+                model_spec.vision_width_multiplier,
             )
         if state is ResourceState.YELLOW:
             return RuntimePlan(
@@ -1732,8 +1965,16 @@ class ResourceGovernor:
                 semantic_w,
                 semantic_h,
                 ocr_scale,
-                max(24, capture),
+                max(24, min(motion_capture, capture)),
                 tier,
+                model_spec.name,
+                model_spec.state_size,
+                model_spec.hidden_size,
+                model_spec.ensemble_size,
+                model_spec.temporal_context,
+                model_spec.planning_horizon,
+                model_spec.object_slots,
+                model_spec.vision_width_multiplier,
             )
         return RuntimePlan(
             capture,
@@ -1751,8 +1992,16 @@ class ResourceGovernor:
             semantic_w,
             semantic_h,
             ocr_scale,
-            capture,
+            motion_capture,
             tier,
+            model_spec.name,
+            model_spec.state_size,
+            model_spec.hidden_size,
+            model_spec.ensemble_size,
+            model_spec.temporal_context,
+            model_spec.planning_horizon,
+            model_spec.object_slots,
+            model_spec.vision_width_multiplier,
         )
 
     def _run(self):
@@ -1801,7 +2050,35 @@ def configure_torch_runtime(torch_module, plan=None):
             _TORCH_INTEROP_CONFIGURED = True
         except (RuntimeError, AttributeError, TypeError, ValueError):
             pass
+    precision = str(getattr(value, "precision", "fp32")).casefold()
+    try:
+        if hasattr(torch_module.backends, "cuda") and hasattr(torch_module.backends.cuda, "matmul"):
+            allow_tf32 = precision in {"tf32", "fp16", "mixed_fp16", "fp16_tf32"}
+            torch_module.backends.cuda.matmul.allow_tf32 = allow_tf32
+        if hasattr(torch_module.backends, "cudnn"):
+            torch_module.backends.cudnn.allow_tf32 = precision in {"tf32", "fp16", "mixed_fp16", "fp16_tf32"}
+        if hasattr(torch_module, "set_float32_matmul_precision"):
+            matmul_precision = (
+                "high"
+                if precision in {"tf32", "fp16", "mixed_fp16", "fp16_tf32"}
+                else "highest"
+            )
+            torch_module.set_float32_matmul_precision(matmul_precision)
+    except (RuntimeError, AttributeError, TypeError, ValueError):
+        pass
     return value
+
+
+def torch_inference_context(torch_module, device, plan=None):
+    value = plan or RESOURCE_GOVERNOR.current_plan()
+    precision = str(getattr(value, "precision", "fp32")).casefold()
+    device_type = str(getattr(device, "type", device)).casefold()
+    if device_type == "cuda" and precision in {"fp16", "mixed_fp16", "fp16_tf32"}:
+        try:
+            return torch_module.autocast(device_type="cuda", dtype=torch_module.float16)
+        except (RuntimeError, AttributeError, TypeError):
+            return nullcontext()
+    return nullcontext()
 
 
 def _atomic_json_write(path, value):
@@ -2219,6 +2496,8 @@ def run_startup_microbenchmark(
             pass
 
     physical = physical_core_count()
+    runtime_manifest = validate_runtime_manifest(root, False, False) or {}
+    candidate_benchmark = runtime_manifest.get("backend_benchmark", {}) if isinstance(runtime_manifest, dict) else {}
     profile = {
         **fingerprint,
         "fingerprint": fingerprint_hash,
@@ -2226,9 +2505,10 @@ def run_startup_microbenchmark(
         "vision_batch": 8,
         "policy_batch": 24,
         "capture_fps": 20,
+        "motion_capture_fps": 20,
         "semantic_interval": 5,
         "ocr_interval": 8,
-        "precision": "fp32",
+        "precision": str(candidate_benchmark.get("precision", "fp32")),
         "torch_threads": physical,
         "vision_latency_ms": 0.0,
         "vision_throughput_fps": 0.0,
@@ -2248,6 +2528,12 @@ def run_startup_microbenchmark(
             "ood_risk_and_candidate_ranking_preparation",
         ],
         "resolution_tier": "low",
+        "candidate_backend_composite_score_ms": safe_float(candidate_benchmark.get("score_ms"), 0.0),
+        "candidate_backend_score_components": (
+            dict(candidate_benchmark.get("score_components", {}))
+            if isinstance(candidate_benchmark.get("score_components"), dict)
+            else {}
+        ),
     }
 
     def median_ms(callable_value, repetitions=3):
@@ -2269,7 +2555,21 @@ def run_startup_microbenchmark(
             if is_cuda
             else median_ms(operation, repetitions)
         )
-        profile["precision"] = "fp16" if is_cuda else "fp32"
+        candidate_precision = str(profile.get("precision", "fp32")).casefold()
+        if is_cuda:
+            profile["precision"] = (
+                candidate_precision
+                if candidate_precision in {"fp16", "fp16_tf32", "tf32", "fp32"}
+                else "fp16_tf32"
+            )
+        elif str(backend) == "windows-x64-directml":
+            profile["precision"] = candidate_precision if candidate_precision in {"fp16", "fp32"} else "fp32"
+        else:
+            profile["precision"] = (
+                candidate_precision
+                if candidate_precision.startswith("int8_onnx")
+                else "int8_onnx_policy_fp32_vision"
+            )
         if is_cuda:
             try:
                 free_vram, total_vram = torch.cuda.mem_get_info(target_device)
@@ -2498,6 +2798,39 @@ def run_startup_microbenchmark(
             profile["end_to_end_samples_ms"] = [round(value, 6) for value in full_values]
             e2e_p95 = profile["end_to_end_p95_ms"]
             e2e_p99 = profile["end_to_end_p99_ms"]
+            jitter_penalty = max(0.0, e2e_p99 - e2e_p95)
+            memory_penalty = (
+                max(
+                    0.0,
+                    (768 * 1024**2 - safe_float(profile.get("free_vram"), 0.0))
+                    / (256 * 1024**2),
+                )
+                * 4.0
+                if profile.get("free_vram")
+                else 0.0
+            )
+            training_penalty = (
+                max(
+                    0.0,
+                    safe_float(profile.get("capture_training_interference_ratio"), 1.0) - 1.0,
+                )
+                * e2e_p95
+            )
+            driver_penalty = 25.0 * (
+                safe_int(RUNTIME_METRICS.counters.get("gpu_device_removed"), 0)
+                + safe_int(RUNTIME_METRICS.counters.get("gpu_device_reset"), 0)
+            )
+            profile["score_components"] = {
+                "p95_end_to_end_latency_ms": round(e2e_p95, 6),
+                "p99_jitter_penalty_ms": round(jitter_penalty, 6),
+                "memory_pressure_penalty_ms": round(memory_penalty, 6),
+                "training_interference_penalty_ms": round(training_penalty, 6),
+                "driver_instability_penalty_ms": round(driver_penalty, 6),
+            }
+            profile["composite_score_ms"] = round(
+                e2e_p95 + 0.75 * jitter_penalty + memory_penalty + training_penalty + driver_penalty,
+                6,
+            )
             if e2e_p95 <= 22.0 and e2e_p99 <= 30.0:
                 profile["capture_fps"] = 45
                 profile["semantic_interval"] = 2
@@ -2508,6 +2841,7 @@ def run_startup_microbenchmark(
                 profile["capture_fps"] = 20
                 profile["semantic_interval"] = 5
             profile["ocr_interval"] = max(profile["semantic_interval"] + 2, 4)
+            profile["motion_capture_fps"] = max(15, min(60, profile["capture_fps"] + (10 if e2e_p95 <= 33.0 else 0)))
             gpu_family = str(backend).startswith("windows-x64-nvidia") or str(backend) == "windows-x64-directml"
             if gpu_family and e2e_p95 <= 30.0:
                 profile["resolution_tier"] = "high"
@@ -2547,6 +2881,22 @@ def run_startup_microbenchmark(
             worker.join(1.0)
             profile["capture_training_interference_ratio"] = interfered / max(0.001, baseline)
             profile["capture_training_interference_tested"] = True
+            training_penalty = (
+                max(0.0, profile["capture_training_interference_ratio"] - 1.0)
+                * safe_float(profile.get("end_to_end_p95_ms"), 0.0)
+            )
+            profile["score_components"]["training_interference_penalty_ms"] = round(
+                training_penalty,
+                6,
+            )
+            profile["composite_score_ms"] = round(
+                safe_float(profile.get("end_to_end_p95_ms"), 0.0)
+                + 0.75 * safe_float(profile["score_components"].get("p99_jitter_penalty_ms"), 0.0)
+                + safe_float(profile["score_components"].get("memory_pressure_penalty_ms"), 0.0)
+                + training_penalty
+                + safe_float(profile["score_components"].get("driver_instability_penalty_ms"), 0.0),
+                6,
+            )
             if profile["capture_training_interference_ratio"] > 1.5:
                 profile["policy_batch"] = max(8, profile["policy_batch"] // 2)
                 profile["capture_fps"] = max(15, profile["capture_fps"] - 5)
@@ -2590,6 +2940,31 @@ def run_startup_microbenchmark(
     profile["fast_visual_size"] = fast_size
     profile["semantic_visual_size"] = semantic_size
     profile["ocr_roi_scale"] = ocr_scale
+    profile["model_tier"] = select_model_tier(
+        backend,
+        profile.get("end_to_end_p95_ms"),
+        profile.get("composite_score_ms"),
+        profile.get("free_vram"),
+        _total_physical_ram(),
+    )
+    selected_model_spec = model_tier_spec(profile["model_tier"])
+    tier_order = {"low": 0, "medium": 1, "high": 2}
+    model_floor = {"Tiny": "low", "Base": "medium", "Large": "high"}[selected_model_spec.name]
+    current_tier = str(profile.get("resolution_tier", "low"))
+    if current_tier not in tier_order or tier_order[current_tier] < tier_order[model_floor]:
+        current_tier = model_floor
+        profile["resolution_tier"] = current_tier
+        fast_size, semantic_size, ocr_scale = tier_shapes[current_tier]
+        profile["fast_visual_size"] = fast_size
+        profile["semantic_visual_size"] = semantic_size
+        profile["ocr_roi_scale"] = ocr_scale
+    profile["policy_state_size"] = selected_model_spec.state_size
+    profile["policy_hidden_size"] = selected_model_spec.hidden_size
+    profile["policy_ensemble_size"] = selected_model_spec.ensemble_size
+    profile["temporal_context_length"] = selected_model_spec.temporal_context
+    profile["world_model_horizon"] = selected_model_spec.planning_horizon
+    profile["object_slot_count"] = selected_model_spec.object_slots
+    profile["vision_width_multiplier"] = selected_model_spec.vision_width_multiplier
     profile["policy_benchmark_architecture"] = (
         "five_member_real_inference_and_sequential_real_member_training"
     )
@@ -3047,7 +3422,7 @@ def ensure_free_space(path, required, label):
 
 @dataclass(frozen=True, slots=True)
 class RuntimeThresholds:
-    version: int = 3
+    version: int = 4
     ram_red_bytes: int = 1536 * 1024 * 1024
     ram_yellow_bytes: int = 2560 * 1024 * 1024
     free_vram_red_bytes: int = 384 * 1024 * 1024
@@ -3066,7 +3441,7 @@ class RuntimeThresholds:
     online_acceptance_minimum_episodes: int = 30
     online_acceptance_target_episodes: int = 40
     online_acceptance_maximum_episodes: int = 50
-    world_model_horizon: int = 3
+    world_model_horizon: int = 16
     latency_regression_ratio: float = 1.30
     latency_regression_runs: int = 3
 
@@ -12619,6 +12994,7 @@ class FrameBuffer:
                     plan = RESOURCE_GOVERNOR.current_plan()
                     self.last_plan = plan
                     self.base_interval = 1.0 / max(5, int(plan.capture_fps))
+                    self.motion_interval = 1.0 / max(5, int(plan.motion_capture_fps))
                     if not self._geometry_ready():
                         self.stop_event.wait(0.05)
                         continue
@@ -12820,13 +13196,16 @@ class FrameBuffer:
                                     frame["semantic_backbone_device"] = semantic_payload.get("device", "")
                                     frame["semantic_backbone_checksum"] = semantic_payload.get("checksum", "")
                             detected_targets = detect_semantic_targets(
-                                frame, 24, DEFAULT_SEMANTIC_DETECTOR_VERSION
+                                frame, plan.object_slot_count, DEFAULT_SEMANTIC_DETECTOR_VERSION
                             )
                             previous_classes = {
                                 str(value.get("class", "")) for value in self.semantic_targets if isinstance(value, dict)
                             }
                             self.semantic_targets = merge_semantic_targets_by_roi(
-                                self.semantic_targets, detected_targets, frame.get("changed_regions", []), 48
+                                self.semantic_targets,
+                                detected_targets,
+                                frame.get("changed_regions", []),
+                                max(plan.object_slot_count, plan.object_slot_count * 2),
                             )
                             current_classes = {
                                 str(value.get("class", "")) for value in self.semantic_targets if isinstance(value, dict)
@@ -16216,7 +16595,7 @@ def _policy_training_cache_key(experience_model, experiences, default_task_id):
     return hashlib.sha256(canonical_bytes(material)).hexdigest()
 
 
-def _policy_state_vector(value, task_id="default", semantic_model=None, next_observation=False):
+def _policy_state_vector(value, task_id="default", semantic_model=None, next_observation=False, state_size=None):
     item = dict(value) if isinstance(value, dict) else {}
     if "observation_t" in item or "observation_t+1" in item:
         key = "observation_t+1" if next_observation else "observation_t"
@@ -16273,12 +16652,20 @@ def _policy_state_vector(value, task_id="default", semantic_model=None, next_obs
         semantic_model,
     )
     combined = base + task_features + memory_features + context_features
-    if len(combined) < POLICY_INPUT_SIZE:
-        combined.extend([0.0] * (POLICY_INPUT_SIZE - len(combined)))
-    return [
-        safe_float(entry, 0.0, -3.0, 3.0)
-        for entry in combined[:POLICY_INPUT_SIZE]
-    ]
+    target_size = max(POLICY_INPUT_SIZE, safe_int(state_size, POLICY_INPUT_SIZE, POLICY_INPUT_SIZE, 1024))
+    if len(combined) < target_size:
+        extension = semantic_embedding(
+            {
+                "state": state_id,
+                "task": task,
+                "objects": observation.get("object_slots", []),
+                "memory": internal.get("memory", {}),
+            },
+            target_size - len(combined),
+            semantic_model,
+        )
+        combined.extend(extension)
+    return [safe_float(entry, 0.0, -3.0, 3.0) for entry in combined[:target_size]]
 
 
 def _policy_action_vector(action_id, semantic_action=None, semantic_model=None):
@@ -16843,11 +17230,16 @@ class OfflinePolicyModelBuilder:
             and item.get("value_update_eligible", True)
             and str(item.get("action_t", item.get("action", "")))
         ]
-        self.cache_key = _policy_training_cache_key(
+        plan = RESOURCE_GOVERNOR.current_plan()
+        self.model_spec = model_tier_spec(plan)
+        base_cache_key = _policy_training_cache_key(
             self.experience_model,
             self.eligible,
             self.default_task_id,
         )
+        self.cache_key = hashlib.sha256(
+            (base_cache_key + "|" + self.model_spec.name + "|" + str(self.model_spec)).encode("utf-8")
+        ).hexdigest()
         self.config = self._config()
         self.split = _game_isolated_policy_split(self.eligible)
         self.task_support, self.action_vocabulary = self._action_support()
@@ -16949,10 +17341,14 @@ class OfflinePolicyModelBuilder:
             "schema_version": NEURAL_OFFLINE_POLICY_SCHEMA_VERSION,
             "algorithm": "task_conditioned_neural_offline_iql_cql_awr_bootstrap_ensemble",
             "trained": False,
-            "state_size": POLICY_INPUT_SIZE,
+            "state_size": self.model_spec.state_size,
             "action_size": LATENT_ACTION_SIZE,
-            "hidden_size": POLICY_HIDDEN_SIZE,
-            "ensemble_size": POLICY_ENSEMBLE_SIZE,
+            "hidden_size": self.model_spec.hidden_size,
+            "ensemble_size": self.model_spec.ensemble_size,
+            "model_tier": self.model_spec.name,
+            "temporal_context_length": self.model_spec.temporal_context,
+            "world_model_horizon": self.model_spec.planning_horizon,
+            "object_slot_count": self.model_spec.object_slots,
             "gamma": self.config.gamma,
             "expectile": self.config.expectile,
             "cql_alpha": self.config.cql_alpha,
@@ -17038,9 +17434,13 @@ class OfflinePolicyModelBuilder:
             task = normalized_identifier(item.get("task_id"), self.default_task_id, 96)
             action = str(item.get("action_t", item.get("action", "")))
             semantic = item.get("semantic_action", {}) if isinstance(item.get("semantic_action"), dict) else {}
-            rows["states"].append(_policy_state_vector(item, task, None, False))
+            rows["states"].append(
+                _policy_state_vector(item, task, None, False, self.model_spec.state_size)
+            )
             rows["actions"].append(action_vectors[action_index[action]])
-            rows["next_states"].append(_policy_state_vector(item, task, None, True))
+            rows["next_states"].append(
+                _policy_state_vector(item, task, None, True, self.model_spec.state_size)
+            )
             rows["rewards"].append(safe_float(item.get("reward_t", item.get("reward", 0.0)), 0.0, -20.0, 20.0))
             rows["dones"].append(float(bool(item.get("done"))))
             rows["confidences"].append(safe_float(item.get("reward_confidence", 0.0), 0.0, 0.0, 1.0))
@@ -17102,19 +17502,21 @@ class OfflinePolicyModelBuilder:
         )
 
     @staticmethod
-    def _create_networks(dense_type, device):
-        encoder = dense_type(POLICY_INPUT_SIZE, POLICY_HIDDEN_SIZE, POLICY_HIDDEN_SIZE).to(device)
-        pair_size = POLICY_HIDDEN_SIZE + LATENT_ACTION_SIZE
-        q1 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
-        q2 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
-        value = dense_type(POLICY_HIDDEN_SIZE, 1, POLICY_HIDDEN_SIZE).to(device)
-        policy = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
-        risk = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
-        outcome = dense_type(pair_size, 3, POLICY_HIDDEN_SIZE).to(device)
-        dynamics = dense_type(pair_size, POLICY_INPUT_SIZE, POLICY_HIDDEN_SIZE).to(device)
-        target_encoder = dense_type(POLICY_INPUT_SIZE, POLICY_HIDDEN_SIZE, POLICY_HIDDEN_SIZE).to(device)
-        target_q1 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
-        target_q2 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
+    def _create_networks(dense_type, device, state_size=POLICY_INPUT_SIZE, hidden_size=POLICY_HIDDEN_SIZE):
+        state_size = max(POLICY_INPUT_SIZE, int(state_size))
+        hidden_size = max(POLICY_HIDDEN_SIZE, int(hidden_size))
+        encoder = dense_type(state_size, hidden_size, hidden_size).to(device)
+        pair_size = hidden_size + LATENT_ACTION_SIZE
+        q1 = dense_type(pair_size, 1, hidden_size).to(device)
+        q2 = dense_type(pair_size, 1, hidden_size).to(device)
+        value = dense_type(hidden_size, 1, hidden_size).to(device)
+        policy = dense_type(pair_size, 1, hidden_size).to(device)
+        risk = dense_type(pair_size, 1, hidden_size).to(device)
+        outcome = dense_type(pair_size, 3, hidden_size).to(device)
+        dynamics = dense_type(pair_size, state_size, hidden_size).to(device)
+        target_encoder = dense_type(state_size, hidden_size, hidden_size).to(device)
+        target_q1 = dense_type(pair_size, 1, hidden_size).to(device)
+        target_q2 = dense_type(pair_size, 1, hidden_size).to(device)
         target_encoder.load_state_dict(encoder.state_dict())
         target_q1.load_state_dict(q1.state_dict())
         target_q2.load_state_dict(q2.state_dict())
@@ -17139,10 +17541,15 @@ class OfflinePolicyModelBuilder:
     def _train_ensemble(self, torch, dense_type, tensors):
         history = defaultdict(list)
         ensemble = []
-        for member_index in range(POLICY_ENSEMBLE_SIZE):
+        for member_index in range(self.model_spec.ensemble_size):
             member_seed = (self.config.seed + member_index * 104729) % (2**63 - 1)
             torch.manual_seed(member_seed)
-            networks = self._create_networks(dense_type, tensors.device)
+            networks = self._create_networks(
+                dense_type,
+                tensors.device,
+                self.model_spec.state_size,
+                self.model_spec.hidden_size,
+            )
             optimizer = torch.optim.AdamW(networks.parameters, lr=0.0015, weight_decay=0.0001)
             rng = random.Random(member_seed)
             bootstrap = [
@@ -17225,7 +17632,7 @@ class OfflinePolicyModelBuilder:
         value_loss = (expectile_weight * value_delta.pow(2)).mean()
         batch_count = state.shape[0]
         action_count = tensors.candidate_actions.shape[0]
-        expanded_state = encoded_state.unsqueeze(1).expand(batch_count, action_count, POLICY_HIDDEN_SIZE)
+        expanded_state = encoded_state.unsqueeze(1).expand(batch_count, action_count, encoded_state.shape[1])
         expanded_action = tensors.candidate_actions.unsqueeze(0).expand(
             batch_count,
             action_count,
@@ -18193,12 +18600,20 @@ class ReviewExecution:
             for name, count in sorted(skill_counts.items())
         }
         sleep_seed = safe_int(getattr(self.host, "sleep_seed", 0), 0, 0, 2**63 - 1)
+        plan = RESOURCE_GOVERNOR.current_plan()
         hardware_training_profile = current_hardware_training_profile(self.host.store.base)
         self.model = {
             "created": time.time(),
             "model_version": MODEL_SCHEMA_VERSION,
             "configuration_version": RUNTIME_THRESHOLDS.version,
             "runtime_thresholds": RUNTIME_THRESHOLDS.to_dict(),
+            "model_tier": plan.model_tier,
+            "policy_state_size": plan.policy_state_size,
+            "policy_hidden_size": plan.policy_hidden_size,
+            "policy_ensemble_size": plan.policy_ensemble_size,
+            "temporal_context_length": plan.temporal_context_length,
+            "world_model_horizon": plan.world_model_horizon,
+            "object_slot_count": plan.object_slot_count,
             "compatibility_signature": compatibility_signature(),
             "training_hardware_profile": hardware_training_profile,
             "sleep_seed": sleep_seed,
@@ -18224,6 +18639,7 @@ class ReviewExecution:
             "sequence_model": self.sequence_model,
             "experiences": experiences,
             "experience_model": experience_model,
+            "demonstration_curriculum": demonstration_curriculum_assessment(experiences),
             "behavior_model": behavior_model,
             "value_model": value_model,
             "risk_model": risk_model,
@@ -19232,7 +19648,14 @@ class TrainingExecution:
             self.host.set_input_status("等待指导")
             self.host.set_confidence("训练置信度：" + str(round(float(decision.get("confidence", 0.0)) * 100, 1)) + "%")
             self.host.set_status("训练中：" + reason + "；不产生鼠标输入")
-            if self.guidance_trigger_streak >= RUNTIME_THRESHOLDS.active_learning_trigger_streak:
+            information = (
+                active_learning_information_score(decision, temporal)
+                if "active_learning_information_score" in globals()
+                else {"score": 0.0}
+            )
+            high_information = safe_float(information.get("score"), 0.0) >= 2.4
+            if high_information or self.guidance_trigger_streak >= RUNTIME_THRESHOLDS.active_learning_trigger_streak:
+                decision["information_score"] = information
                 (
                     register_active_learning_request(self, captured, temporal, decision)
                     if "register_active_learning_request" in globals()
@@ -29301,6 +29724,10 @@ class AppModeService(AppServiceBase):
             return ranked
         world_predictions = {}
         grouped_rollouts = defaultdict(list)
+        temporal_context = kwargs.get("temporal_context")
+        if temporal_context is None and len(args) > 4:
+            temporal_context = args[4]
+        temporal_context = dict(temporal_context) if isinstance(temporal_context, dict) else {}
         for index, item in enumerate(ranked):
             group_key = (
                 item.get("task_id") or runtime.get("default_task_id"),
@@ -29308,11 +29735,32 @@ class AppModeService(AppServiceBase):
             )
             grouped_rollouts[group_key].append((index, item.get("skill_key", item.get("cluster_id"))))
         for (rollout_task, rollout_state), entries in grouped_rollouts.items():
+            rollout_context = dict(temporal_context)
+            entry_items = [ranked[index] for index, _ in entries]
+            rollout_context["risk_probability"] = max(
+                (safe_float(item.get("risk_probability"), 0.0) for item in entry_items),
+                default=0.0,
+            )
+            rollout_context["policy_value_disagreement"] = max(
+                (
+                    safe_float(
+                        item.get("policy_value_disagreement", item.get("ensemble_disagreement", 0.0)),
+                        0.0,
+                    )
+                    for item in entry_items
+                ),
+                default=0.0,
+            )
+            rollout_context["uncertainty"] = max(
+                (safe_float(item.get("ood_uncertainty", item.get("uncertainty", 0.0)), 0.0) for item in entry_items),
+                default=0.0,
+            )
             batch = world_model_rollout_candidates(
                 world,
                 rollout_task,
                 rollout_state,
                 [action for _, action in entries],
+                rollout_context,
             )
             for local_index, (global_index, _) in enumerate(entries):
                 world_predictions[global_index] = batch.get(str(local_index), {})
@@ -29329,7 +29777,13 @@ class AppModeService(AppServiceBase):
             )
             item["goal"] = str(runtime.get("task_goal", item.get("goal", "")))
             item["semantic_encoder"] = runtime.get("semantic_encoder", {})
-            features = goal_conditioned_candidate_features(item, prediction, POLICY_INPUT_SIZE)
+            ranker_input_size = safe_int(
+                ranker.get("input_size"),
+                RESOURCE_GOVERNOR.current_plan().policy_state_size,
+                POLICY_INPUT_SIZE,
+                4096,
+            )
+            features = goal_conditioned_candidate_features(item, prediction, ranker_input_size)
             outputs = LearnedCandidateRankingHead.forward(ranker, features)
             item["rule_audit_score"] = item.get("score")
             item["world_model_prediction"] = prediction
@@ -30587,13 +31041,111 @@ class AppStorageService(AppServiceBase):
         self.api.block_input()
         self.api.release_all_buttons()
         self.lifecycle.set_runtime_ready(False)
+        details = RESOURCE_GOVERNOR.report_accelerator_fault(error)
         message = "AI工作进程异常，自动输入已立即锁定：" + str(error)
         if self.store is not None:
-            self.store.log_error("AI_WORKER_FAILED", error, mode=self.mode)
+            self.store.log_error("AI_WORKER_FAILED", error, mode=self.mode, details=details)
+        should_resume_ai = normalize_mode_id(self.mode) == ModeId.AI.value and self.mode_state != MODE_IDLE
         if self.mode_state != MODE_IDLE:
-            self.ui(lambda: self.request_mode_stop("failed", message), "ai_worker_failed")
+            self.ui(lambda: self.request_mode_stop("stopped", message), "ai_worker_failed")
         else:
             self.ui(lambda: self.status.set(message), "ai_worker_failed_status")
+        if details.get("accelerator_fault") and self.store is not None:
+            lock = getattr(self, "_hot_recovery_lock", None)
+            if lock is None:
+                lock = threading.RLock()
+                self._hot_recovery_lock = lock
+            with lock:
+                if getattr(self, "_hot_recovery_active", False):
+                    return
+                self._hot_recovery_active = True
+            threading.Thread(
+                target=self._recover_ai_worker_to_cpu_safe,
+                args=(error, details, should_resume_ai),
+                name="UniversalGameAI-HotCpuFallback",
+                daemon=True,
+            ).start()
+
+    def _recover_ai_worker_to_cpu_safe(self, error, details, should_resume_ai):
+        old_worker = self.ai_worker
+        try:
+            self.api.block_input()
+            self.api.release_all_buttons()
+            base = Path(self.store.base)
+            recovery_dir = make_data_directory(base, Path("audit") / "runtime_recovery")
+            session_record = {
+                "schema_version": 1,
+                "created": time.time(),
+                "mode": normalize_mode_id(self.mode),
+                "game_id": str(self.selected_game or ""),
+                "window": dict(self.selected_window) if isinstance(self.selected_window, dict) else {},
+                "fault": type(error).__name__ + ":" + str(error),
+                "fault_details": dict(details),
+                "phase": "input_locked_session_saved_worker_restart_cpu_safe",
+            }
+            _atomic_json_write(recovery_dir / (str(int(time.time() * 1000)) + ".json"), session_record)
+            try:
+                self.store.emergency_checkpoint("accelerator_hot_fallback")
+            except RECOVERABLE_ERRORS as checkpoint_error:
+                record_cleanup_error("HOT_FALLBACK_CHECKPOINT", checkpoint_error)
+            worker = AIWorkerClient(base, self._ai_worker_failed, force_cpu_safe=True)
+            vision = VisionRuntimeProxy(worker)
+            ocr = OCRRuntimeProxy(worker)
+            if self.selected_game:
+                vision.activate_game(self.selected_game)
+                ocr.activate_game(self.selected_game)
+                manifest = vision.manifest()
+                relative = str(manifest.get("relative_path", ""))
+                checksum = str(manifest.get("checksum", ""))
+                if relative:
+                    model_path = (base / relative).resolve()
+                    if not path_inside(model_path, base) or not model_path.is_file():
+                        raise ModelValidationError("CPU安全模型路径无效")
+                    if checksum and sha256_file(model_path, MODEL_MAX_BYTES) != checksum:
+                        raise ModelValidationError("CPU安全模型校验和不一致")
+            self.ai_worker = worker
+            self.vision_runtime = vision
+            self.ocr_runtime = ocr
+            APP_CONTEXT.vision_runtime = vision
+            APP_CONTEXT.ocr_runtime = ocr
+            self.api.ai_runtime = vision
+            self.lifecycle.set_runtime_ready(True)
+            RESOURCE_GOVERNOR.apply_benchmark_profile(
+                {
+                    "backend": "windows-x64-cpu-safe",
+                    "precision": "int8_onnx",
+                    "model_tier": "Tiny",
+                    "capture_fps": 20,
+                    "motion_capture_fps": 20,
+                    "semantic_interval": 5,
+                    "ocr_interval": 8,
+                    "vision_batch": 4,
+                    "policy_batch": 16,
+                }
+            )
+            if old_worker is not None and old_worker is not worker:
+                old_worker.close(1.0)
+            self.ui(
+                lambda: self.status.set("GPU后端异常后已自动切换CPU安全模型，并完成模型校验"),
+                "ai_hot_fallback_success",
+            )
+            if should_resume_ai:
+                deadline = time.monotonic() + 15.0
+                while self.mode_state != MODE_IDLE and time.monotonic() < deadline:
+                    interruptible_wait(None, 0.05)
+                if self.mode_state == MODE_IDLE:
+                    self.ui(self.start_training, "ai_hot_fallback_resume")
+        except RECOVERABLE_ERRORS as recovery_error:
+            if self.store is not None:
+                self.store.log_error("AI_HOT_FALLBACK_FAILED", recovery_error, mode=self.mode)
+            self.ui(
+                lambda value=str(recovery_error): self.status.set("CPU安全模型自动恢复失败：" + value),
+                "ai_hot_fallback_failed",
+            )
+        finally:
+            lock = getattr(self, "_hot_recovery_lock", threading.RLock())
+            with lock:
+                self._hot_recovery_active = False
 
     def _start_ai_worker(self, base):
         old = self.ai_worker
@@ -33078,6 +33630,161 @@ def project_module_templates(source=None):
     return modules
 
 
+DEMONSTRATION_CURRICULUM = {
+    "schema_version": 1,
+    "sequence": [
+        "5_to_10_standard_success_demonstrations",
+        "different_interfaces_resolutions_and_start_states",
+        "failure_recovery_demonstrations",
+        "popup_disconnect_loading_and_stuck_recovery",
+        "positive_and_negative_examples_for_dangerous_actions",
+        "answer_only_high_information_uncertainty_questions",
+        "immediate_human_takeover_and_correct_action",
+        "independent_online_acceptance",
+    ],
+    "question_priority": ["ensemble_disagreement", "risk", "future_frequency"],
+}
+
+
+def demonstration_curriculum_assessment(experiences):
+    rows = [value for value in experiences or [] if isinstance(value, dict)]
+    contexts = [value.get("context", {}) for value in rows]
+    contexts = [value if isinstance(value, dict) else {} for value in contexts]
+    success_episodes = {
+        str(value.get("episode_id", value.get("session_id", "")))
+        for value in rows
+        if value.get("success") or value.get("terminal") == "success"
+    }
+    variants = {
+        json.dumps(
+            {
+                "window_size": context.get("window_size"),
+                "dpi": context.get("dpi"),
+                "ui_variant": context.get("ui_variant"),
+                "start_state": context.get("start_state", context.get("state_t")),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for context in contexts
+    }
+    variants.discard(
+        json.dumps(
+            {"window_size": None, "dpi": None, "ui_variant": None, "start_state": None},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    recovery_count = sum(
+        1
+        for value, context in zip(rows, contexts)
+        if value.get("failure_recovery") or context.get("failure_recovery")
+    )
+    edge_count = sum(
+        1
+        for value, context in zip(rows, contexts)
+        if any(
+            context.get(name) or value.get(name)
+            for name in ("popup", "disconnect", "loading", "stuck", "capture_frozen")
+        )
+    )
+    dangerous_positive = 0
+    dangerous_negative = 0
+    for value, context in zip(rows, contexts):
+        raw_semantic = value.get("semantic_action")
+        if not isinstance(raw_semantic, dict):
+            raw_semantic = context.get("semantic_action")
+        raw_semantic = raw_semantic if isinstance(raw_semantic, dict) else {}
+        semantic = normalize_semantic_action(raw_semantic) or raw_semantic
+        risk_class = str(semantic.get("risk_class", context.get("risk_class", "safe")))
+        if risk_class != "irreversible":
+            continue
+        if value.get("human_rejected") or context.get("negative_example"):
+            dangerous_negative += 1
+        else:
+            dangerous_positive += 1
+    high_information_answers = sum(
+        1
+        for context in contexts
+        if safe_float((context.get("information_score") or {}).get("score"), 0.0) >= 2.4
+        or safe_float(context.get("active_learning_priority"), 0.0) >= 2.4
+    )
+    takeover_count = sum(
+        1
+        for context in contexts
+        if context.get("human_override") and context.get("corrective_action")
+    )
+    stages = [
+        {
+            "id": "standard_success",
+            "complete": 5 <= len(success_episodes),
+            "count": len(success_episodes),
+            "target": "5-10",
+            "recommendation": "先提供5至10局标准成功示范",
+        },
+        {
+            "id": "interface_variants",
+            "complete": len(variants) >= 3,
+            "count": len(variants),
+            "target": ">=3",
+            "recommendation": "补充不同界面、分辨率和起始状态",
+        },
+        {
+            "id": "failure_recovery",
+            "complete": recovery_count >= 2,
+            "count": recovery_count,
+            "target": ">=2",
+            "recommendation": "专门演示失败后的恢复操作",
+        },
+        {
+            "id": "edge_recovery",
+            "complete": edge_count >= 4,
+            "count": edge_count,
+            "target": ">=4",
+            "recommendation": "演示弹窗、断线、加载和卡死恢复",
+        },
+        {
+            "id": "dangerous_contrast",
+            "complete": dangerous_positive >= 1 and dangerous_negative >= 1,
+            "count": dangerous_positive + dangerous_negative,
+            "target": "正反例各>=1",
+            "recommendation": "为危险操作同时提供正例和反例",
+        },
+        {
+            "id": "high_information_questions",
+            "complete": high_information_answers >= 1,
+            "count": high_information_answers,
+            "target": ">=1",
+            "recommendation": "只回答成员分歧、风险和复用价值最高的问题",
+        },
+        {
+            "id": "corrective_takeover",
+            "complete": takeover_count >= 1,
+            "count": takeover_count,
+            "target": ">=1",
+            "recommendation": "AI出错时立即人工接管并给出正确动作",
+        },
+        {
+            "id": "online_acceptance",
+            "complete": False,
+            "count": 0,
+            "target": "独立验收",
+            "recommendation": "最后执行独立在线验收",
+        },
+    ]
+    next_stage = next((value for value in stages if not value["complete"]), stages[-1])
+    return {
+        "schema_version": DEMONSTRATION_CURRICULUM["schema_version"],
+        "stages": stages,
+        "completed_count": sum(1 for value in stages if value["complete"]),
+        "next_stage": dict(next_stage),
+        "question_priority": list(DEMONSTRATION_CURRICULUM["question_priority"]),
+        "random_mass_questioning": False,
+    }
+
+
 def materialize_project_layout(base):
     root = Path(base) / "project"
     source = Path(__file__).read_text(encoding="utf-8")
@@ -33095,6 +33802,38 @@ def materialize_project_layout(base):
         "files": files,
         "generated": time.time(),
     }
+    package_names = (
+        "core",
+        "hardware",
+        "capture",
+        "input",
+        "perception",
+        "policy",
+        "training",
+        "storage",
+        "ui",
+        "tests",
+    )
+    signed_modules = {}
+    for package_name in package_names:
+        initializer = root / package_name / "__init__.py"
+        payload = (
+            "MODULE_NAME=" + repr(package_name) + "\n"
+            "MODULE_SCHEMA_VERSION=1\n"
+            "def contract():\n"
+            "    return {'module':MODULE_NAME,'schema_version':MODULE_SCHEMA_VERSION}\n"
+        )
+        _atomic_write(initializer, payload)
+        signed_modules[str(initializer.relative_to(root))] = sha256_file(initializer)
+    curriculum_path = root / "training" / "demonstration_curriculum.json"
+    _atomic_write(
+        curriculum_path,
+        json.dumps(DEMONSTRATION_CURRICULUM, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    )
+    signed_modules[str(curriculum_path.relative_to(root))] = sha256_file(curriculum_path)
+    manifest["self_extract_layout"] = list(package_names)
+    manifest["signed_modules"] = signed_modules
+    manifest["demonstration_curriculum_checksum"] = sha256_file(curriculum_path)
     _atomic_write(
         root / "manifest.json", json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
@@ -33113,12 +33852,67 @@ def materialize_selected_folder_layout(base):
         for relative, content in modules.items()
         if relative.startswith("src/") or relative.startswith("tests/")
     }
+    package_names = (
+        "core",
+        "hardware",
+        "capture",
+        "input",
+        "perception",
+        "policy",
+        "training",
+        "storage",
+        "ui",
+        "tests",
+    )
+    for package_name in package_names:
+        payload["project/" + package_name + "/__init__.py"] = (
+            "MODULE_NAME=" + repr(package_name) + "\n"
+            "MODULE_SCHEMA_VERSION=1\n"
+            "def contract():\n"
+            "    return {'module':MODULE_NAME,'schema_version':MODULE_SCHEMA_VERSION}\n"
+        )
+    payload["project/training/demonstration_curriculum.json"] = json.dumps(
+        DEMONSTRATION_CURRICULUM,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     payload["runtime/runtime_manifest.json"] = json.dumps(
         {
             "layout_version": RUNTIME_LAYOUT_VERSION,
             "runtime_install_state": "pending_or_managed",
             "entrypoint": "../main.py",
             "integrity": "manifests/source_manifest.json",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    payload["runtime.current/.layout.json"] = json.dumps(
+        {
+            "layout_version": RUNTIME_LAYOUT_VERSION,
+            "state": "pending_integrity_install",
+            "managed_atomically": True,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    payload["models/.layout.json"] = json.dumps(
+        {
+            "layout_version": RUNTIME_LAYOUT_VERSION,
+            "purpose": "signed_model_artifacts",
+            "checksum_required": True,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    payload["audit/.layout.json"] = json.dumps(
+        {
+            "layout_version": RUNTIME_LAYOUT_VERSION,
+            "purpose": "append_only_runtime_audit",
+            "recovery_events": True,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -33136,7 +33930,7 @@ def materialize_selected_folder_layout(base):
         entries.append({"path": relative, "size": len(encoded), "sha256": expected_hash})
     manifest = {
         "format": 1,
-        "layout": ["runtime", "src", "tests", "manifests"],
+        "layout": ["project", "runtime.current", "models", "audit", "runtime", "src", "tests", "manifests"],
         "entrypoint": "main.py",
         "entrypoint_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
         "files": entries,
@@ -34235,100 +35029,515 @@ def _runtime_write_require_hashes_lock(path, entries, wheelhouse):
 
 def _runtime_backend_validation(python, env, family):
     source = """
-import gc,hashlib,json,math,statistics,sys,tempfile,time
+import gc, hashlib, json, math, os, statistics, subprocess, sys, tempfile, threading, time
 import numpy as np
-from PIL import Image,ImageDraw
+from PIL import Image, ImageDraw
 import cv2
 import torch
 import torchvision
 import setuptools
 from omegaconf import OmegaConf
-from safetensors.torch import save_file,load_file
+from safetensors.torch import save_file, load_file
 from rapidocr import RapidOCR
-family=__FAMILY__
+family = __FAMILY__
 if family.startswith('windows-x64-nvidia'):
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA运行库已安装但torch.cuda.is_available为False')
-    device=torch.device('cuda')
-    device_name=str(torch.cuda.get_device_name(0))
-    device_type='cuda'
-elif family=='windows-x64-directml':
+    device = torch.device('cuda')
+    device_name = str(torch.cuda.get_device_name(0))
+    device_type = 'cuda'
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+elif family == 'windows-x64-directml':
     import torch_directml
-    device=torch_directml.device()
-    device_name=str(device)
-    device_type='privateuseone'
+    device = torch_directml.device()
+    device_name = str(device)
+    device_type = 'privateuseone'
 else:
-    device=torch.device('cpu')
-    device_name='CPU'
-    device_type='cpu'
-def sync():
+    device = torch.device('cpu')
+    device_name = 'CPU'
+    device_type = 'cpu'
+
+def sync(value=None):
     if family.startswith('windows-x64-nvidia'):
         torch.cuda.synchronize()
-a=np.asarray([[1,2],[3,4]],dtype=np.float32)
-assert float(a.sum())==10.0
-image=Image.new('RGB',(180,64),'white')
-ImageDraw.Draw(image).text((12,18),'12345',fill='black')
-array=np.asarray(image)
-assert cv2.resize(array,(90,32)).shape==(32,90,3)
-x=torch.tensor([[1.0,2.0]],device=device,requires_grad=True)
-y=(x@torch.tensor([[2.0],[3.0]],device=device)).sum()
-y.backward()
-sync()
-assert abs(float(y.detach().to('cpu'))-8.0)<1e-4 and x.grad is not None
-with tempfile.TemporaryDirectory() as folder:
-    path=folder+'/probe.safetensors'
-    save_file({'x':x.detach().to('cpu')},path)
-    assert tuple(load_file(path)['x'].shape)==(1,2)
-engine=RapidOCR()
-ocr_result=engine(array)
-ocr_text=''
-if ocr_result is not None:
-    ocr_text=str(getattr(ocr_result,'txts','') or getattr(ocr_result,'texts','') or ocr_result)
-assert isinstance(ocr_text,str)
-assert OmegaConf.create({'strict':True}).strict is True
-conv=torch.nn.Conv2d(3,24,3,padding=1).to(device).eval()
-conv_input=torch.randn(1,3,128,128,device=device)
-mat_a=torch.randn(384,384,device=device)
-mat_b=torch.randn(384,384,device=device)
-for _ in range(3):
-    with torch.inference_mode():
-        conv(conv_input); mat_a@mat_b
-    sync()
-def measure(call):
-    values=[]
-    for _ in range(9):
-        started=time.perf_counter()
-        with torch.inference_mode(): call()
-        sync()
-        values.append((time.perf_counter()-started)*1000.0)
-    values.sort()
-    return {
-        'p50_ms':values[len(values)//2],
-        'p95_ms':values[min(len(values)-1,round((len(values)-1)*0.95))],
-        'max_ms':values[-1],
-    }
-conv_metric=measure(lambda:conv(conv_input))
-matmul_metric=measure(lambda:mat_a@mat_b)
-stress=torch.empty(16*1024*1024,dtype=torch.float32,device=device)
-stress.fill_(1.0)
-sync()
-stress_checksum=float(stress[:1024].sum().detach().to('cpu'))
-del stress,conv_input,mat_a,mat_b,conv
-gc.collect()
+    elif value is not None and family == 'windows-x64-directml':
+        value.reshape(-1)[:1].to('cpu')
+
+def percentile(values, q):
+    ordered = sorted((float(v) for v in values))
+    return ordered[min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * q))))]
+
+def process_rss():
+    if os.name != 'nt':
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PMC(ctypes.Structure):
+            _fields_ = [
+                ('cb', wintypes.DWORD),
+                ('PageFaultCount', wintypes.DWORD),
+                ('PeakWorkingSetSize', ctypes.c_size_t),
+                ('WorkingSetSize', ctypes.c_size_t),
+                ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                ('PagefileUsage', ctypes.c_size_t),
+                ('PeakPagefileUsage', ctypes.c_size_t),
+            ]
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        psapi = ctypes.WinDLL('psapi', use_last_error=True)
+        counters = PMC()
+        counters.cb = ctypes.sizeof(counters)
+        if not psapi.GetProcessMemoryInfo(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+            return 0
+        return int(counters.WorkingSetSize)
+    except Exception:
+        return 0
+
+def dml_telemetry():
+    if family != 'windows-x64-directml' or os.name != 'nt':
+        return {}
+    command = (
+        "$p=@('\\GPU Engine(*)\\Utilization Percentage',"
+        "'\\GPU Adapter Memory(*)\\Dedicated Usage',"
+        "'\\GPU Adapter Memory(*)\\Shared Usage');"
+        "$s=(Get-Counter -Counter $p -MaxSamples 1 -ErrorAction Stop).CounterSamples;"
+        "$s|Select-Object Path,CookedValue|ConvertTo-Json -Compress"
+    )
+    try:
+        raw = subprocess.check_output(
+            [
+                'powershell.exe',
+                '-NoProfile',
+                '-NonInteractive',
+                '-Command',
+                command,
+            ],
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=6,
+            creationflags=134217728,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        rows = json.loads(raw) if raw else []
+        if isinstance(rows, dict):
+            rows = [rows]
+        util = []
+        dedicated = []
+        shared = []
+        for row in rows:
+            path = str(row.get('Path', '')).lower()
+            value = max(0.0, float(row.get('CookedValue', 0.0) or 0.0))
+            if 'utilization percentage' in path:
+                util.append(value)
+            elif 'dedicated usage' in path:
+                dedicated.append(value)
+            elif 'shared usage' in path:
+                shared.append(value)
+        reset_command = (
+            "$e=Get-WinEvent -FilterHashtable @{LogName='System';StartTime=(Get-Date).AddHours(-24)} "
+            "-ErrorAction SilentlyContinue;"
+            "@($e|Where-Object {$_.Id -eq 4101}).Count"
+        )
+        try:
+            reset_count = int(
+                subprocess.check_output(
+                    [
+                        'powershell.exe',
+                        '-NoProfile',
+                        '-NonInteractive',
+                        '-Command',
+                        reset_command,
+                    ],
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=6,
+                    creationflags=134217728,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+                or 0
+            )
+        except Exception:
+            reset_count = 0
+        return {
+            'gpu_engine_utilization': min(100.0, sum(util)),
+            'dedicated_vram_used': int(max(dedicated) if dedicated else 0),
+            'shared_vram_used': int(max(shared) if shared else 0),
+            'device_removed_count': 0,
+            'device_reset_count': reset_count,
+            'source': 'windows_performance_counters_and_system_events',
+        }
+    except Exception as error:
+        return {'source': 'windows_performance_counters', 'error': type(error).__name__ + ':' + str(error)}
+image = Image.new('RGB', (640, 360), 'white')
+draw = ImageDraw.Draw(image)
+draw.rectangle((30, 30, 230, 120), fill=(40, 90, 180))
+draw.text((55, 62), 'PLAY 12345', fill='white')
+draw.rectangle((360, 210, 610, 330), fill=(180, 50, 50))
+draw.text((405, 250), 'CONFIRM', fill='white')
+base_array = np.asarray(image, dtype=np.uint8)
+ocr_roi = base_array[30:125, 30:250].copy()
+engine = RapidOCR()
+ocr_probe = engine(ocr_roi)
+assert ocr_probe is not None
+assert OmegaConf.create({'strict': True}).strict is True
+precision = 'fp32'
 if family.startswith('windows-x64-nvidia'):
-    torch.cuda.empty_cache()
-score=float(conv_metric['p95_ms']+matmul_metric['p95_ms'])
-stable=all(math.isfinite(float(value)) for value in (score,stress_checksum)) and score<5000.0
-payload=b'UniversalGameAI strict runtime backend benchmark'
-print(json.dumps({
-    'python':sys.version,'family':family,'backend':'torch','device':device_name,'device_type':device_type,
-    'numpy':np.__version__,'pillow':getattr(Image,'__version__','loaded'),'opencv':cv2.__version__,
-    'torch':torch.__version__,'torchvision':torchvision.__version__,'rapidocr':'functional',
-    'safetensors':'functional','omegaconf':'functional','setuptools':setuptools.__version__,
-    'conv':conv_metric,'matmul':matmul_metric,'memory_stress_bytes':16*1024*1024*4,
-    'memory_stress_checksum':stress_checksum,'score_ms':score,'stable':stable,
-    'self_test_sha256':hashlib.sha256(payload).hexdigest()
-},ensure_ascii=False))
+    precision = 'fp16_tf32'
+elif family == 'windows-x64-directml':
+    try:
+        probe = torch.randn(1, 3, 16, 16, dtype=torch.float16).to(device)
+        layer = torch.nn.Conv2d(3, 4, 3, padding=1).to(device).half()
+        out = layer(probe)
+        sync(out)
+        precision = 'fp16'
+        del probe, layer, out
+    except Exception:
+        precision = 'fp32'
+elif family == 'windows-x64-cpu':
+    precision = 'int8_onnx_policy_fp32_vision'
+fast = torch.nn.Sequential(
+    torch.nn.Conv2d(3, 24, 3, padding=1),
+    torch.nn.Hardswish(),
+    torch.nn.Conv2d(24, 32, 3, padding=1, groups=8),
+    torch.nn.Hardswish(),
+    torch.nn.AdaptiveAvgPool2d(1),
+).to(device).eval()
+semantic = torch.nn.Sequential(
+    torch.nn.Conv2d(3, 32, 5, stride=2, padding=2),
+    torch.nn.Hardswish(),
+    torch.nn.Conv2d(32, 64, 3, stride=2, padding=1),
+    torch.nn.Hardswish(),
+    torch.nn.AdaptiveAvgPool2d((6, 10)),
+).to(device).eval()
+
+class Policy(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(224, 256),
+            torch.nn.Tanh(),
+            torch.nn.Linear(256, 128),
+            torch.nn.Tanh(),
+            torch.nn.Linear(128, 5),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+policies = [Policy().to(device).eval() for _ in range(5)]
+gru = torch.nn.GRUCell(160, 256).to(device).eval()
+world_head = torch.nn.Linear(256, 128).to(device).eval()
+inference_dtype = (
+    torch.float16
+    if precision in {'fp16', 'fp16_tf32'}
+    else torch.float32
+)
+if inference_dtype == torch.float16:
+    fast.half()
+    semantic.half()
+    for member in policies:
+        member.half()
+    gru.half()
+    world_head.half()
+trainer = torch.nn.Sequential(torch.nn.Linear(224, 256), torch.nn.GELU(), torch.nn.Linear(256, 5)).to(device)
+optimizer = torch.optim.AdamW(trainer.parameters(), lr=0.001)
+train_x = torch.randn(32, 224, device=device)
+train_y = torch.randn(32, 5, device=device)
+with tempfile.TemporaryDirectory() as folder:
+    path = folder + '/probe.safetensors'
+    save_file({'x': torch.ones(2, 2)}, path)
+    assert tuple(load_file(path)['x'].shape) == (2, 2)
+
+def training_step():
+    optimizer.zero_grad(set_to_none=True)
+    loss = (trainer(train_x) - train_y).pow(2).mean()
+    loss.backward()
+    optimizer.step()
+    sync(loss)
+
+def pipeline(run_training=False):
+    stage = {}
+    queue_wait_ms = 0.0
+    started = time.perf_counter()
+    capture_started = time.perf_counter()
+    captured = base_array.copy()
+    stage['simulated_window_capture_ms'] = (time.perf_counter() - capture_started) * 1000.0
+    prep_started = time.perf_counter()
+    rgb = cv2.cvtColor(captured, cv2.COLOR_RGB2BGR)
+    fast_np = cv2.resize(rgb, (128, 72), interpolation=cv2.INTER_AREA)
+    semantic_np = cv2.resize(rgb, (384, 216), interpolation=cv2.INTER_LINEAR)
+    stage['resize_color_conversion_ms'] = (time.perf_counter() - prep_started) * 1000.0
+    transfer_started = time.perf_counter()
+    fast_tensor = torch.from_numpy(fast_np.copy()).permute(2, 0, 1).unsqueeze(0).to(device, dtype=inference_dtype) / 255.0
+    semantic_tensor = (
+        torch.from_numpy(semantic_np.copy())
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .to(device, dtype=inference_dtype)
+        / 255.0
+    )
+    queue_started = time.perf_counter()
+    sync(fast_tensor)
+    queue_wait_ms += (time.perf_counter() - queue_started) * 1000.0
+    stage['cpu_to_gpu_copy_ms'] = (time.perf_counter() - transfer_started) * 1000.0
+    vision_started = time.perf_counter()
+    with torch.inference_mode():
+        fast_out = fast(fast_tensor)
+    queue_started = time.perf_counter()
+    sync(fast_out)
+    queue_wait_ms += (time.perf_counter() - queue_started) * 1000.0
+    stage['fast_visual_encoding_ms'] = (time.perf_counter() - vision_started) * 1000.0
+    semantic_started = time.perf_counter()
+    with torch.inference_mode():
+        semantic_out = semantic(semantic_tensor)
+    queue_started = time.perf_counter()
+    sync(semantic_out)
+    queue_wait_ms += (time.perf_counter() - queue_started) * 1000.0
+    stage['high_resolution_semantic_visual_ms'] = (time.perf_counter() - semantic_started) * 1000.0
+    ocr_started = time.perf_counter()
+    ocr_value = engine(ocr_roi)
+    stage['ocr_region_processing_ms'] = (time.perf_counter() - ocr_started) * 1000.0
+    detect_started = time.perf_counter()
+    gray = cv2.cvtColor(captured, cv2.COLOR_RGB2GRAY)
+    _, binary = cv2.threshold(gray, 210, 255, cv2.THRESH_BINARY_INV)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    objects = []
+    for contour in contours[:24]:
+        x, y, w, h = cv2.boundingRect(contour)
+        if w * h >= 36:
+            objects.append((x, y, w, h))
+    relations = []
+    for i, a in enumerate(objects):
+        for j, b in enumerate(objects):
+            if i != j and a[0] + a[2] <= b[0]:
+                relations.append((i, 'left_of', j))
+    stage['object_detection_scene_graph_ms'] = (time.perf_counter() - detect_started) * 1000.0
+    state_cpu = np.zeros((1, 224), dtype=np.float32)
+    state_cpu[0, :min(64, fast_out.numel())] = fast_out.detach().reshape(-1)[:64].to('cpu', dtype=torch.float32).numpy()
+    state_cpu[0, 64:128] = semantic_out.detach().reshape(-1)[:64].to('cpu', dtype=torch.float32).numpy()
+    state_cpu[0, 128] = len(objects) / 24.0
+    state_cpu[0, 129] = len(relations) / 576.0
+    state_cpu[0, 130] = 1.0 if ocr_value is not None else 0.0
+    policy_started = time.perf_counter()
+    state = torch.from_numpy(state_cpu).to(device, dtype=inference_dtype)
+    member_outputs = []
+    with torch.inference_mode():
+        for member in policies:
+            member_outputs.append(member(state))
+    policy_stack = torch.stack(member_outputs)
+    queue_started = time.perf_counter()
+    sync(policy_stack)
+    queue_wait_ms += (time.perf_counter() - queue_started) * 1000.0
+    stage['five_member_policy_inference_ms'] = (time.perf_counter() - policy_started) * 1000.0
+    world_started = time.perf_counter()
+    hidden = torch.zeros(1, 256, device=device, dtype=inference_dtype)
+    action = torch.zeros(1, 32, device=device, dtype=inference_dtype)
+    rollout = []
+    with torch.inference_mode():
+        for _ in range(6):
+            hidden = gru(torch.cat([state[:, :128], action], dim=1), hidden)
+            predicted = world_head(hidden)
+            rollout.append(predicted)
+            action = torch.tanh(predicted[:, :32])
+    rollout_stack = torch.stack(rollout)
+    queue_started = time.perf_counter()
+    sync(rollout_stack)
+    queue_wait_ms += (time.perf_counter() - queue_started) * 1000.0
+    stage['world_model_six_step_rollout_ms'] = (time.perf_counter() - world_started) * 1000.0
+    rank_started = time.perf_counter()
+    mean = policy_stack.mean(dim=0)
+    std = policy_stack.std(dim=0, unbiased=False)
+    rollout_value = rollout_stack.mean()
+    scores = mean[:, 0] + mean[:, 1] - mean[:, 3] - std.mean(dim=1) + 0.01 * rollout_value
+    ordering = torch.argsort(scores, descending=True)
+    queue_started = time.perf_counter()
+    sync(ordering)
+    queue_wait_ms += (time.perf_counter() - queue_started) * 1000.0
+    stage['candidate_action_ranking_ms'] = (time.perf_counter() - rank_started) * 1000.0
+    stage['gpu_queue_wait_ms'] = queue_wait_ms
+    if run_training:
+        train_started = time.perf_counter()
+        training_step()
+        stage['training_step_ms'] = (time.perf_counter() - train_started) * 1000.0
+    stage['end_to_end_ms'] = (time.perf_counter() - started) * 1000.0
+    return stage
+for _ in range(2):
+    pipeline(False)
+stages = []
+failures = 0
+for _ in range(9):
+    try:
+        stages.append(pipeline(False))
+    except Exception:
+        failures += 1
+training_stages = []
+training_errors = []
+training_stop = threading.Event()
+
+def background_training():
+    while not training_stop.is_set():
+        try:
+            training_step()
+        except Exception as error:
+            training_errors.append(type(error).__name__ + ':' + str(error))
+            break
+
+training_worker = threading.Thread(target=background_training, daemon=True)
+training_worker.start()
+time.sleep(0.05)
+for _ in range(5):
+    try:
+        training_stages.append(pipeline(False))
+    except Exception:
+        failures += 1
+training_stop.set()
+training_worker.join(3.0)
+failures += len(training_errors)
+if training_worker.is_alive():
+    failures += 1
+if not stages:
+    raise RuntimeError('完整端到端候选后端基准没有成功样本')
+latencies = [row['end_to_end_ms'] for row in stages]
+training_latencies = [row['end_to_end_ms'] for row in training_stages] or latencies
+p50 = percentile(latencies, 0.5)
+p95 = percentile(latencies, 0.95)
+p99 = percentile(latencies, 0.99)
+jitter = max(0.0, p99 - p95)
+training_p95 = percentile(training_latencies, 0.95)
+training_interference = max(0.0, training_p95 - p95)
+rss = process_rss()
+memory_penalty = max(0.0, (rss - 1536 * 1024 * 1024) / (256 * 1024 * 1024)) * 5.0
+telemetry = dml_telemetry()
+driver_penalty = 50.0 * (
+    failures
+    + int(telemetry.get('device_removed_count', 0) or 0)
+    + int(telemetry.get('device_reset_count', 0) or 0)
+)
+if family.startswith('windows-x64-nvidia'):
+    try:
+        free_vram, total_vram = torch.cuda.mem_get_info(device)
+        telemetry.update(
+            {
+                'free_vram': int(free_vram),
+                'total_vram': int(total_vram),
+                'allocated_vram': int(torch.cuda.memory_allocated(device)),
+            }
+        )
+        memory_penalty += max(0.0, (768 * 1024 * 1024 - free_vram) / (256 * 1024 * 1024)) * 5.0
+    except Exception:
+        pass
+elif family == 'windows-x64-directml':
+    shared = int(telemetry.get('shared_vram_used', 0) or 0)
+    memory_penalty += max(0.0, (shared - 2 * 1024 * 1024 * 1024) / (512 * 1024 * 1024)) * 4.0
+score = p95 + 0.75 * jitter + memory_penalty + training_interference + driver_penalty
+stage_metrics = {}
+for key in stages[0]:
+    values = [row[key] for row in stages if key in row]
+    stage_metrics[key] = {
+        'p50_ms': percentile(values, 0.5),
+        'p95_ms': percentile(values, 0.95),
+        'p99_ms': percentile(values, 0.99),
+    }
+stable = failures == 0 and all((math.isfinite(float(value)) for value in (p50, p95, p99, score))) and (p99 < 10000.0)
+if family.startswith('windows-x64-nvidia') and p95 <= 42 and (score <= 85):
+    model_tier = 'Large'
+elif family == 'windows-x64-directml' and p95 <= 48 and (score <= 95):
+    model_tier = 'Large'
+elif p95 <= 80 and score <= 160:
+    model_tier = 'Base'
+else:
+    model_tier = 'Tiny'
+model_specs = {
+    'Tiny': {
+        'state_size': 192,
+        'hidden_size': 128,
+        'ensemble_size': 5,
+        'temporal_context': 32,
+        'planning_horizon': 3,
+        'object_slots': 24,
+    },
+    'Base': {
+        'state_size': 384,
+        'hidden_size': 256,
+        'ensemble_size': 5,
+        'temporal_context': 64,
+        'planning_horizon': 6,
+        'object_slots': 48,
+    },
+    'Large': {
+        'state_size': 512,
+        'hidden_size': 512,
+        'ensemble_size': 7,
+        'temporal_context': 128,
+        'planning_horizon': 16,
+        'object_slots': 72,
+    },
+}
+payload = b'UniversalGameAI complete end-to-end backend benchmark v2'
+result = {
+    'python': sys.version,
+    'family': family,
+    'backend': 'torch',
+    'device': device_name,
+    'device_type': device_type,
+    'precision': precision,
+    'numpy': np.__version__,
+    'pillow': getattr(Image, '__version__', 'loaded'),
+    'opencv': cv2.__version__,
+    'torch': torch.__version__,
+    'torchvision': torchvision.__version__,
+    'rapidocr': 'functional',
+    'safetensors': 'functional',
+    'omegaconf': 'functional',
+    'setuptools': setuptools.__version__,
+    'end_to_end_p50_ms': p50,
+    'end_to_end_p95_ms': p95,
+    'end_to_end_p99_ms': p99,
+    'p99_jitter_ms': jitter,
+    'training_interference_ms': training_interference,
+    'training_interference_mode': 'concurrent_background_training',
+    'process_rss_bytes': rss,
+    'telemetry': telemetry,
+    'stage_metrics': stage_metrics,
+    'pipeline': [
+        'simulated_window_capture',
+        'resize_and_color_conversion',
+        'fast_visual_encoding',
+        'high_resolution_semantic_visual',
+        'ocr_region_processing',
+        'object_detection_and_scene_graph',
+        'five_member_policy_inference',
+        'six_step_world_model_rollout',
+        'candidate_action_ranking',
+        'cpu_gpu_synchronization_and_transfer',
+    ],
+    'score_components': {
+        'p95_end_to_end_latency_ms': p95,
+        'p99_jitter_penalty_ms': 0.75 * jitter,
+        'memory_vram_pressure_penalty_ms': memory_penalty,
+        'training_interference_penalty_ms': training_interference,
+        'driver_instability_penalty_ms': driver_penalty,
+    },
+    'score_formula': (
+        'p95+0.75*(p99-p95)+memory_pressure+'
+        'training_interference+driver_instability'
+    ),
+    'score_ms': score,
+    'model_tier': model_tier,
+    'model_spec': model_specs[model_tier],
+    'motion_capture_fps': 45 if p95 <= 33 else 30 if p95 <= 55 else 20,
+    'stable': stable,
+    'failures': failures,
+    'self_test_sha256': hashlib.sha256(payload).hexdigest(),
+}
+print(json.dumps(result, ensure_ascii=False))
 """.replace("__FAMILY__", repr(str(family)))
     output = subprocess.check_output(
         [str(python), "-c", source],
@@ -34337,11 +35546,25 @@ print(json.dumps({
         encoding="utf-8",
         errors="replace",
         stderr=subprocess.STDOUT,
-        timeout=180,
+        timeout=300,
     )
     value = json.loads(output.strip().splitlines()[-1])
     if value.get("stable") is not True or str(value.get("family")) != str(family):
-        raise RuntimeError("后端卷积、矩阵乘法或显存压力测试未稳定通过：" + str(family))
+        raise RuntimeError("后端完整端到端任务、训练干扰或驱动稳定性基准未通过：" + str(family))
+    required_stages = {
+        "simulated_window_capture",
+        "resize_and_color_conversion",
+        "fast_visual_encoding",
+        "high_resolution_semantic_visual",
+        "ocr_region_processing",
+        "object_detection_and_scene_graph",
+        "five_member_policy_inference",
+        "six_step_world_model_rollout",
+        "candidate_action_ranking",
+        "cpu_gpu_synchronization_and_transfer",
+    }
+    if not required_stages.issubset(set(value.get("pipeline", []))):
+        raise RuntimeError("候选后端端到端基准阶段不完整：" + str(family))
     return value
 
 
@@ -34509,7 +35732,7 @@ def runtime_install_worker(request_path):
             env,
             "按内嵌SHA-256锁安装wheel",
         )
-        _runtime_emit("progress", value=82.0, message="执行CPU候选后端卷积、矩阵乘法与内存压力实测")
+        _runtime_emit("progress", value=82.0, message="执行CPU候选后端完整端到端任务、训练干扰与稳定性实测")
         validation_result = _runtime_backend_validation(python, env, "windows-x64-cpu")
         freeze = subprocess.check_output(
             [python, "-m", "pip", "freeze", "--all"],
@@ -34549,7 +35772,7 @@ def runtime_install_worker(request_path):
                 candidate_evidence.append({**descriptor, "installed": False, "stable": False})
                 continue
             try:
-                _runtime_emit("line", message="安装并实测候选后端 " + family)
+                _runtime_emit("line", message="安装并执行完整端到端实测候选后端 " + family)
                 candidate = _runtime_install_backend_candidate(base, family, architecture, cache_root)
                 candidate_records.append(candidate)
                 candidate_evidence.append(
@@ -34600,13 +35823,13 @@ def runtime_install_worker(request_path):
             reason = str(value.get("reason", "")).strip()
             if not reason and value.get("installed") and value.get("stable"):
                 reason = "真实延迟不如所选后端"
-            rejected.append(family + "：" + (reason or "安装或压力测试未通过"))
+            rejected.append(family + "：" + (reason or "安装或完整端到端稳定性基准未通过"))
         if selected_backend == "windows-x64-cpu" and not requested_gpu:
             fallback_reason = "未检测到可实测GPU；使用CPU锁定运行库"
         elif selected_backend == "windows-x64-cpu":
             fallback_reason = "；".join(rejected) or "GPU候选未通过真实延迟或稳定性门禁，原子回退CPU"
         else:
-            fallback_reason = "按卷积、矩阵乘法和显存压力测试的真实延迟选择" + selected_backend
+            fallback_reason = "按端到端p95、p99抖动、内存/显存、训练干扰和驱动稳定性综合目标选择" + selected_backend
         fallback = {
             "requested": "measured_gpu_candidates" if requested_gpu else "cpu",
             "selected": selected_backend,
@@ -34662,6 +35885,12 @@ def runtime_install_worker(request_path):
             "gpu_backend": selected_backend,
             "gpu_device": str(validation_result.get("device", "CPU")),
             "backend_benchmark": validation_result,
+            "model_tier": normalize_model_tier(validation_result.get("model_tier", "Tiny")),
+            "model_spec": dict(validation_result.get("model_spec", {})),
+            "precision": str(validation_result.get("precision", "fp32")),
+            "motion_capture_fps": safe_int(validation_result.get("motion_capture_fps"), 20, 5, 120),
+            "backend_selection_objective": dict(validation_result.get("score_components", {})),
+            "directml_telemetry": dict(validation_result.get("telemetry", {})),
             "backend_fallback": fallback,
             "download_evidence": download_evidence,
             "preprocess_hash": VISION_PREPROCESS_HASH,
@@ -34675,7 +35904,8 @@ def runtime_install_worker(request_path):
             },
             "reproducibility": (
                 "each eligible backend uses an embedded architecture-specific SHA-256 wheel lock, "
-                "is installed in isolation, benchmarked, and atomically selected without dependency resolution"
+                "is installed in isolation, executes the same complete end-to-end task benchmark, "
+                "and is atomically selected by the composite objective without dependency resolution"
             ),
         }
         if manifest.get("lock_complete") is not True or not runtime_lock_matches_key(
@@ -35760,6 +36990,13 @@ class OfflineVisionRuntime:
                 or self.runtime_manifest.get("gpu_backend")
                 or "windows-x64-cpu"
             )
+            force_cpu_safe = os.environ.get("UGAI_FORCE_CPU_SAFE", "0") == "1"
+            effective_family = "windows-x64-cpu" if force_cpu_safe else selected_family
+            self.runtime_manifest = dict(self.runtime_manifest)
+            self.runtime_manifest["effective_runtime_family"] = (
+                "windows-x64-cpu-safe" if force_cpu_safe else selected_family
+            )
+            self.runtime_manifest["hot_fallback"] = bool(force_cpu_safe)
             self.builtin = True
             self.device = "cpu"
             self.device_name = "内置CPU可训练编码器"
@@ -35780,33 +37017,33 @@ class OfflineVisionRuntime:
                 self.safetensors = importlib.import_module("safetensors.torch")
                 configure_torch_runtime(self.torch)
                 self.builtin = False
-                if selected_family.startswith("windows-x64-nvidia"):
+                if effective_family.startswith("windows-x64-nvidia"):
                     if not bool(self.torch.cuda.is_available()):
                         raise RuntimeError("运行库清单锁定CUDA，但当前驱动或CUDA运行时不可用")
                     self.device = self.torch.device("cuda")
                     self.device_name = "CUDA：" + str(self.torch.cuda.get_device_name(0))
-                elif selected_family == "windows-x64-directml":
+                elif effective_family == "windows-x64-directml":
                     torch_directml = importlib.import_module("torch_directml")
                     self.device = torch_directml.device()
                     self.device_name = "DirectML：" + str(self.device)
-                elif selected_family == "windows-x64-cpu":
+                elif effective_family == "windows-x64-cpu":
                     self.device = self.torch.device("cpu")
                     self.device_name = "PyTorch CPU"
                 else:
-                    raise RuntimeError("运行库清单包含未知后端：" + selected_family)
+                    raise RuntimeError("运行库清单包含未知后端：" + effective_family)
             except RECOVERABLE_ERRORS as error:
                 self.torch = None
                 self.safetensors = None
                 self.builtin = True
                 self.device = "cpu"
                 self.device_name = "NumPy CPU可训练编码器" if self.np is not None else "内置CPU可训练编码器"
-                if selected_family != "windows-x64-cpu":
+                if effective_family != "windows-x64-cpu":
                     raise RuntimeError("所选GPU后端加载失败，拒绝在正式流程中静默切换设备：" + str(error)) from error
             run_startup_microbenchmark(
                 self.base,
                 self.torch,
                 self.device,
-                selected_family,
+                effective_family,
                 runtime_instance=self,
             )
         except RECOVERABLE_ERRORS as error:
@@ -35821,12 +37058,17 @@ class OfflineVisionRuntime:
         if not self.ready:
             self._load_runtime()
         if not self.ready:
-            raise RuntimeError("AI运行库不可用，请先点击“检查文件完整性”：" + self.error)
+            raise RuntimeError("AI运行库不可用，自动安全后端恢复也未成功：" + self.error)
         return True
 
     def _build_model(self):
         torch = self.torch
-        backend = str((self.runtime_manifest or {}).get("runtime_family", "windows-x64-cpu"))
+        backend = str(
+            (self.runtime_manifest or {}).get("effective_runtime_family")
+            or (self.runtime_manifest or {}).get("runtime_family", "windows-x64-cpu")
+        )
+        plan = RESOURCE_GOVERNOR.current_plan()
+        model_spec = model_tier_spec(plan)
         gpu_profile = backend.startswith("windows-x64-nvidia") or backend == "windows-x64-directml"
 
         class InvertedResidual(torch.nn.Module):
@@ -35858,9 +37100,16 @@ class OfflineVisionRuntime:
         class Encoder(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                stem_channels = 24 if not gpu_profile else 32
-                stage_channels = (32, 48, 64, 96) if not gpu_profile else (40, 64, 96, 128)
-                expansions = (96, 128, 192, 256) if not gpu_profile else (128, 192, 288, 384)
+                width = model_spec.vision_width_multiplier
+                stem_channels = max(16, int(round((24 if not gpu_profile else 32) * width)))
+                stage_channels = tuple(
+                    max(16, int(round(value * width)))
+                    for value in ((32, 48, 64, 96) if not gpu_profile else (40, 64, 96, 128))
+                )
+                expansions = tuple(
+                    max(32, int(round(value * width)))
+                    for value in ((96, 128, 192, 256) if not gpu_profile else (128, 192, 288, 384))
+                )
                 self.c1 = torch.nn.Conv2d(3, stem_channels, 3, padding=1, bias=False)
                 self.c1_norm = torch.nn.BatchNorm2d(stem_channels)
                 self.c2 = InvertedResidual(stem_channels, stage_channels[0], expansions[0])
@@ -35894,6 +37143,8 @@ class OfflineVisionRuntime:
             "family": "mobilenet_v3_small_like_depthwise",
             "pretrained_source": "bundled_shared_backbone_or_deterministic_generic_initialization",
             "embedding_size": VISUAL_EMBEDDING_SIZE,
+            "model_tier": model_spec.name,
+            "width_multiplier": model_spec.vision_width_multiplier,
             "multiscale": True,
             "compatibility_projection_channels": 4,
         }
@@ -36217,9 +37468,10 @@ class OfflineVisionRuntime:
                     self.torch is not None
                     and (
                         str(self.device).casefold().startswith("cuda")
-                        or str((self.runtime_manifest or {}).get("runtime_family", "")) == "windows-x64-directml"
+                        or self._effective_runtime_family() == "windows-x64-directml"
                     )
                 ),
+                "precision": RESOURCE_GOVERNOR.current_plan().precision,
                 "dynamic_object_rois": True,
                 "cross_frame_tracking": True,
                 "scene_graph": True,
@@ -36263,6 +37515,36 @@ class OfflineVisionRuntime:
             self.semantic_onnx = None
             return None
 
+    def _effective_runtime_family(self):
+        manifest = self.runtime_manifest if isinstance(self.runtime_manifest, dict) else {}
+        return str(
+            manifest.get("effective_runtime_family")
+            or manifest.get("runtime_family")
+            or "windows-x64-cpu"
+        )
+
+    def _run_visual_model(self, tensor, plan=None):
+        runtime_plan = plan or RESOURCE_GOVERNOR.current_plan()
+        family = self._effective_runtime_family()
+        precision = str(runtime_plan.precision).casefold()
+        directml_fp16 = family == "windows-x64-directml" and precision == "fp16"
+        with self.torch.inference_mode():
+            if not directml_fp16:
+                with torch_inference_context(self.torch, self.device, runtime_plan):
+                    return self.model(tensor)
+            try:
+                self.model.half()
+                return self.model(tensor.to(dtype=self.torch.float16)).to(dtype=self.torch.float32)
+            except RuntimeError as error:
+                self.model.float()
+                if classify_accelerator_fault(error).get("accelerator_fault"):
+                    raise
+                RESOURCE_GOVERNOR.apply_benchmark_profile({"precision": "fp32"})
+                RUNTIME_METRICS.increment("directml_fp16_operator_fallback")
+                return self.model(tensor.to(dtype=self.torch.float32))
+            finally:
+                self.model.float()
+
     def encode_semantic(self, rgb, width, height):
         source = bytes(rgb) if isinstance(rgb, (bytes, bytearray, memoryview)) else b""
         source_width = safe_int(width, 0, 1, 8192)
@@ -36271,22 +37553,25 @@ class OfflineVisionRuntime:
             raise CaptureUnavailable("高分辨率语义视觉输入尺寸无效")
         plan = RESOURCE_GOVERNOR.current_plan()
         target_width, target_height = plan.semantic_width, plan.semantic_height
-        if (
-            self.torch is not None
-            and self.np is not None
-            and self.model is not None
-            and str((self.runtime_manifest or {}).get("runtime_family", "windows-x64-cpu")) != "windows-x64-cpu"
-        ):
+        effective_family = self._effective_runtime_family()
+        gpu_family = effective_family == "windows-x64-directml" or effective_family.startswith(
+            "windows-x64-nvidia"
+        )
+        if self.torch is not None and self.np is not None and self.model is not None and gpu_family:
             array = self.np.frombuffer(source, dtype=self.np.uint8).reshape(source_height, source_width, 3).copy()
+            copy_started = time.perf_counter()
             tensor = (
                 self.torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).to(self.device, dtype=self.torch.float32)
                 / 255.0
             )
+            RESOURCE_GOVERNOR.report_cpu_to_gpu_copy((time.perf_counter() - copy_started) * 1000.0)
             tensor = self.torch.nn.functional.interpolate(
                 tensor, size=(target_height, target_width), mode="bilinear", align_corners=False
             )
-            with self.lock, self.torch.inference_mode():
-                encoded = self.model(tensor)
+            queue_started = time.perf_counter()
+            with self.lock:
+                encoded = self._run_visual_model(tensor, plan)
+            RESOURCE_GOVERNOR.report_gpu_queue_wait((time.perf_counter() - queue_started) * 1000.0)
             pooled = self.torch.nn.functional.avg_pool2d(
                 encoded, kernel_size=HYBRID_SEMANTIC_PATCH, stride=HYBRID_SEMANTIC_PATCH, ceil_mode=True
             )
@@ -36301,9 +37586,7 @@ class OfflineVisionRuntime:
             return {
                 "backend": (
                     "full_cnn_cuda"
-                    if str((self.runtime_manifest or {}).get("runtime_family", "")).startswith(
-                        "windows-x64-nvidia"
-                    )
+                    if effective_family.startswith("windows-x64-nvidia")
                     else "full_cnn_directml"
                 ),
                 "learned": True,
@@ -36400,8 +37683,7 @@ class OfflineVisionRuntime:
             if self.model is None:
                 self.activate_game(self.active_game or "default")
             tensor = self._tensor_from_rgb(rgb)
-            with self.torch.inference_mode():
-                encoded = self.model(tensor)
+            encoded = self._run_visual_model(tensor, RESOURCE_GOVERNOR.current_plan())
             encoded = (encoded.squeeze(0).clamp(0, 1) * 255.0).to("cpu", dtype=self.torch.uint8).numpy()
             channels = [bytes(encoded[index].reshape(-1).tolist()) for index in range(4)]
         motion = bytearray(PIXELS)
@@ -37107,7 +38389,14 @@ def ai_worker_main(base, address, auth_text, family, protocol_version=None):
 
 
 class AIWorkerClient:
-    def __init__(self, base, on_failure=None, worker_filename="ai_worker.py", allow_dedicated_training=True):
+    def __init__(
+        self,
+        base,
+        on_failure=None,
+        worker_filename="ai_worker.py",
+        allow_dedicated_training=True,
+        force_cpu_safe=False,
+    ):
         from multiprocessing.connection import Listener
 
         self.base = Path(base).resolve()
@@ -37123,6 +38412,7 @@ class AIWorkerClient:
         if self.worker_filename not in {"ai_worker.py", "training_worker.py"}:
             raise RuntimeError("AI工作进程入口无效")
         self.allow_dedicated_training = bool(allow_dedicated_training)
+        self.force_cpu_safe = bool(force_cpu_safe)
         self.lock = threading.RLock()
         self.connection = None
         self.process = None
@@ -37170,6 +38460,7 @@ class AIWorkerClient:
                 "MPLCONFIGDIR": str(self.base / "cache" / "matplotlib"),
                 "TMP": str(self.base / "temp"),
                 "TEMP": str(self.base / "temp"),
+                "UGAI_FORCE_CPU_SAFE": "1" if self.force_cpu_safe else "0",
             }
         )
         address_text = (
@@ -37277,6 +38568,7 @@ class AIWorkerClient:
             self.on_failure,
             worker_filename="training_worker.py",
             allow_dedicated_training=False,
+            force_cpu_safe=self.force_cpu_safe,
         )
         with self.lock:
             if self.closed:
@@ -40929,14 +42221,44 @@ def detect_semantic_targets(frame, maximum=32, version="object_centric_v2"):
 
 class StructuredTemporalMemory:
     def __init__(self, maximum=STRUCTURED_MEMORY_LENGTH):
-        self.maximum = max(32, min(128, int(maximum)))
+        plan = RESOURCE_GOVERNOR.current_plan()
+        self.maximum = max(32, min(128, int(max(maximum, plan.temporal_context_length))))
         self.lock = threading.RLock()
         self.memories = {}
+        self.failure_recovery_stacks = {}
+        self.long_term_variables = {}
+        self.completed_subgoals = {}
 
     def update(self, key, observation, context=None):
         memory_key = str(key or "default")
         item = observation.to_dict() if isinstance(observation, ObservationState) else dict(observation or {})
         source = dict(context) if isinstance(context, dict) else {}
+        internal = item.get("internal_state", {}) if isinstance(item.get("internal_state"), dict) else {}
+        failure_reason = str(source.get("no_change_reason") or source.get("failure_reason") or "")
+        completed = list(source.get("completed_subgoals", []))
+        with self.lock:
+            recovery_stack = self.failure_recovery_stacks.setdefault(memory_key, deque(maxlen=32))
+            long_term = self.long_term_variables.setdefault(
+                memory_key,
+                {"resources": {}, "tasks": {}, "characters": {}, "cross_scene": {}},
+            )
+            completed_memory = self.completed_subgoals.setdefault(memory_key, deque(maxlen=128))
+            if failure_reason:
+                recovery_stack.append(
+                    {
+                        "time": time.monotonic(),
+                        "reason": failure_reason,
+                        "state_id": str(item.get("state_id", "")),
+                        "last_action": list(item.get("recent_actions", []))[-1:] or [None],
+                    }
+                )
+            for subgoal in completed:
+                if subgoal:
+                    completed_memory.append(str(subgoal))
+            for category in ("resources", "tasks", "characters", "cross_scene"):
+                values = internal.get(category, {}) if isinstance(internal.get(category), dict) else {}
+                for variable, variable_value in values.items():
+                    long_term[category][str(variable)] = variable_value
         compact = {
             "state_id": str(item.get("state_id", "")),
             "environment_id": str(item.get("environment_id", "")),
@@ -40953,7 +42275,7 @@ class StructuredTemporalMemory:
             "recent_actions": list(item.get("recent_actions", []))[-8:],
             "recent_rewards": list(item.get("recent_rewards", []))[-8:],
             "time": time.monotonic(),
-            "failure_reason": str(source.get("no_change_reason") or source.get("failure_reason") or ""),
+            "failure_reason": failure_reason,
             "scene_graph": source.get("scene_graph", {}),
         }
         with self.lock:
@@ -40983,24 +42305,60 @@ class StructuredTemporalMemory:
                         "bbox": obj.get("bbox"),
                     }
         phases = Counter(str(value.get("internal_state", {}).get("task_phase", "unknown")) for value in values)
+        with self.lock:
+            recovery_stack = list(self.failure_recovery_stacks.get(memory_key, ()))
+            long_term = {
+                category: dict(data)
+                for category, data in self.long_term_variables.get(memory_key, {}).items()
+            }
+            completed_memory = list(self.completed_subgoals.get(memory_key, ()))
+        compressed = semantic_embedding(
+            [
+                {
+                    "state_id": value.get("state_id"),
+                    "objects": value.get("objects", [])[:12],
+                    "reward": value.get("recent_rewards", [])[-1:] or [0.0],
+                    "failure": value.get("failure_reason", ""),
+                }
+                for value in values[-min(len(values), 128):]
+            ],
+            64,
+        )
         return {
-            "backend": "structured_memory_gru_context",
+            "backend": "structured_memory_gru_or_lightweight_transformer_context",
             "length": len(values),
             "capacity": self.maximum,
             "current_phase": phases.most_common(1)[0][0] if phases else "unknown",
             "visited_regions": visited,
             "attempted_actions": list(dict.fromkeys(actions))[-64:],
             "failure_reasons": failures[-16:],
+            "failure_recovery_stack": recovery_stack[-16:],
             "remembered_objects": list(remembered.values())[-48:],
-            "completed_subgoals": list(source.get("completed_subgoals", []))[-32:],
+            "completed_subgoals": list(
+                dict.fromkeys(completed_memory + list(source.get("completed_subgoals", [])))
+            )[-128:],
+            "long_term_variables": long_term,
+            "compressed_key_state_memory": compressed,
+            "temporal_architecture": (
+                "lightweight_transformer"
+                if RESOURCE_GOVERNOR.current_plan().model_tier == "Large"
+                else "gru"
+            ),
         }
 
     def clear(self, key=None):
         with self.lock:
             if key is None:
                 self.memories.clear()
+                self.failure_recovery_stacks.clear()
+                self.long_term_variables.clear()
+                self.completed_subgoals.clear()
             else:
-                self.memories.pop(str(key), None)
+                token = str(key)
+                self.memories.pop(token, None)
+                self.failure_recovery_stacks.pop(token, None)
+                self.long_term_variables.pop(token, None)
+                self.completed_subgoals.pop(token, None)
 
 
 STRUCTURED_MEMORY = StructuredTemporalMemory()
@@ -42102,6 +43460,10 @@ class LearnedCandidateRankingHead:
 
     @classmethod
     def train(cls, experience_model, experiences, seed=0, semantic_model=None):
+        runtime_plan = RESOURCE_GOVERNOR.current_plan()
+        input_size = max(POLICY_INPUT_SIZE, int(runtime_plan.policy_state_size))
+        hidden_size = max(POLICY_HIDDEN_SIZE, int(runtime_plan.policy_hidden_size))
+        ensemble_size = max(POLICY_ENSEMBLE_SIZE, int(runtime_plan.policy_ensemble_size))
         default_task = normalized_identifier(
             experience_model.get("default_task_id") if isinstance(experience_model, dict) else None, "default", 96
         )
@@ -42171,7 +43533,7 @@ class LearnedCandidateRankingHead:
                     "skill_confidence": min(1.0, awr / 4.0),
                 }
                 item["semantic_encoder"] = semantic_model
-                features = goal_conditioned_candidate_features(item, {}, cls.input_size)
+                features = goal_conditioned_candidate_features(item, {}, input_size)
                 utility = max(
                     0.0,
                     min(
@@ -42193,21 +43555,21 @@ class LearnedCandidateRankingHead:
                 "trained": False,
                 "reason": "insufficient_rows",
                 "fallback": "auditable_rule_score",
-                "input_size": cls.input_size,
-                "hidden_size": cls.hidden_size,
-                "ensemble_size": cls.ensemble_size,
+                "input_size": input_size,
+                "hidden_size": hidden_size,
+                "ensemble_size": ensemble_size,
                 "outputs": list(cls.output_names),
             }
         generator = random.Random(safe_int(seed, 0, 0, 2**63 - 1) ^ 0x52414E4B)
         generator.shuffle(rows)
         rows = rows[:1200]
         ensemble = []
-        for member_index in range(cls.ensemble_size):
+        for member_index in range(ensemble_size):
             member_rng = random.Random(generator.randrange(2**63) ^ member_index)
-            scale = 1.0 / math.sqrt(cls.input_size)
-            w1 = [[member_rng.uniform(-scale, scale) for _ in range(cls.input_size)] for _ in range(cls.hidden_size)]
-            b1 = [0.0] * cls.hidden_size
-            w2 = [[member_rng.uniform(-0.14, 0.14) for _ in range(cls.hidden_size)] for _ in cls.output_names]
+            scale = 1.0 / math.sqrt(input_size)
+            w1 = [[member_rng.uniform(-scale, scale) for _ in range(input_size)] for _ in range(hidden_size)]
+            b1 = [0.0] * hidden_size
+            w2 = [[member_rng.uniform(-0.14, 0.14) for _ in range(hidden_size)] for _ in cls.output_names]
             b2 = [0.0] * len(cls.output_names)
             learning_rate = 0.032
             steps = max(160, min(900, len(rows) * 3))
@@ -42231,14 +43593,14 @@ class LearnedCandidateRankingHead:
                         delta_out[output_index] * w2[output_index][hidden_index] for output_index in range(len(outputs))
                     )
                     * (1.0 - hidden[hidden_index] * hidden[hidden_index])
-                    for hidden_index in range(cls.hidden_size)
+                    for hidden_index in range(hidden_size)
                 ]
                 for output_index in range(len(outputs)):
-                    for hidden_index in range(cls.hidden_size):
+                    for hidden_index in range(hidden_size):
                         w2[output_index][hidden_index] -= learning_rate * delta_out[output_index] * hidden[hidden_index]
                     b2[output_index] -= learning_rate * delta_out[output_index]
-                for hidden_index in range(cls.hidden_size):
-                    for input_index in range(cls.input_size):
+                for hidden_index in range(hidden_size):
+                    for input_index in range(input_size):
                         w1[hidden_index][input_index] -= (
                             learning_rate * delta_hidden[hidden_index] * features[input_index]
                         )
@@ -42249,8 +43611,8 @@ class LearnedCandidateRankingHead:
             "schema_version": 2,
             "algorithm": "goal_conditioned_bc_awr_iql_cql_calibrated_ensemble",
             "trained": True,
-            "input_size": cls.input_size,
-            "hidden_size": cls.hidden_size,
+            "input_size": input_size,
+            "hidden_size": hidden_size,
             "ensemble_size": len(ensemble),
             "outputs": list(cls.output_names),
             "ensemble": ensemble,
@@ -42277,8 +43639,9 @@ class LearnedCandidateRankingHead:
         if not isinstance(model, dict) or not model.get("trained"):
             return None
         try:
-            values = [safe_float(value, 0.0, -4.0, 4.0) for value in list(features)[: cls.input_size]]
-            values = (values + [0.0] * cls.input_size)[: cls.input_size]
+            input_size = safe_int(model.get("input_size"), cls.input_size, 1, 4096)
+            values = [safe_float(value, 0.0, -4.0, 4.0) for value in list(features)[:input_size]]
+            values = (values + [0.0] * input_size)[:input_size]
             members = model.get("ensemble", [])
             predictions = [cls._forward_member(member, values) for member in members if isinstance(member, dict)]
             if not predictions:
@@ -43162,12 +44525,12 @@ def train_latent_world_model(experiences, semantic_model=None):
         train_rows = train_rows[:5000]
         ensemble = []
         histories = defaultdict(list)
-        for member_index in range(LATENT_WORLD_ENSEMBLE_SIZE):
+        for member_index in range(max(LATENT_WORLD_ENSEMBLE_SIZE, plan.policy_ensemble_size)):
             member_seed = (seed + member_index * 130363) % (2**63 - 1)
             torch.manual_seed(member_seed)
             rng = random.Random(member_seed)
             gru = torch.nn.GRUCell(LATENT_ACTION_SIZE, LATENT_STATE_SIZE).to(device)
-            auxiliary = DenseNetwork(LATENT_STATE_SIZE, 10, POLICY_HIDDEN_SIZE).to(device)
+            auxiliary = DenseNetwork(LATENT_STATE_SIZE, 10, plan.policy_hidden_size).to(device)
             parameters = list(gru.parameters()) + list(auxiliary.parameters())
             optimizer = torch.optim.AdamW(parameters, lr=0.0012, weight_decay=0.0001)
             scaler = torch_grad_scaler(torch, amp_enabled)
@@ -43430,19 +44793,38 @@ def train_latent_world_model(experiences, semantic_model=None):
             "validation": _world_model_validation({"ensemble": []}, rows, split),
         }
 
-def world_model_rollout_candidates(model, task_id, state_id, candidate_action_ids):
+def dynamic_planning_depth(context=None, uncertainty=0.0, maximum=None):
+    value = context if isinstance(context, dict) else {}
+    plan = RESOURCE_GOVERNOR.current_plan()
+    upper = max(1, min(int(maximum or plan.world_model_horizon), RUNTIME_THRESHOLDS.world_model_horizon))
+    phase = str(value.get("task_phase", value.get("scene_phase", ""))).casefold()
+    classes = {str(item).casefold() for item in value.get("object_classes", []) if item is not None}
+    risk = safe_float(value.get("risk_probability"), 0.0, 0.0, 1.0)
+    disagreement = safe_float(value.get("policy_value_disagreement"), uncertainty, 0.0, 10.0)
+    if classes.intersection({"dialog", "confirm_button", "popup"}) or "popup" in phase or "confirm" in phase:
+        depth = 2 + int(disagreement > 0.35) + int(risk > 0.35)
+        return min(upper, max(2, min(4, depth)))
+    if classes.intersection({"enemy", "resource", "inventory", "meter"}) or any(
+        token in phase for token in ("combat", "battle", "resource", "inventory")
+    ):
+        depth = 6 + int(disagreement > 0.25) * 2 + int(risk > 0.35) * 2
+        return min(upper, max(6, min(12, depth)))
+    if value.get("current_subgoal") or value.get("failure_recovery_stack"):
+        return min(upper, max(4, 8 + int(disagreement > 0.4) * 4))
+    return min(upper, max(1, 1 + int(disagreement > 0.20) + int(disagreement > 0.45)))
+
+
+def world_model_rollout_candidates(model, task_id, state_id, candidate_action_ids, context=None):
     if not isinstance(model, dict):
         return {}
     task = normalized_identifier(task_id, "default", 96)
-    horizon = max(1, min(
+    configured_horizon = safe_int(
+        model.get("horizon", RESOURCE_GOVERNOR.current_plan().world_model_horizon),
+        RESOURCE_GOVERNOR.current_plan().world_model_horizon,
+        1,
         RUNTIME_THRESHOLDS.world_model_horizon,
-        safe_int(
-            model.get("horizon", RUNTIME_THRESHOLDS.world_model_horizon),
-            RUNTIME_THRESHOLDS.world_model_horizon,
-            1,
-            RUNTIME_THRESHOLDS.world_model_horizon,
-        ),
-    ))
+    )
+    horizon = dynamic_planning_depth(context, safe_float((context or {}).get("uncertainty"), 0.0), configured_horizon)
     auditable = (
         model.get("auditable_transition_model", {})
         if isinstance(model.get("auditable_transition_model"), dict)
@@ -45310,7 +46692,58 @@ def active_learning_alternatives(frame, ranked, existing):
     return selected, candidates
 
 
+def active_learning_information_score(decision, temporal=None):
+    value = decision if isinstance(decision, dict) else {}
+    best = value.get("best", {}) if isinstance(value.get("best"), dict) else {}
+    memory = temporal if isinstance(temporal, dict) else {}
+    disagreement = safe_float(
+        value.get(
+            "policy_value_disagreement",
+            value.get("ensemble_disagreement", best.get("ensemble_disagreement", 0.0)),
+        ),
+        0.0,
+        0.0,
+        10.0,
+    )
+    risk = safe_float(
+        value.get("risk_probability", value.get("risk", best.get("risk_probability", 0.0))),
+        0.0,
+        0.0,
+        1.0,
+    )
+    uncertainty = max(
+        safe_float(value.get("uncertainty", best.get("uncertainty", 0.0)), 0.0, 0.0, 1.0),
+        safe_float(value.get("ood_uncertainty", best.get("ood_uncertainty", 0.0)), 0.0, 0.0, 1.0),
+    )
+    support = max(
+        0,
+        safe_int(
+            value.get(
+                "support_count",
+                value.get("support", best.get("support", best.get("behavior_count", 0))),
+            ),
+            0,
+        ),
+    )
+    frequency = min(1.0, math.log1p(support) / math.log(32.0))
+    risk_class = str(value.get("risk_class", best.get("risk_class", "safe")))
+    irreversible = 1.0 if risk_class == "irreversible" else 0.0
+    recovery = 1.0 if memory.get("failure_recovery_stack") else 0.0
+    score = 1.8 * disagreement + 1.6 * risk + 1.4 * uncertainty + 0.8 * frequency + 1.2 * irreversible + 0.5 * recovery
+    return {
+        "score": round(score, 6),
+        "disagreement": round(disagreement, 6),
+        "risk": round(risk, 6),
+        "uncertainty": round(uncertainty, 6),
+        "future_frequency": round(frequency, 6),
+        "irreversible": irreversible,
+        "recovery_context": recovery,
+        "selection_rule": "maximum_ensemble_disagreement_risk_future_frequency",
+    }
+
+
 def register_active_learning_request(execution, frame, temporal, decision):
+    information = active_learning_information_score(decision, temporal)
     game_id = str(
         getattr(execution, "game", {}).get(
             "id",
@@ -45333,6 +46766,9 @@ def register_active_learning_request(execution, frame, temporal, decision):
         "guidance_trigger": list(decision.get("guidance_trigger", [])),
         "reason": str(decision.get("reason", "")),
         "temporal": dict(temporal or {}),
+        "information_score": information,
+        "priority": information["score"],
+        "question_selection_rule": "ensemble_disagreement_then_risk_then_future_frequency",
         "safe_snapshot": True,
     }
     store = getattr(getattr(execution, "host", None), "store", None)
