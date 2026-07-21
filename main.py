@@ -61,9 +61,6 @@ FEATURE_CHANNELS = 5
 PIXELS = FEATURE_W * FEATURE_H
 FEATURE_LEN = PIXELS * FEATURE_CHANNELS
 FEATURE_DISTANCE_WEIGHTS = (0.30, 0.19, 0.19, 0.22, 0.10)
-FEATURE_DISTANCE_WEIGHTS_ARRAY = None
-POOL_BOUNDARIES = OrderedDict()
-POOL_BOUNDARIES_LOCK = threading.RLock()
 POOL_BOUNDARIES_MAX = 256
 COARSE_W = 16
 COARSE_H = 9
@@ -71,7 +68,7 @@ COARSE_LEN = COARSE_W * COARSE_H * FEATURE_CHANNELS
 SQUARED_DIFF = tuple(value * value for value in range(-255, 256))
 FEATURE_ALGORITHM_VERSION = 4
 ACTION_ALGORITHM_VERSION = 6
-DATABASE_SCHEMA_VERSION = 12
+DATABASE_SCHEMA_VERSION = 13
 MODEL_SCHEMA_VERSION = 5
 POLICY_MODEL_SCHEMA_VERSION = 7
 DEFAULT_POLICY_SCORE_WEIGHTS = {"bc": 60.0, "q": 45.0, "success": 35.0, "risk": 45.0, "ood": 55.0}
@@ -175,7 +172,6 @@ AFFORDANCE_NAMES = (
 )
 NEURAL_OFFLINE_POLICY_SCHEMA_VERSION = 1
 SEQUENCE_WORLD_MODEL_SCHEMA_VERSION = 1
-OFFLINE_POLICY_TRAINING_CACHE = OrderedDict()
 SEMANTIC_AMBIGUITY_MARGIN = 0.35
 SEMANTIC_TARGET_MIN_CONFIDENCE = 0.30
 MODE_IDLE = "IDLE"
@@ -188,8 +184,12 @@ AI_WORKER_PROTOCOL_VERSION = 4
 RUNTIME_INSTALL_PROTOCOL_VERSION = 2
 REVIEW_PROCESS_PROTOCOL_VERSION = 2
 TEST_WORKER_PROTOCOL_VERSION = 2
-STATIC_CONTRACT_VERSION = 10
-EXTERNAL_REQUIREMENT_SPEC_JSON = '{"default_buttons":["选择文件夹","检查文件完整性","游戏名称","选择窗口","人","做题","升级","AI"],"capture_toggles":["鼠标","键盘","手柄","声音"],"success_confirmation_surface":"main_window","error_confirmation_surface":"modal","promotion_requires_human_baseline":true}'
+STATIC_CONTRACT_VERSION = 11
+EXTERNAL_REQUIREMENT_SPEC_JSON = (
+    '{"default_buttons":["选择文件夹","检查文件完整性","游戏名称","选择窗口","人","做题","升级","AI"],'
+    '"capture_toggles":["鼠标","键盘","手柄","声音"],"success_confirmation_surface":"main_window",'
+    '"error_confirmation_surface":"modal","promotion_requires_human_baseline":true}'
+)
 EXTERNAL_REQUIREMENT_SPEC = json.loads(EXTERNAL_REQUIREMENT_SPEC_JSON)
 
 
@@ -281,7 +281,7 @@ class CaptureOptions:
         return value
 
 
-@dataclass
+@dataclass(slots=True)
 class ApplicationContext:
     store: object = None
     vision_runtime: object = None
@@ -294,6 +294,97 @@ class ApplicationContext:
 APP_CONTEXT = ApplicationContext()
 
 
+@dataclass(slots=True)
+class RuntimeRepository:
+    manifest_cache: object = None
+    build_hash: str = ""
+    build_hash_key: object = None
+    lock: object = field(default_factory=threading.RLock)
+
+
+class TrainingCache:
+    def __init__(self, maximum=2):
+        self.maximum = max(1, int(maximum))
+        self.lock = threading.RLock()
+        self.values = OrderedDict()
+
+    def get(self, key):
+        with self.lock:
+            value = self.values.pop(key, None)
+            if value is not None:
+                self.values[key] = value
+            return value
+
+    def put(self, key, value):
+        with self.lock:
+            self.values.pop(key, None)
+            self.values[key] = value
+            while len(self.values) > self.maximum:
+                self.values.popitem(last=False)
+
+    def clear(self):
+        with self.lock:
+            self.values.clear()
+
+
+class FeatureEngine:
+    def __init__(self, boundary_capacity=256):
+        self.boundary_capacity = max(16, int(boundary_capacity))
+        self.lock = threading.RLock()
+        self.pool_boundaries = OrderedDict()
+        self.distance_weights_array = None
+        self.numpy_checked = False
+        self.numpy_module = None
+        self.frame_cache = None
+
+    def optional_numpy(self):
+        with self.lock:
+            if not self.numpy_checked:
+                try:
+                    import numpy
+
+                    self.numpy_module = numpy
+                except ImportError:
+                    self.numpy_module = None
+                self.numpy_checked = True
+            return self.numpy_module
+
+    def boundaries(self, src_w, src_h, out_w, out_h):
+        key = (int(src_w), int(src_h), int(out_w), int(out_h))
+        with self.lock:
+            value = self.pool_boundaries.pop(key, None)
+            if value is not None:
+                self.pool_boundaries[key] = value
+                return value
+        y = tuple(index * int(src_h) // int(out_h) for index in range(int(out_h) + 1))
+        x = tuple(index * int(src_w) // int(out_w) for index in range(int(out_w) + 1))
+        value = (y, x)
+        with self.lock:
+            self.pool_boundaries[key] = value
+            while len(self.pool_boundaries) > self.boundary_capacity:
+                self.pool_boundaries.popitem(last=False)
+        return value
+
+    def weight_array(self, numpy_module):
+        with self.lock:
+            if self.distance_weights_array is None:
+                self.distance_weights_array = numpy_module.asarray(
+                    FEATURE_DISTANCE_WEIGHTS,
+                    dtype=numpy_module.float64,
+                )
+            return self.distance_weights_array
+
+    def clear_frames(self):
+        cache = self.frame_cache
+        if cache is not None:
+            cache.clear()
+
+
+RUNTIME_REPOSITORY = RuntimeRepository()
+FEATURE_ENGINE = FeatureEngine(POOL_BOUNDARIES_MAX)
+POLICY_TRAINING_CACHE = TrainingCache(2)
+
+
 def iter_rows(cursor, batch_size=256):
     size = max(1, int(batch_size))
     while True:
@@ -301,6 +392,15 @@ def iter_rows(cursor, batch_size=256):
         if not rows:
             break
         yield from rows
+
+
+def interruptible_wait(stop_event, seconds):
+    duration = max(0.0, float(seconds))
+    if stop_event is None:
+        if duration:
+            time.sleep(duration)
+        return False
+    return bool(stop_event.wait(duration))
 
 
 class BoundedTTLMap:
@@ -572,6 +672,92 @@ class ModeId(str, Enum):
     QUIZ = "quiz"
 
 
+class ModeResultStatus(str, Enum):
+    COMPLETED = "completed"
+    STOPPED = "stopped"
+    FAILED = "failed"
+
+
+class WorkerMessageKind(str, Enum):
+    READY = "ready"
+    PROGRESS = "progress"
+    STATUS = "status"
+    LINE = "line"
+    RESULT = "result"
+    ERROR = "error"
+
+
+class WorkerStage(str, Enum):
+    READY = "READY"
+    STARTING = "STARTING"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateScores:
+    behavior: float
+    value: float
+    success: float
+    risk: float
+    ood: float
+
+
+@dataclass(frozen=True, slots=True)
+class CapturedFrame:
+    timestamp: float
+    feature: bytes
+    method: str
+    black_frame: bool
+    client_rect: tuple
+
+    @classmethod
+    def from_payload(cls, payload):
+        if not isinstance(payload, dict):
+            raise ValueError("采集帧协议无效")
+        feature = feature_bytes(payload.get("f"))
+        timestamp = safe_float(payload.get("time", payload.get("timestamp", 0.0)), 0.0)
+        method = str(payload.get("method", ""))
+        rect = payload.get("client_rect", payload.get("rect", ()))
+        client_rect = tuple(rect) if isinstance(rect, (list, tuple)) else ()
+        if not method or timestamp <= 0.0:
+            raise ValueError("采集帧缺少时间戳或后端标识")
+        return cls(timestamp, feature, method, bool(payload.get("black_frame")), client_rect)
+
+    def to_dict(self):
+        return {
+            "timestamp": self.timestamp,
+            "f": self.feature,
+            "method": self.method,
+            "black_frame": self.black_frame,
+            "client_rect": list(self.client_rect),
+        }
+
+
+class UserMessageCatalog:
+    @staticmethod
+    def data_summary(game_name, stats, prototype_count):
+        return (
+            f"游戏：{game_name}\n"
+            f"有效样本：{safe_int(stats.get('valid'), 0)}\n"
+            f"异常行：{safe_int(stats.get('invalid'), 0)}\n"
+            f"数据大小：{safe_float(stats.get('bytes'), 0.0) / 1024:.1f} KB\n"
+            f"模型原型：{safe_int(prototype_count, 0)}"
+        )
+
+    @staticmethod
+    def compaction(result):
+        return (
+            "数据整理完成：按动作种类、按钮、规范动作与视觉多样性保留"
+            f"{safe_int(result.get('kept'), 0)}，移除{safe_int(result.get('removed'), 0)}"
+        )
+
+    @staticmethod
+    def backup_created(path):
+        return f"数据库、WAL与SHM恢复备份已保存到：{path}"
+
+
 MODE_LABELS = {ModeId.COLLECT: "人", ModeId.UPGRADE: "升级", ModeId.AI: "AI", ModeId.QUIZ: "做题"}
 MODE_BY_LABEL = {label: mode.value for mode, label in MODE_LABELS.items()}
 
@@ -707,22 +893,22 @@ RUNTIME_LOCK_MANIFEST_B85 = (
     "L?8#9333RWES07UnnJUrt5;|x8%n0&3&F8Apsy{p2(d!1W+j&bw4_zoYfetapxiPZ3w?wb!_aYawjxX22y^-A?co1<*L5Cd|G6Lj"
     "r-$PK`9Izmdf$3DtbQ-nn7$3yZ|c1ij2{<I;{Wmg@47_z"
 )
-_RUNTIME_LOCK_MANIFEST_CACHE = None
 RUNTIME_ALLOWED_DOWNLOAD_HOSTS = {"www.python.org", "files.pythonhosted.org", "pypi.org", "download.pytorch.org"}
 
 
 def runtime_lock_manifest():
-    global _RUNTIME_LOCK_MANIFEST_CACHE
-    if _RUNTIME_LOCK_MANIFEST_CACHE is None:
-        packed = base64.b85decode("".join(RUNTIME_LOCK_MANIFEST_B85).encode("ascii"))
-        raw_manifest = bounded_decompress(packed, 4 * 1024 * 1024)
-        if hashlib.sha256(raw_manifest).hexdigest() != RUNTIME_LOCK_MANIFEST_SHA256:
-            raise RuntimeError("运行库规范清单SHA-256校验失败")
-        value = json.loads(raw_manifest.decode("utf-8"))
-        if not isinstance(value, dict) or safe_int(value.get("version"), 0) != RUNTIME_LOCK_MANIFEST_VERSION:
-            raise RuntimeError("运行库规范清单版本无效")
-        _RUNTIME_LOCK_MANIFEST_CACHE = value
-    return _RUNTIME_LOCK_MANIFEST_CACHE
+    with RUNTIME_REPOSITORY.lock:
+        if RUNTIME_REPOSITORY.manifest_cache is None:
+            packed = base64.b85decode("".join(RUNTIME_LOCK_MANIFEST_B85).encode("ascii"))
+            raw_manifest = bounded_decompress(packed, 4 * 1024 * 1024)
+            if hashlib.sha256(raw_manifest).hexdigest() != RUNTIME_LOCK_MANIFEST_SHA256:
+                raise RuntimeError("运行库规范清单SHA-256校验失败")
+            value = json.loads(raw_manifest.decode("utf-8"))
+            valid_version = safe_int(value.get("version"), 0) == RUNTIME_LOCK_MANIFEST_VERSION
+            if not isinstance(value, dict) or not valid_version:
+                raise RuntimeError("运行库规范清单版本无效")
+            RUNTIME_REPOSITORY.manifest_cache = value
+        return RUNTIME_REPOSITORY.manifest_cache
 
 
 def runtime_lock_project_versions():
@@ -1214,20 +1400,16 @@ class VersionedThresholdConfig:
         }
 
 
-_BUILD_HASH = None
-_BUILD_HASH_KEY = None
-
-
 def current_build_hash():
-    global _BUILD_HASH, _BUILD_HASH_KEY
     try:
         source = Path(__file__)
         stat = source.stat()
         key = (int(stat.st_size), int(stat.st_mtime_ns))
-        if _BUILD_HASH is None or _BUILD_HASH_KEY != key:
-            _BUILD_HASH = hashlib.sha256(source.read_bytes()).hexdigest()
-            _BUILD_HASH_KEY = key
-        return _BUILD_HASH
+        with RUNTIME_REPOSITORY.lock:
+            if not RUNTIME_REPOSITORY.build_hash or RUNTIME_REPOSITORY.build_hash_key != key:
+                RUNTIME_REPOSITORY.build_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+                RUNTIME_REPOSITORY.build_hash_key = key
+            return RUNTIME_REPOSITORY.build_hash
     except RECOVERABLE_ERRORS:
         return ""
 
@@ -1827,7 +2009,7 @@ class ThreadLocalSQLite:
                 remaining = list(self.connections.values())
             if not remaining or time.monotonic() >= deadline:
                 break
-            time.sleep(0.01)
+            interruptible_wait(None, 0.01)
         failures = []
         for item in remaining:
             connection = item.get("connection")
@@ -2170,14 +2352,19 @@ def validate_packet(kind, value):
     raise ValueError("未知数据包类型：" + name)
 
 
+@dataclass(frozen=True, slots=True)
 class ModeResult:
-    def __init__(self, status, summary, details=None):
-        value = str(status)
-        if value not in {"completed", "stopped", "failed"}:
+    status: str
+    summary: str
+    details: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        value = self.status.value if isinstance(self.status, ModeResultStatus) else str(self.status)
+        if value not in {item.value for item in ModeResultStatus}:
             raise ValueError("模式结果状态无效")
-        self.status = value
-        self.summary = str(summary)
-        self.details = dict(details) if isinstance(details, dict) else {}
+        object.__setattr__(self, "status", value)
+        object.__setattr__(self, "summary", str(self.summary))
+        object.__setattr__(self, "details", dict(self.details) if isinstance(self.details, dict) else {})
 
 
 class ControlStateMachine:
@@ -3953,7 +4140,7 @@ class ReusableSkillPolicy(SkillPolicy):
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SafetyDecision:
     allowed: bool
     reason: str
@@ -5462,46 +5649,16 @@ def rgb_bytes(rgb):
     return bytes(int(max(0, min(255, round(float(value))))) for value in rgb)
 
 
-_NUMPY_CHECKED = False
-_NUMPY_MODULE = None
-
-
 def _optional_numpy():
-    global _NUMPY_CHECKED, _NUMPY_MODULE
-    if not _NUMPY_CHECKED:
-        try:
-            import numpy
-
-            _NUMPY_MODULE = numpy
-        except ImportError:
-            _NUMPY_MODULE = None
-        _NUMPY_CHECKED = True
-    return _NUMPY_MODULE
+    return FEATURE_ENGINE.optional_numpy()
 
 
 def _pool_boundaries(src_w, src_h, out_w, out_h):
-    key = (int(src_w), int(src_h), int(out_w), int(out_h))
-    with POOL_BOUNDARIES_LOCK:
-        value = POOL_BOUNDARIES.pop(key, None)
-        if value is not None:
-            POOL_BOUNDARIES[key] = value
-            return value
-    y = tuple(index * int(src_h) // int(out_h) for index in range(int(out_h) + 1))
-    x = tuple(index * int(src_w) // int(out_w) for index in range(int(out_w) + 1))
-    value = (y, x)
-    with POOL_BOUNDARIES_LOCK:
-        POOL_BOUNDARIES[key] = value
-        while len(POOL_BOUNDARIES) > POOL_BOUNDARIES_MAX:
-            POOL_BOUNDARIES.popitem(last=False)
-    return value
+    return FEATURE_ENGINE.boundaries(src_w, src_h, out_w, out_h)
 
 
 def _feature_weight_array(np):
-    global FEATURE_DISTANCE_WEIGHTS_ARRAY
-    if FEATURE_DISTANCE_WEIGHTS_ARRAY is None:
-        FEATURE_DISTANCE_WEIGHTS_ARRAY = np.asarray(FEATURE_DISTANCE_WEIGHTS, dtype=np.float64)
-    return FEATURE_DISTANCE_WEIGHTS_ARRAY
-
+    return FEATURE_ENGINE.weight_array(np)
 
 def _pool_channel(source, offset, src_w, src_h, out_w, out_h):
     y_bounds, x_bounds = _pool_boundaries(src_w, src_h, out_w, out_h)
@@ -6552,11 +6709,11 @@ class WindowsGraphicsCapture:
                     self._close(frame)
                     self._release(frame)
                 frame = candidate
-                time.sleep(0.002)
+                interruptible_wait(None, 0.002)
                 continue
             if frame is not None:
                 break
-            time.sleep(0.008)
+            interruptible_wait(None, 0.008)
         if frame is None:
             raise CaptureUnavailable("Windows Graphics Capture暂未返回画面")
         surface = access = texture = None
@@ -8847,7 +9004,7 @@ class WinCaptureServiceMixin:
                 progress(min(1.0, 1.0 - max(0.0, deadline - time.monotonic()) / actual_duration))
             if stop_event is not None and stop_event.wait(0.05):
                 raise InputStopped("窗口采集验收已取消")
-            time.sleep(0.0)
+            interruptible_wait(stop_event, 0.0)
         minimum_nonblack = 3 if actual_duration < 1.2 else 4
         eligible = {}
         for method, items in records.items():
@@ -10710,7 +10867,7 @@ class ModeSession:
         if timeout > 0 and not done:
             deadline = time.monotonic() + float(timeout)
             while time.monotonic() < deadline and not done:
-                time.sleep(0.02)
+                interruptible_wait(self.host.stop_event, 0.02)
                 done = self.barrier.poll()
         if done:
             clear_runtime_isolation(key=self.isolation_key)
@@ -11481,14 +11638,27 @@ class ReviewProcessApi:
 
 def review_process_send(connection, kind, payload, stage=None):
     try:
-        value = str(
-            stage or ("COMPLETED" if str(kind) == "result" else "FAILED" if str(kind) == "error" else "RUNNING")
-        )
+        message_kind = kind if isinstance(kind, WorkerMessageKind) else WorkerMessageKind(str(kind))
+        if stage is None:
+            worker_stage = (
+                WorkerStage.COMPLETED
+                if message_kind is WorkerMessageKind.RESULT
+                else WorkerStage.FAILED
+                if message_kind is WorkerMessageKind.ERROR
+                else WorkerStage.RUNNING
+            )
+        else:
+            worker_stage = stage if isinstance(stage, WorkerStage) else WorkerStage(str(stage))
         connection.send(
-            {"protocol_version": REVIEW_PROCESS_PROTOCOL_VERSION, "stage": value, "kind": str(kind), "payload": payload}
+            {
+                "protocol_version": REVIEW_PROCESS_PROTOCOL_VERSION,
+                "stage": worker_stage.value,
+                "kind": message_kind.value,
+                "payload": payload,
+            }
         )
         return True
-    except RECOVERABLE_ERRORS:
+    except (RECOVERABLE_ERRORS, TypeError):
         return False
 
 
@@ -11496,14 +11666,14 @@ def review_process_main(connection, stop_event, payload):
     try:
         if (
             safe_int(payload.get("protocol_version"), 0) != REVIEW_PROCESS_PROTOCOL_VERSION
-            or payload.get("stage") != "STARTING"
+            or payload.get("stage") != WorkerStage.STARTING.value
         ):
             raise RuntimeError("睡眠子进程协议版本或启动阶段无效")
         if payload.get("base"):
             install_write_boundary_guard(payload["base"])
         _disable_network_access()
         offline_evidence = _verify_offline_network_block()
-        review_process_send(connection, "status", "睡眠子进程已启动", "STARTING")
+        review_process_send(connection, WorkerMessageKind.STATUS, "睡眠子进程已启动", WorkerStage.STARTING)
         host = ReviewProcessHost(validate_packet("review_request", payload), stop_event, connection)
         result = host.review_controller.run_offline()
         result.details.update(
@@ -11515,19 +11685,24 @@ def review_process_main(connection, stop_event, payload):
         )
         review_process_send(
             connection,
-            "result",
+            WorkerMessageKind.RESULT,
             {"status": result.status, "summary": result.summary, "details": result.details, "models": host.store.saved},
         )
     except InputStopped as error:
         saved = getattr(getattr(locals().get("host", None), "store", None), "saved", [])
         review_process_send(
             connection,
-            "result",
-            {"status": "stopped", "summary": "睡眠已停止", "details": {"reason": str(error)}, "models": saved},
+            WorkerMessageKind.RESULT,
+            {
+                "status": ModeResultStatus.STOPPED.value,
+                "summary": "睡眠已停止",
+                "details": {"reason": str(error)},
+                "models": saved,
+            },
         )
     except Exception:
         saved = getattr(getattr(locals().get("host", None), "store", None), "saved", [])
-        review_process_send(connection, "error", {"traceback": traceback.format_exc(), "models": saved})
+        review_process_send(connection, WorkerMessageKind.ERROR, {"traceback": traceback.format_exc(), "models": saved})
     finally:
         try:
             connection.close()
@@ -11541,7 +11716,7 @@ class ReviewProcessWorker:
         self.connection, child = context.Pipe(duplex=False)
         self.stop_event = context.Event()
         value = dict(payload)
-        value.update({"protocol_version": REVIEW_PROCESS_PROTOCOL_VERSION, "stage": "STARTING"})
+        value.update({"protocol_version": REVIEW_PROCESS_PROTOCOL_VERSION, "stage": WorkerStage.STARTING.value})
         self.process = context.Process(
             target=review_process_main,
             args=(child, self.stop_event, value),
@@ -11561,15 +11736,16 @@ class ReviewProcessWorker:
                 if (
                     not isinstance(packet, dict)
                     or safe_int(packet.get("protocol_version"), 0) != REVIEW_PROCESS_PROTOCOL_VERSION
-                    or packet.get("stage") not in {"STARTING", "RUNNING", "COMPLETED", "FAILED"}
+                    or packet.get("stage")
+                    not in {stage.value for stage in WorkerStage if stage is not WorkerStage.READY}
                 ):
                     return "error", {"traceback": "睡眠子进程返回了无效协议包", "packet_type": type(packet).__name__}
-                return str(packet.get("kind", "error")), packet.get("payload")
+                return str(packet.get("kind", WorkerMessageKind.ERROR.value)), packet.get("payload")
         except (EOFError, OSError) as error:
             return "error", {
                 "traceback": "睡眠子进程连接提前关闭：" + str(error),
                 "exitcode": self.process.exitcode,
-                "stage": "FAILED",
+                "stage": WorkerStage.FAILED.value,
             }
         return None
 
@@ -12654,7 +12830,8 @@ class LearningExecution:
                 events = self.monitor.drain() if self.monitor is not None else []
                 self.mouse_event_count += len(events)
                 if rect is None:
-                    time.sleep(0.05)
+                    if interruptible_wait(self.host.stop_event, 0.05):
+                        break
                     continue
                 for raw_event in events:
                     self.handle_event(raw_event, rect)
@@ -12674,7 +12851,7 @@ class LearningExecution:
                         self.modality_sample_count += 1
                         self.last_modality_sample = now
                 self.update_status(now)
-                time.sleep(self.sampling_delay)
+                interruptible_wait(self.host.stop_event, self.sampling_delay)
 
     def finalize(self):
         self.host.learning_controller.submit(self.host.store, self.game["id"], self.session_id)
@@ -12732,6 +12909,499 @@ class LearningExecution:
         self.preflight()
         self.capture_loop()
         return self.finalize()
+
+
+@dataclass(frozen=True, slots=True)
+class ExperienceBuildConfig:
+    gamma: float
+    n_step: int
+    game_id: str
+    default_task_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class OcrTransitionSummary:
+    events: tuple
+    terminal: str
+    progress: float
+    confidence: float
+    numeric_progress: float
+    reset: bool
+
+
+@dataclass(slots=True)
+class EpisodeBuildState:
+    seen_environments: set = field(default_factory=set)
+    previous_skill_key: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedExperienceStep:
+    item: dict
+    next_item: dict
+    index: int
+    session: str
+    start: float
+    next_created: float
+    context: dict
+    task_id: str
+    runtime: object
+    observation: object
+    next_observation: object
+    semantic_action: object
+    grounded_action: object
+    skill: object
+    action_id: str
+    visual_change: float
+    environment_changed: bool
+    repeated: bool
+    new_state: bool
+    human_override: bool
+    risk_class: str
+    ocr: OcrTransitionSummary
+
+
+class ExperienceBuilder:
+    def __init__(self, controller, samples, ocr_events, profile):
+        self.controller = controller
+        self.samples = list(samples or [])
+        self.profile = dict(profile) if isinstance(profile, dict) else {}
+        self.events = tuple(
+            sorted(
+                (item for item in ocr_events or [] if isinstance(item, dict)),
+                key=lambda item: safe_float(item.get("created"), 0.0),
+            )
+        )
+        self.config = ExperienceBuildConfig(
+            safe_float(self.profile.get("offline_discount", 0.97), 0.97, 0.0, 0.999),
+            safe_int(self.profile.get("offline_n_step", 5), 5, 1, 32),
+            str(self.profile.get("game_id") or (self.samples[0].get("game_id") if self.samples else "")),
+            normalized_identifier(self.profile.get("default_task_id"), "default", 96),
+        )
+        self.task_runtimes = {}
+
+    def build(self):
+        experiences = []
+        sessions = defaultdict(list)
+        for item in self.samples:
+            sessions[self.controller.session_of(item)].append(item)
+        for session, items in sorted(sessions.items()):
+            episode = self._build_episode(session, items, len(experiences))
+            self._apply_returns(episode)
+            experiences.extend(episode)
+        return experiences, self._build_policy_model(experiences)
+
+    def _task_runtime(self, task_id):
+        tid = normalized_identifier(task_id, self.config.default_task_id, 96)
+        runtime = self.task_runtimes.get(tid)
+        if runtime is not None:
+            return runtime
+        payload = None
+        host = getattr(self.controller, "host", None)
+        store = getattr(host, "store", None) if host is not None else None
+        if store is not None and self.config.game_id:
+            try:
+                payload = store.load_task(self.config.game_id, tid)
+            except RECOVERABLE_ERRORS:
+                payload = None
+        if not isinstance(payload, dict):
+            payload = {**self.profile, "game_id": self.config.game_id, "task_id": tid, "name": tid}
+        runtime = TaskRuntime(TaskDefinition.from_mapping(payload, self.config.game_id, tid))
+        self.task_runtimes[tid] = runtime
+        return runtime
+
+    @staticmethod
+    def _observation_summary(observation):
+        return {
+            "schema_version": OBSERVATION_SCHEMA_VERSION,
+            "state_id": observation.state_id,
+            "environment_id": observation.environment_id,
+            "visual_digest": observation.visual_digest,
+            "index_hash": observation.index_hash,
+            "confidence": round(observation.confidence, 6),
+            "objects": [slot.compact() for slot in observation.objects],
+            "ocr_values": [dict(value) for value in observation.ocr_values],
+            "task": dict(observation.task),
+            "internal_state": dict(observation.internal_state),
+        }
+
+    def _ocr_summary(self, start, end):
+        matched = [
+            entry.get("event", {})
+            for entry in self.events
+            if start <= safe_float(entry.get("created"), 0.0) <= end
+        ]
+        terminal = ""
+        progress = 0.0
+        confidence = 0.0
+        numeric_progress = 0.0
+        compact_events = []
+        for event in matched:
+            if not isinstance(event, dict):
+                continue
+            compact_events.append(
+                {
+                    key: event.get(key)
+                    for key in (
+                        "region_id",
+                        "terminal",
+                        "progress",
+                        "status",
+                        "reset",
+                        "numeric_value",
+                        "numeric_delta",
+                        "source_confidence",
+                        "stable_frames",
+                        "raw_text",
+                    )
+                    if key in event
+                }
+            )
+            confidence = max(confidence, safe_float(event.get("source_confidence", 0.0), 0.0, 0.0, 1.0))
+            if event.get("terminal") in {"success", "failure"}:
+                terminal = str(event.get("terminal"))
+            event_progress = max(-1.0, min(1.0, safe_float(event.get("progress"), 0.0)))
+            if abs(event_progress) > abs(progress):
+                progress = event_progress
+            if abs(event_progress) > abs(numeric_progress) and finite_number(event.get("numeric_delta")):
+                numeric_progress = event_progress
+        return OcrTransitionSummary(
+            tuple(compact_events),
+            terminal,
+            progress,
+            confidence,
+            numeric_progress,
+            any(bool(event.get("reset")) for event in matched if isinstance(event, dict)),
+        )
+
+    def _build_episode(self, session, items, experience_offset):
+        ordered = sorted(
+            items,
+            key=lambda item: (safe_float(item.get("created"), 0.0), str(item.get("checksum", ""))),
+        )
+        state = EpisodeBuildState()
+        episode = []
+        for index, item in enumerate(ordered):
+            if (experience_offset + len(episode)) % 64 == 0 and self.controller.context.callbacks.should_stop():
+                raise InputStopped("睡眠已停止")
+            prepared = self._prepare_step(session, ordered, index, state)
+            episode.append(self._make_experience(prepared, len(ordered)))
+        return episode
+
+    def _prepare_step(self, session, ordered, index, state):
+        item = ordered[index]
+        next_item = ordered[index + 1] if index + 1 < len(ordered) else item
+        start = safe_float(item.get("created"), 0.0)
+        next_created = safe_float(next_item.get("created"), start)
+        end = next_created if index + 1 < len(ordered) else start + 1.5
+        context = item.get("context", {}) if isinstance(item.get("context"), dict) else {}
+        next_context = next_item.get("context", {}) if isinstance(next_item.get("context"), dict) else {}
+        task_id = normalized_identifier(context.get("task_id"), self.config.default_task_id, 96)
+        runtime = self._task_runtime(task_id)
+        observation = objectized_observation(item, context, runtime.definition)
+        next_observation = objectized_observation(next_item, next_context, runtime.definition)
+        semantic_action = normalize_semantic_action(context.get("semantic_action")) or semantic_action_from_coordinate(
+            item.get("a")
+        )
+        grounded_action = normalize_action(context.get("grounded_action")) or normalize_action(item.get("a"))
+        skill = semantic_skill(
+            semantic_action,
+            str(context.get("subgoal_id") or "advance_goal"),
+            safe_float(context.get("policy_confidence", 1.0), 1.0, 0.0, 1.0),
+        )
+        action_id = skill.key()
+        repeated = bool(state.previous_skill_key and state.previous_skill_key == action_id)
+        state.previous_skill_key = action_id
+        new_state = next_observation.environment_id not in state.seen_environments
+        state.seen_environments.add(observation.environment_id)
+        state.seen_environments.add(next_observation.environment_id)
+        return PreparedExperienceStep(
+            item,
+            next_item,
+            index,
+            session,
+            start,
+            next_created,
+            context,
+            task_id,
+            runtime,
+            observation,
+            next_observation,
+            semantic_action,
+            grounded_action,
+            skill,
+            action_id,
+            visual_distance(item["f"], next_item["f"]),
+            observation.environment_id != next_observation.environment_id,
+            repeated,
+            new_state,
+            bool(context.get("human_override") or str(item.get("source", "")).startswith("teach")),
+            str((semantic_action or {}).get("risk_class", "safe")),
+            self._ocr_summary(start, end),
+        )
+
+    def _reward_result(self, prepared):
+        ocr = prepared.ocr
+        context = prepared.context
+        transition = {
+            "terminal": ocr.terminal,
+            "terminal_confidence": ocr.confidence if ocr.terminal else 0.0,
+            "progress_score": ocr.progress,
+            "numeric_progress": ocr.numeric_progress,
+            "progress_confidence": ocr.confidence,
+            "ocr_confidence": ocr.confidence,
+            "state_confidence": min(prepared.observation.confidence, prepared.next_observation.confidence),
+            "changed": prepared.environment_changed,
+            "visual_changed": prepared.visual_change > 0.0,
+            "repeated": prepared.repeated,
+            "loop_detected": prepared.repeated and prepared.index > 1,
+            "new_state": prepared.new_state,
+            "reset": ocr.reset,
+            "should_wait": bool(context.get("should_wait", False)),
+            "invalid_action": bool(context.get("invalid_action", False)),
+            "human_override": prepared.human_override,
+            "risk_class": prepared.risk_class,
+            "subgoal_completed": bool(context.get("subgoal_completed", False)),
+        }
+        return prepared.runtime.evaluate(transition)
+
+    def _make_experience(self, prepared, episode_size):
+        reward_result = self._reward_result(prepared)
+        reward = safe_float(reward_result.get("reward"), 0.0)
+        result = self._result_name(reward_result, prepared.ocr.progress)
+        done = bool(reward_result.get("success") or reward_result.get("failure") or prepared.index + 1 >= episode_size)
+        action_delay = safe_float(
+            prepared.context.get("action_delay", max(0.0, prepared.next_created - prepared.start)),
+            max(0.0, prepared.next_created - prepared.start),
+            0.0,
+            60.0,
+        )
+        action_duration = safe_float(
+            (prepared.semantic_action or {}).get("parameters", {}).get("duration", 0.0), 0.0, 0.0, 60.0
+        )
+        action_start = safe_float(prepared.context.get("action_start_time", prepared.start), prepared.start)
+        action_end = safe_float(
+            prepared.context.get("action_end_time", action_start + action_duration), action_start + action_duration
+        )
+        return self._experience_payload(
+            prepared, reward_result, reward, result, done, action_delay, action_start, action_end
+        )
+
+    @staticmethod
+    def _result_name(reward_result, progress):
+        if reward_result.get("success"):
+            return "success"
+        if reward_result.get("failure"):
+            return "failure"
+        return "progress" if progress > 0 else "regress" if progress < 0 else "neutral"
+
+    def _experience_payload(self, prepared, reward_result, reward, result, done, action_delay, action_start, action_end):
+        observation = prepared.observation
+        next_observation = prepared.next_observation
+        context = prepared.context
+        skill = prepared.skill
+        common = {
+            "game_id": self.config.game_id,
+            "task_id": prepared.task_id,
+            "episode_id": str(context.get("episode_id") or prepared.session),
+            "step_id": safe_int(context.get("step_id", prepared.index), prepared.index, 0),
+            "state_t": observation.state_id,
+            "action_t": prepared.action_id,
+            "state_t+1": next_observation.state_id,
+            "environment_t": observation.environment_id,
+            "environment_t+1": next_observation.environment_id,
+            "reward_t": round(reward, 6),
+            "reward_confidence": safe_float(reward_result.get("confidence", 0.0), 0.0, 0.0, 1.0),
+            "value_update_eligible": bool(reward_result.get("update_eligible", False)),
+            "done": done,
+            "success": result == "success",
+            "failure": result == "failure",
+            "result": result,
+            "terminal_state": result if done else "neutral",
+            "progress_score": round(prepared.ocr.progress, 6),
+            "action_delay": round(action_delay, 6),
+            "action_start_time": round(action_start, 6),
+            "action_end_time": round(action_end, 6),
+            "environment_response_time": round(max(0.0, prepared.next_created - action_end), 6),
+            "human_override": prepared.human_override,
+            "created_t": prepared.start,
+            "created_t+1": prepared.next_created,
+            "visual_change": round(prepared.visual_change, 6),
+            "environment_changed": prepared.environment_changed,
+            "ocr_events": list(prepared.ocr.events),
+            "reward_components": reward_result.get("components", {}),
+        }
+        common.update(self._semantic_payload(prepared, context, skill))
+        common.update(
+            {
+                "trajectory_schema_version": TRAJECTORY_SCHEMA_VERSION,
+                "session": prepared.session,
+                "state": observation.state_id,
+                "action": prepared.action_id,
+                "next_state": next_observation.state_id,
+                "reward": round(reward, 6),
+            }
+        )
+        return common
+
+    def _semantic_payload(self, prepared, context, skill):
+        return {
+            "semantic_action": prepared.semantic_action,
+            "grounded_action": prepared.grounded_action,
+            "grounding": context.get("grounding", {}),
+            "skill_id": skill.skill_id,
+            "skill_key": prepared.action_id,
+            "skill_parameters": dict(skill.parameters),
+            "subgoal_id": skill.subgoal_id,
+            "policy_confidence": safe_float(
+                context.get("policy_confidence", skill.confidence), skill.confidence, 0.0, 1.0
+            ),
+            "safety_decision": context.get("safety_decision", {}),
+            "observation_t": self._observation_summary(prepared.observation),
+            "observation_t+1": self._observation_summary(prepared.next_observation),
+            "model_version": str(context.get("model_version") or current_build_hash()),
+            "source_sample_checksum": str(prepared.item.get("checksum", "")),
+        }
+
+    def _apply_returns(self, episode):
+        episode_return = 0.0
+        for experience in reversed(episode):
+            episode_return = safe_float(experience["reward_t"], 0.0) + (
+                0.0 if experience["done"] else self.config.gamma * episode_return
+            )
+            experience["episode_return_t"] = round(episode_return, 6)
+        for index, experience in enumerate(episode):
+            running = 0.0
+            discount = 1.0
+            for offset in range(self.config.n_step):
+                position = index + offset
+                if position >= len(episode):
+                    break
+                row = episode[position]
+                running += discount * safe_float(row["reward_t"], 0.0)
+                if row["done"]:
+                    break
+                discount *= self.config.gamma
+            experience["return_t"] = round(running, 6)
+            experience["n_step"] = self.config.n_step
+
+    @staticmethod
+    def _empty_policy_row():
+        return {
+            "count": 0,
+            "reward_sum": 0.0,
+            "return_sum": 0.0,
+            "success": 0,
+            "failure": 0,
+            "neutral": 0,
+            "next_states": Counter(),
+            "override": 0,
+            "confidence_sum": 0.0,
+        }
+
+    def _aggregate_policy_rows(self, experiences):
+        state_rows = defaultdict(self._empty_policy_row)
+        action_rows = defaultdict(self._empty_policy_row)
+        behavior_state_counts = Counter()
+        behavior_action_counts = Counter()
+        state_action_ids = {}
+        for experience in experiences:
+            task_id = normalized_identifier(experience.get("task_id"), self.config.default_task_id, 96)
+            state_key = task_id + "|" + experience["state_t"] + "|" + experience["action_t"]
+            action_key = task_id + "|" + experience["action_t"]
+            state_action_ids[state_key] = action_key
+            behavior_state_counts[state_key] += 1
+            behavior_action_counts[action_key] += 1
+            if not experience.get("value_update_eligible", False):
+                continue
+            for row in (state_rows[state_key], action_rows[action_key]):
+                row["count"] += 1
+                row["reward_sum"] += experience["reward_t"]
+                row["return_sum"] += experience["return_t"]
+                row["success"] += int(experience["success"])
+                row["failure"] += int(experience["failure"])
+                row["neutral"] += int(not experience["success"] and not experience["failure"])
+                row["override"] += int(experience["human_override"])
+                row["confidence_sum"] += safe_float(experience.get("reward_confidence", 0.0), 0.0)
+                row["next_states"][experience["state_t+1"]] += 1
+        return state_rows, action_rows, behavior_state_counts, behavior_action_counts, state_action_ids
+
+    @staticmethod
+    def _finish_policy_row(row):
+        count = max(1, row["count"])
+        terminal = max(0, row["success"] + row["failure"])
+        success_probability = (row["success"] + 1.0) / (terminal + 2.0) if terminal else 0.0
+        failure_probability = (row["failure"] + 1.0) / (terminal + 2.0) if terminal else 0.0
+        uncertainty = min(1.0, 1.0 / math.sqrt(count) + 0.5 * (1.0 - min(1.0, terminal / count)))
+        return {
+            "count": row["count"],
+            "mean_reward": round(row["reward_sum"] / count, 6),
+            "q_value": round(row["return_sum"] / count, 6),
+            "success": row["success"],
+            "failure": row["failure"],
+            "neutral": row["neutral"],
+            "success_probability": round(success_probability, 6),
+            "risk_probability": round(failure_probability, 6),
+            "uncertainty": round(uncertainty, 6),
+            "human_override_rate": round(row["override"] / count, 6),
+            "mean_reward_confidence": round(row["confidence_sum"] / count, 6),
+            "next_states": dict(row["next_states"].most_common(8)),
+        }
+
+    def _build_policy_model(self, experiences):
+        rows = self._aggregate_policy_rows(experiences)
+        state_rows, action_rows, behavior_state_counts, behavior_action_counts, state_action_ids = rows
+        state_model = {key: self._finish_policy_row(row) for key, row in state_rows.items()}
+        action_model = {key: self._finish_policy_row(row) for key, row in action_rows.items()}
+        temperature = safe_float(self.profile.get("awr_temperature", 0.5), 0.5, 0.05, 10.0)
+        total_value_count = sum(row["count"] for row in action_model.values())
+        baseline = sum(row["q_value"] * row["count"] for row in action_model.values()) / max(1, total_value_count)
+        self._apply_advantages(
+            state_model,
+            action_model,
+            behavior_state_counts,
+            behavior_action_counts,
+            state_action_ids,
+            baseline,
+            temperature,
+        )
+        task_ids = sorted(
+            {normalized_identifier(item.get("task_id"), self.config.default_task_id, 96) for item in experiences}
+        )
+        return {
+            "schema_version": POLICY_MODEL_SCHEMA_VERSION,
+            "algorithm": "task_conditioned_object_state+n_step_conservative_return+advantage_weighted_skill_cloning",
+            "gamma": self.config.gamma,
+            "n_step": self.config.n_step,
+            "awr_temperature": temperature,
+            "value_baseline": round(baseline, 6),
+            "total_count": len(experiences),
+            "value_eligible_count": sum(1 for item in experiences if item.get("value_update_eligible")),
+            "default_task_id": self.config.default_task_id,
+            "task_ids": task_ids,
+            "state_action": state_model,
+            "action_prior": action_model,
+            "behavior_state_count": dict(behavior_state_counts),
+            "behavior_action_count": dict(behavior_action_counts),
+            "state_key_algorithm_version": STATE_KEY_ALGORITHM_VERSION,
+            "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
+            "skill_schema_version": SKILL_SCHEMA_VERSION,
+            "episode_metrics": summarize_episode_metrics(experiences),
+        }
+
+    @staticmethod
+    def _apply_advantages(state_model, action_model, state_counts, action_counts, state_action_ids, baseline, temperature):
+        for key, row in action_model.items():
+            advantage = row["q_value"] - baseline
+            row["advantage"] = round(advantage, 6)
+            row["awr_weight"] = round(math.exp(max(-4.0, min(4.0, advantage / temperature))), 6)
+            row["behavior_count"] = action_counts.get(key, 0)
+        for key, row in state_model.items():
+            prior = action_model.get(state_action_ids.get(key), {})
+            advantage = row["q_value"] - safe_float(prior.get("q_value", baseline), baseline)
+            row["advantage"] = round(advantage, 6)
+            row["awr_weight"] = round(math.exp(max(-4.0, min(4.0, advantage / temperature))), 6)
+            row["behavior_count"] = state_counts.get(key, 0)
 
 
 class ReviewController:
@@ -12981,357 +13651,7 @@ class ReviewController:
         return uncovered
 
     def build_experiences(self, samples, ocr_events, profile):
-        events = sorted(
-            (item for item in ocr_events if isinstance(item, dict)),
-            key=lambda item: safe_float(item.get("created"), 0.0),
-        )
-        gamma = safe_float(profile.get("offline_discount", 0.97), 0.97, 0.0, 0.999)
-        n_step = safe_int(profile.get("offline_n_step", 5), 5, 1, 32)
-        game_id = str(profile.get("game_id") or (samples[0].get("game_id") if samples else ""))
-        default_task_id = normalized_identifier(profile.get("default_task_id"), "default", 96)
-        task_runtimes = {}
-
-        def task_runtime(task_id):
-            tid = normalized_identifier(task_id, default_task_id, 96)
-            runtime = task_runtimes.get(tid)
-            if runtime is not None:
-                return runtime
-            payload = None
-            store = getattr(self.host, "store", None) if getattr(self, "host", None) is not None else None
-            if store is not None and game_id:
-                try:
-                    payload = store.load_task(game_id, tid)
-                except RECOVERABLE_ERRORS:
-                    payload = None
-            if not isinstance(payload, dict):
-                payload = {**profile, "game_id": game_id, "task_id": tid, "name": tid}
-            runtime = TaskRuntime(TaskDefinition.from_mapping(payload, game_id, tid))
-            task_runtimes[tid] = runtime
-            return runtime
-
-        def observation_summary(observation):
-            return {
-                "schema_version": OBSERVATION_SCHEMA_VERSION,
-                "state_id": observation.state_id,
-                "environment_id": observation.environment_id,
-                "visual_digest": observation.visual_digest,
-                "index_hash": observation.index_hash,
-                "confidence": round(observation.confidence, 6),
-                "objects": [slot.compact() for slot in observation.objects],
-                "ocr_values": [dict(value) for value in observation.ocr_values],
-                "task": dict(observation.task),
-                "internal_state": dict(observation.internal_state),
-            }
-
-        experiences = []
-        by_session = defaultdict(list)
-        for item in samples:
-            by_session[self.session_of(item)].append(item)
-        for session, items in sorted(by_session.items()):
-            ordered = sorted(
-                items, key=lambda item: (safe_float(item.get("created"), 0.0), str(item.get("checksum", "")))
-            )
-            episode = []
-            seen_environments = set()
-            previous_skill_key = ""
-            for index, item in enumerate(ordered):
-                if len(experiences) % 64 == 0 and self.context.callbacks.should_stop():
-                    raise InputStopped("睡眠已停止")
-                next_item = ordered[index + 1] if index + 1 < len(ordered) else item
-                start = safe_float(item.get("created"), 0.0)
-                next_created = safe_float(next_item.get("created"), start)
-                end = next_created if index + 1 < len(ordered) else start + 1.5
-                matched = [
-                    entry.get("event", {}) for entry in events if start <= safe_float(entry.get("created"), 0.0) <= end
-                ]
-                terminal = ""
-                progress = 0.0
-                ocr = []
-                ocr_confidence = 0.0
-                numeric_progress = 0.0
-                for event in matched:
-                    if not isinstance(event, dict):
-                        continue
-                    compact = {
-                        key: event.get(key)
-                        for key in (
-                            "region_id",
-                            "terminal",
-                            "progress",
-                            "status",
-                            "reset",
-                            "numeric_value",
-                            "numeric_delta",
-                            "source_confidence",
-                            "stable_frames",
-                            "raw_text",
-                        )
-                        if key in event
-                    }
-                    ocr.append(compact)
-                    source_confidence = safe_float(event.get("source_confidence", 0.0), 0.0, 0.0, 1.0)
-                    ocr_confidence = max(ocr_confidence, source_confidence)
-                    if event.get("terminal") in {"success", "failure"}:
-                        terminal = str(event.get("terminal"))
-                    event_progress = max(-1.0, min(1.0, safe_float(event.get("progress"), 0.0)))
-                    if abs(event_progress) > abs(progress):
-                        progress = event_progress
-                    if abs(event_progress) > abs(numeric_progress) and finite_number(event.get("numeric_delta")):
-                        numeric_progress = event_progress
-                context = item.get("context", {}) if isinstance(item.get("context"), dict) else {}
-                next_context = next_item.get("context", {}) if isinstance(next_item.get("context"), dict) else {}
-                task_id = normalized_identifier(context.get("task_id"), default_task_id, 96)
-                runtime = task_runtime(task_id)
-                definition = runtime.definition
-                observation = objectized_observation(item, context, definition)
-                next_observation = objectized_observation(next_item, next_context, definition)
-                semantic_action = normalize_semantic_action(
-                    context.get("semantic_action")
-                ) or semantic_action_from_coordinate(item.get("a"))
-                grounded_action = normalize_action(context.get("grounded_action")) or normalize_action(item.get("a"))
-                skill = semantic_skill(
-                    semantic_action,
-                    str(context.get("subgoal_id") or "advance_goal"),
-                    safe_float(context.get("policy_confidence", 1.0), 1.0, 0.0, 1.0),
-                )
-                action_id = skill.key()
-                visual_change = visual_distance(item["f"], next_item["f"])
-                environment_changed = observation.environment_id != next_observation.environment_id
-                repeated = bool(previous_skill_key and previous_skill_key == action_id)
-                previous_skill_key = action_id
-                new_state = next_observation.environment_id not in seen_environments
-                seen_environments.add(observation.environment_id)
-                seen_environments.add(next_observation.environment_id)
-                human_override = bool(context.get("human_override") or str(item.get("source", "")).startswith("teach"))
-                risk_class = str((semantic_action or {}).get("risk_class", "safe"))
-                transition = {
-                    "terminal": terminal,
-                    "terminal_confidence": ocr_confidence if terminal else 0.0,
-                    "progress_score": progress,
-                    "numeric_progress": numeric_progress,
-                    "progress_confidence": ocr_confidence,
-                    "ocr_confidence": ocr_confidence,
-                    "state_confidence": min(observation.confidence, next_observation.confidence),
-                    "changed": environment_changed,
-                    "visual_changed": visual_change > 0.0,
-                    "repeated": repeated,
-                    "loop_detected": repeated and index > 1,
-                    "new_state": new_state,
-                    "reset": any(bool(event.get("reset")) for event in matched if isinstance(event, dict)),
-                    "should_wait": bool(context.get("should_wait", False)),
-                    "invalid_action": bool(context.get("invalid_action", False)),
-                    "human_override": human_override,
-                    "risk_class": risk_class,
-                    "subgoal_completed": bool(context.get("subgoal_completed", False)),
-                }
-                reward_result = runtime.evaluate(transition)
-                reward = safe_float(reward_result.get("reward"), 0.0)
-                result = (
-                    "success"
-                    if reward_result.get("success")
-                    else (
-                        "failure"
-                        if reward_result.get("failure")
-                        else "progress" if progress > 0 else "regress" if progress < 0 else "neutral"
-                    )
-                )
-                done = bool(reward_result.get("success") or reward_result.get("failure") or index + 1 >= len(ordered))
-                action_delay = safe_float(
-                    context.get("action_delay", max(0.0, next_created - start)),
-                    max(0.0, next_created - start),
-                    0.0,
-                    60.0,
-                )
-                action_duration = safe_float(
-                    (semantic_action or {}).get("parameters", {}).get("duration", 0.0), 0.0, 0.0, 60.0
-                )
-                action_start = safe_float(context.get("action_start_time", start), start)
-                action_end = safe_float(
-                    context.get("action_end_time", action_start + action_duration), action_start + action_duration
-                )
-                experience = {
-                    "game_id": game_id,
-                    "task_id": task_id,
-                    "episode_id": str(context.get("episode_id") or session),
-                    "step_id": safe_int(context.get("step_id", index), index, 0),
-                    "state_t": observation.state_id,
-                    "action_t": action_id,
-                    "state_t+1": next_observation.state_id,
-                    "environment_t": observation.environment_id,
-                    "environment_t+1": next_observation.environment_id,
-                    "reward_t": round(reward, 6),
-                    "reward_confidence": safe_float(reward_result.get("confidence", 0.0), 0.0, 0.0, 1.0),
-                    "value_update_eligible": bool(reward_result.get("update_eligible", False)),
-                    "done": done,
-                    "success": result == "success",
-                    "failure": result == "failure",
-                    "result": result,
-                    "terminal_state": result if done else "neutral",
-                    "progress_score": round(progress, 6),
-                    "action_delay": round(action_delay, 6),
-                    "action_start_time": round(action_start, 6),
-                    "action_end_time": round(action_end, 6),
-                    "environment_response_time": round(max(0.0, next_created - action_end), 6),
-                    "human_override": human_override,
-                    "created_t": start,
-                    "created_t+1": next_created,
-                    "visual_change": round(visual_change, 6),
-                    "environment_changed": environment_changed,
-                    "ocr_events": ocr,
-                    "reward_components": reward_result.get("components", {}),
-                    "semantic_action": semantic_action,
-                    "grounded_action": grounded_action,
-                    "grounding": context.get("grounding", {}),
-                    "skill_id": skill.skill_id,
-                    "skill_key": action_id,
-                    "skill_parameters": dict(skill.parameters),
-                    "subgoal_id": skill.subgoal_id,
-                    "policy_confidence": safe_float(
-                        context.get("policy_confidence", skill.confidence), skill.confidence, 0.0, 1.0
-                    ),
-                    "safety_decision": context.get("safety_decision", {}),
-                    "observation_t": observation_summary(observation),
-                    "observation_t+1": observation_summary(next_observation),
-                    "model_version": str(context.get("model_version") or current_build_hash()),
-                    "source_sample_checksum": str(item.get("checksum", "")),
-                    "trajectory_schema_version": TRAJECTORY_SCHEMA_VERSION,
-                    "session": session,
-                    "state": observation.state_id,
-                    "action": action_id,
-                    "next_state": next_observation.state_id,
-                    "reward": round(reward, 6),
-                }
-                episode.append(experience)
-            episode_return = 0.0
-            for experience in reversed(episode):
-                episode_return = safe_float(experience["reward_t"], 0.0) + (
-                    0.0 if experience["done"] else gamma * episode_return
-                )
-                experience["episode_return_t"] = round(episode_return, 6)
-            for index, experience in enumerate(episode):
-                running = 0.0
-                discount = 1.0
-                for offset in range(n_step):
-                    position = index + offset
-                    if position >= len(episode):
-                        break
-                    row = episode[position]
-                    running += discount * safe_float(row["reward_t"], 0.0)
-                    if row["done"]:
-                        break
-                    discount *= gamma
-                experience["return_t"] = round(running, 6)
-                experience["n_step"] = n_step
-            experiences.extend(episode)
-        state_rows = defaultdict(
-            lambda: {
-                "count": 0,
-                "reward_sum": 0.0,
-                "return_sum": 0.0,
-                "success": 0,
-                "failure": 0,
-                "neutral": 0,
-                "next_states": Counter(),
-                "override": 0,
-                "confidence_sum": 0.0,
-            }
-        )
-        action_rows = defaultdict(
-            lambda: {
-                "count": 0,
-                "reward_sum": 0.0,
-                "return_sum": 0.0,
-                "success": 0,
-                "failure": 0,
-                "neutral": 0,
-                "next_states": Counter(),
-                "override": 0,
-                "confidence_sum": 0.0,
-            }
-        )
-        behavior_state_counts = Counter()
-        behavior_action_counts = Counter()
-        state_action_ids = {}
-        for experience in experiences:
-            task_id = normalized_identifier(experience.get("task_id"), default_task_id, 96)
-            state_key = task_id + "|" + experience["state_t"] + "|" + experience["action_t"]
-            action_key = task_id + "|" + experience["action_t"]
-            state_action_ids[state_key] = action_key
-            behavior_state_counts[state_key] += 1
-            behavior_action_counts[action_key] += 1
-            if not experience.get("value_update_eligible", False):
-                continue
-            for row in (state_rows[state_key], action_rows[action_key]):
-                row["count"] += 1
-                row["reward_sum"] += experience["reward_t"]
-                row["return_sum"] += experience["return_t"]
-                row["success"] += int(experience["success"])
-                row["failure"] += int(experience["failure"])
-                row["neutral"] += int(not experience["success"] and not experience["failure"])
-                row["override"] += int(experience["human_override"])
-                row["confidence_sum"] += safe_float(experience.get("reward_confidence", 0.0), 0.0)
-                row["next_states"][experience["state_t+1"]] += 1
-
-        def finish(row):
-            count = max(1, row["count"])
-            terminal = max(0, row["success"] + row["failure"])
-            alpha = 1.0
-            success_probability = (row["success"] + alpha) / (terminal + 2 * alpha) if terminal else 0.0
-            failure_probability = (row["failure"] + alpha) / (terminal + 2 * alpha) if terminal else 0.0
-            uncertainty = min(1.0, 1.0 / math.sqrt(count) + 0.5 * (1.0 - min(1.0, terminal / count)))
-            return {
-                "count": row["count"],
-                "mean_reward": round(row["reward_sum"] / count, 6),
-                "q_value": round(row["return_sum"] / count, 6),
-                "success": row["success"],
-                "failure": row["failure"],
-                "neutral": row["neutral"],
-                "success_probability": round(success_probability, 6),
-                "risk_probability": round(failure_probability, 6),
-                "uncertainty": round(uncertainty, 6),
-                "human_override_rate": round(row["override"] / count, 6),
-                "mean_reward_confidence": round(row["confidence_sum"] / count, 6),
-                "next_states": dict(row["next_states"].most_common(8)),
-            }
-
-        state_model = {key: finish(row) for key, row in state_rows.items()}
-        action_model = {key: finish(row) for key, row in action_rows.items()}
-        temperature = safe_float(profile.get("awr_temperature", 0.5), 0.5, 0.05, 10.0)
-        total_value_count = sum(row["count"] for row in action_model.values())
-        baseline = sum(row["q_value"] * row["count"] for row in action_model.values()) / max(1, total_value_count)
-        for key, row in action_model.items():
-            advantage = row["q_value"] - baseline
-            row["advantage"] = round(advantage, 6)
-            row["awr_weight"] = round(math.exp(max(-4.0, min(4.0, advantage / temperature))), 6)
-            row["behavior_count"] = behavior_action_counts.get(key, 0)
-        for key, row in state_model.items():
-            prior = action_model.get(state_action_ids.get(key), {})
-            advantage = row["q_value"] - safe_float(prior.get("q_value", baseline), baseline)
-            row["advantage"] = round(advantage, 6)
-            row["awr_weight"] = round(math.exp(max(-4.0, min(4.0, advantage / temperature))), 6)
-            row["behavior_count"] = behavior_state_counts.get(key, 0)
-        task_ids = sorted({normalized_identifier(item.get("task_id"), default_task_id, 96) for item in experiences})
-        model = {
-            "schema_version": POLICY_MODEL_SCHEMA_VERSION,
-            "algorithm": "task_conditioned_object_state+n_step_conservative_return+advantage_weighted_skill_cloning",
-            "gamma": gamma,
-            "n_step": n_step,
-            "awr_temperature": temperature,
-            "value_baseline": round(baseline, 6),
-            "total_count": len(experiences),
-            "value_eligible_count": sum(1 for item in experiences if item.get("value_update_eligible")),
-            "default_task_id": default_task_id,
-            "task_ids": task_ids,
-            "state_action": state_model,
-            "action_prior": action_model,
-            "behavior_state_count": dict(behavior_state_counts),
-            "behavior_action_count": dict(behavior_action_counts),
-            "state_key_algorithm_version": STATE_KEY_ALGORITHM_VERSION,
-            "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
-            "skill_schema_version": SKILL_SCHEMA_VERSION,
-            "episode_metrics": summarize_episode_metrics(experiences),
-        }
-        return experiences, model
+        return ExperienceBuilder(self, samples, ocr_events, profile).build()
 
     def run(self):
         return ReviewRunner(ModeContext.from_host(self.host), self, self.host, False).run()
@@ -13819,425 +14139,517 @@ def _offline_policy_evaluation(bundle, experiences, split):
     }
 
 
-def build_offline_policy_models(experience_model, experiences, default_task_id):
-    eligible = [
-        item
-        for item in experiences or []
-        if isinstance(item, dict)
-        and item.get("value_update_eligible", True)
-        and str(item.get("action_t", item.get("action", "")))
-    ]
-    cache_key = _policy_training_cache_key(experience_model, eligible, default_task_id)
-    cached = OFFLINE_POLICY_TRAINING_CACHE.get(cache_key)
-    if cached is not None:
-        OFFLINE_POLICY_TRAINING_CACHE.move_to_end(cache_key)
-        return cached
-    gamma = safe_float(
-        experience_model.get("gamma", 0.97) if isinstance(experience_model, dict) else 0.97, 0.97, 0.0, 0.999
+@dataclass(frozen=True, slots=True)
+class OfflinePolicyConfig:
+    gamma: float
+    expectile: float
+    cql_alpha: float
+    beta: float
+    seed: int
+
+
+@dataclass(slots=True)
+class PolicyTrainingTensors:
+    filtered: list
+    train_games: set
+    train_indices: list
+    state: object
+    action: object
+    next_state: object
+    reward: object
+    done: object
+    confidence: object
+    risk: object
+    outcome: object
+    action_index: object
+    support_mask: object
+    candidate_actions: object
+    device: object
+
+
+@dataclass(slots=True)
+class PolicyNetworkSet:
+    q1: object
+    q2: object
+    value: object
+    policy: object
+    risk: object
+    outcome: object
+    dynamics: object
+    target_q1: object
+    target_q2: object
+    parameters: list
+
+
+class OfflinePolicyModelBuilder:
+    LOSS_NAMES = (
+        "q1_loss",
+        "q2_loss",
+        "expectile_value_loss",
+        "advantage_weighted_policy_loss",
+        "behavior_support_loss",
+        "conservative_q_loss",
+        "risk_classification_loss",
+        "outcome_classification_loss",
+        "world_model_consistency_loss",
     )
-    expectile = safe_float(
-        experience_model.get("iql_expectile", 0.7) if isinstance(experience_model, dict) else 0.7, 0.7, 0.5, 0.95
-    )
-    cql_alpha = safe_float(
-        experience_model.get("cql_alpha", 0.25) if isinstance(experience_model, dict) else 0.25, 0.25, 0.0, 10.0
-    )
-    beta = max(
-        0.05,
-        safe_float(
-            experience_model.get("awr_temperature", 0.5) if isinstance(experience_model, dict) else 0.5, 0.5, 0.05, 10.0
-        ),
-    )
-    split = _game_isolated_policy_split(eligible)
-    seed = (
-        int(
-            hashlib.sha256(
-                canonical_bytes([str(item.get("source_sample_checksum", "")) for item in eligible])
-            ).hexdigest()[:16],
-            16,
+
+    def __init__(self, experience_model, experiences, default_task_id):
+        self.experience_model = experience_model if isinstance(experience_model, dict) else {}
+        self.default_task_id = default_task_id
+        self.eligible = [
+            item
+            for item in experiences or []
+            if isinstance(item, dict)
+            and item.get("value_update_eligible", True)
+            and str(item.get("action_t", item.get("action", "")))
+        ]
+        self.cache_key = _policy_training_cache_key(
+            self.experience_model,
+            self.eligible,
+            self.default_task_id,
         )
-        if eligible
-        else 0
-    )
-    task_support = defaultdict(Counter)
-    action_counts = Counter()
-    for item in eligible:
-        task = normalized_identifier(item.get("task_id"), default_task_id, 96)
-        action = str(item.get("action_t", item.get("action", "")))
-        task_support[task][action] += 1
-        action_counts[action] += 1
-    action_vocabulary = [action for action, _ in action_counts.most_common(96)]
-    bundle = {
-        "schema_version": NEURAL_OFFLINE_POLICY_SCHEMA_VERSION,
-        "algorithm": "task_conditioned_neural_offline_iql_cql_awr_bootstrap_ensemble",
-        "trained": False,
-        "state_size": POLICY_INPUT_SIZE,
-        "action_size": LATENT_ACTION_SIZE,
-        "hidden_size": POLICY_HIDDEN_SIZE,
-        "ensemble_size": POLICY_ENSEMBLE_SIZE,
-        "gamma": gamma,
-        "expectile": expectile,
-        "cql_alpha": cql_alpha,
-        "awr_temperature": beta,
-        "action_vocabulary": action_vocabulary,
-        "task_action_support": {task: dict(counts) for task, counts in task_support.items()},
-        "game_isolated_split": split,
-        "safety_boundary": "risk_prediction_never_bypasses_independent_safety_authorization",
-        "semantic_state": "object_slots+scene_graph+goal+memory",
-        "behavior_support_constraint": True,
-        "target_q_networks": True,
-        "terminal_done_mask": True,
-        "confidence_weighted_reward": True,
-        "bootstrap_epistemic_uncertainty": True,
-        "distillation": {"trained": False},
-        "ensemble": [],
-    }
-    losses = {
-        "q1_loss": 0.0,
-        "q2_loss": 0.0,
-        "expectile_value_loss": 0.0,
-        "advantage_weighted_policy_loss": 0.0,
-        "behavior_support_loss": 0.0,
-        "conservative_q_loss": 0.0,
-        "risk_classification_loss": 0.0,
-        "outcome_classification_loss": 0.0,
-        "world_model_consistency_loss": 0.0,
-    }
-    training_error = ""
-    if len(eligible) >= 16 and len(action_vocabulary) >= 2:
+        self.config = self._config()
+        self.split = _game_isolated_policy_split(self.eligible)
+        self.task_support, self.action_vocabulary = self._action_support()
+        self.bundle = self._base_bundle()
+        self.losses = {name: 0.0 for name in self.LOSS_NAMES}
+        self.training_error = ""
+
+    def build(self):
+        cached = POLICY_TRAINING_CACHE.get(self.cache_key)
+        if cached is not None:
+            return cached
+        self._train_if_possible()
+        result = self._assemble_models()
+        POLICY_TRAINING_CACHE.put(self.cache_key, result)
+        return result
+
+    def _config(self):
+        gamma = safe_float(self.experience_model.get("gamma", 0.97), 0.97, 0.0, 0.999)
+        expectile = safe_float(self.experience_model.get("iql_expectile", 0.7), 0.7, 0.5, 0.95)
+        cql_alpha = safe_float(self.experience_model.get("cql_alpha", 0.25), 0.25, 0.0, 10.0)
+        beta = max(
+            0.05,
+            safe_float(self.experience_model.get("awr_temperature", 0.5), 0.5, 0.05, 10.0),
+        )
+        seed = 0
+        if self.eligible:
+            checksums = [str(item.get("source_sample_checksum", "")) for item in self.eligible]
+            seed = int(hashlib.sha256(canonical_bytes(checksums)).hexdigest()[:16], 16)
+        return OfflinePolicyConfig(gamma, expectile, cql_alpha, beta, seed)
+
+    def _action_support(self):
+        task_support = defaultdict(Counter)
+        action_counts = Counter()
+        for item in self.eligible:
+            task = normalized_identifier(item.get("task_id"), self.default_task_id, 96)
+            action = str(item.get("action_t", item.get("action", "")))
+            task_support[task][action] += 1
+            action_counts[action] += 1
+        return task_support, [action for action, _ in action_counts.most_common(96)]
+
+    def _base_bundle(self):
+        return {
+            "schema_version": NEURAL_OFFLINE_POLICY_SCHEMA_VERSION,
+            "algorithm": "task_conditioned_neural_offline_iql_cql_awr_bootstrap_ensemble",
+            "trained": False,
+            "state_size": POLICY_INPUT_SIZE,
+            "action_size": LATENT_ACTION_SIZE,
+            "hidden_size": POLICY_HIDDEN_SIZE,
+            "ensemble_size": POLICY_ENSEMBLE_SIZE,
+            "gamma": self.config.gamma,
+            "expectile": self.config.expectile,
+            "cql_alpha": self.config.cql_alpha,
+            "awr_temperature": self.config.beta,
+            "action_vocabulary": self.action_vocabulary,
+            "task_action_support": {task: dict(counts) for task, counts in self.task_support.items()},
+            "game_isolated_split": self.split,
+            "safety_boundary": "risk_prediction_never_bypasses_independent_safety_authorization",
+            "semantic_state": "object_slots+scene_graph+goal+memory",
+            "behavior_support_constraint": True,
+            "target_q_networks": True,
+            "terminal_done_mask": True,
+            "confidence_weighted_reward": True,
+            "bootstrap_epistemic_uncertainty": True,
+            "distillation": {"trained": False},
+            "ensemble": [],
+        }
+
+    def _train_if_possible(self):
+        if len(self.eligible) < 16 or len(self.action_vocabulary) < 2:
+            return
         try:
             import torch
 
             torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
-            torch.manual_seed(seed % (2**63 - 1))
-
-            class DenseNetwork(torch.nn.Module):
-                def __init__(self, input_size, output_size, hidden_size):
-                    super().__init__()
-                    self.layers = torch.nn.ModuleList(
-                        [
-                            torch.nn.Linear(input_size, hidden_size),
-                            torch.nn.Linear(hidden_size, hidden_size),
-                            torch.nn.Linear(hidden_size, output_size),
-                        ]
-                    )
-
-                def forward(self, value):
-                    for layer in self.layers[:-1]:
-                        value = torch.tanh(layer(value))
-                    return self.layers[-1](value)
-
-            filtered = [
-                item for item in eligible if str(item.get("action_t", item.get("action", ""))) in set(action_vocabulary)
-            ]
-            filtered = filtered[:6000]
-            action_index = {action: index for index, action in enumerate(action_vocabulary)}
-            states = []
-            actions = []
-            next_states = []
-            rewards = []
-            dones = []
-            confidences = []
-            risks = []
-            outcomes = []
-            action_indexes = []
-            support_masks = []
-            games = []
-            action_vectors = [_policy_action_vector(action, None, None) for action in action_vocabulary]
-            for item in filtered:
-                task = normalized_identifier(item.get("task_id"), default_task_id, 96)
-                action = str(item.get("action_t", item.get("action", "")))
-                states.append(_policy_state_vector(item, task, None, False))
-                actions.append(action_vectors[action_index[action]])
-                next_states.append(_policy_state_vector(item, task, None, True))
-                rewards.append(safe_float(item.get("reward_t", item.get("reward", 0.0)), 0.0, -20.0, 20.0))
-                dones.append(float(bool(item.get("done"))))
-                confidences.append(safe_float(item.get("reward_confidence", 0.0), 0.0, 0.0, 1.0))
-                semantic = item.get("semantic_action", {}) if isinstance(item.get("semantic_action"), dict) else {}
-                risks.append(
-                    float(
-                        bool(
-                            item.get("failure")
-                            or item.get("human_override")
-                            or str(semantic.get("risk_class", "safe")) == "irreversible"
-                        )
-                    )
-                )
-                outcomes.append(1 if item.get("success") else 2 if item.get("failure") else 0)
-                action_indexes.append(action_index[action])
-                support_masks.append(
-                    [1.0 if task_support[task].get(candidate, 0) > 0 else 0.0 for candidate in action_vocabulary]
-                )
-                games.append(str(item.get("game_id") or "unknown"))
-            train_games = set(split.get("train_game_ids", []))
-            train_indices = [index for index, game in enumerate(games) if game in train_games] or list(
-                range(len(filtered))
-            )
-            device = torch.device("cpu")
-            state_tensor = torch.tensor(states, dtype=torch.float32, device=device)
-            action_tensor = torch.tensor(actions, dtype=torch.float32, device=device)
-            next_state_tensor = torch.tensor(next_states, dtype=torch.float32, device=device)
-            reward_tensor = torch.tensor(rewards, dtype=torch.float32, device=device).unsqueeze(1)
-            done_tensor = torch.tensor(dones, dtype=torch.float32, device=device).unsqueeze(1)
-            confidence_tensor = torch.tensor(confidences, dtype=torch.float32, device=device).unsqueeze(1)
-            risk_tensor = torch.tensor(risks, dtype=torch.float32, device=device).unsqueeze(1)
-            outcome_tensor = torch.tensor(outcomes, dtype=torch.long, device=device)
-            action_index_tensor = torch.tensor(action_indexes, dtype=torch.long, device=device)
-            support_mask_tensor = torch.tensor(support_masks, dtype=torch.float32, device=device)
-            candidate_actions = torch.tensor(action_vectors, dtype=torch.float32, device=device)
-            history = defaultdict(list)
-            ensemble = []
-            for member_index in range(POLICY_ENSEMBLE_SIZE):
-                member_seed = (seed + member_index * 104729) % (2**63 - 1)
-                torch.manual_seed(member_seed)
-                pair_size = POLICY_INPUT_SIZE + LATENT_ACTION_SIZE
-                q1 = DenseNetwork(pair_size, 1, POLICY_HIDDEN_SIZE)
-                q2 = DenseNetwork(pair_size, 1, POLICY_HIDDEN_SIZE)
-                v = DenseNetwork(POLICY_INPUT_SIZE, 1, POLICY_HIDDEN_SIZE)
-                policy = DenseNetwork(pair_size, 1, POLICY_HIDDEN_SIZE)
-                risk_net = DenseNetwork(pair_size, 1, POLICY_HIDDEN_SIZE)
-                outcome = DenseNetwork(pair_size, 3, POLICY_HIDDEN_SIZE)
-                dynamics = DenseNetwork(pair_size, POLICY_INPUT_SIZE, POLICY_HIDDEN_SIZE)
-                target_q1 = DenseNetwork(pair_size, 1, POLICY_HIDDEN_SIZE)
-                target_q2 = DenseNetwork(pair_size, 1, POLICY_HIDDEN_SIZE)
-                target_q1.load_state_dict(q1.state_dict())
-                target_q2.load_state_dict(q2.state_dict())
-                parameters = (
-                    list(q1.parameters())
-                    + list(q2.parameters())
-                    + list(v.parameters())
-                    + list(policy.parameters())
-                    + list(risk_net.parameters())
-                    + list(outcome.parameters())
-                    + list(dynamics.parameters())
-                )
-                optimizer = torch.optim.AdamW(parameters, lr=0.0015, weight_decay=0.0001)
-                rng = random.Random(member_seed)
-                bootstrap = [
-                    train_indices[rng.randrange(len(train_indices))] for _ in range(max(32, len(train_indices)))
-                ]
-                steps = max(36, min(180, len(train_indices) * 2))
-                batch_size = min(32, max(12, len(bootstrap)))
-                for step in range(steps):
-                    indexes = [bootstrap[rng.randrange(len(bootstrap))] for _ in range(batch_size)]
-                    idx = torch.tensor(indexes, dtype=torch.long, device=device)
-                    s_batch = state_tensor[idx]
-                    a_batch = action_tensor[idx]
-                    ns_batch = next_state_tensor[idx]
-                    r_batch = reward_tensor[idx]
-                    d_batch = done_tensor[idx]
-                    confidence_batch = confidence_tensor[idx]
-                    risk_batch = risk_tensor[idx]
-                    outcome_batch = outcome_tensor[idx]
-                    action_label = action_index_tensor[idx]
-                    support_batch = support_mask_tensor[idx]
-                    pair = torch.cat([s_batch, a_batch], dim=1)
-                    q1_value = q1(pair)
-                    q2_value = q2(pair)
-                    with torch.no_grad():
-                        target = r_batch + gamma * (1.0 - d_batch) * v(ns_batch)
-                        target_q = torch.minimum(target_q1(pair), target_q2(pair))
-                    sample_weight = 0.20 + 0.80 * confidence_batch
-                    q1_loss = (sample_weight * (q1_value - target).pow(2)).mean()
-                    q2_loss = (sample_weight * (q2_value - target).pow(2)).mean()
-                    value_delta = target_q - v(s_batch)
-                    expectile_weight = torch.where(
-                        value_delta >= 0,
-                        torch.full_like(value_delta, expectile),
-                        torch.full_like(value_delta, 1.0 - expectile),
-                    )
-                    value_loss = (expectile_weight * value_delta.pow(2)).mean()
-                    batch_count = s_batch.shape[0]
-                    action_count = candidate_actions.shape[0]
-                    expanded_state = s_batch.unsqueeze(1).expand(batch_count, action_count, POLICY_INPUT_SIZE)
-                    expanded_action = candidate_actions.unsqueeze(0).expand(
-                        batch_count, action_count, LATENT_ACTION_SIZE
-                    )
-                    all_pairs = torch.cat([expanded_state, expanded_action], dim=2).reshape(
-                        batch_count * action_count, -1
-                    )
-                    q1_all = q1(all_pairs).reshape(batch_count, action_count)
-                    q2_all = q2(all_pairs).reshape(batch_count, action_count)
-                    cql_loss = (
-                        torch.logsumexp(q1_all, dim=1).mean()
-                        - q1_value.mean()
-                        + torch.logsumexp(q2_all, dim=1).mean()
-                        - q2_value.mean()
-                    ) * 0.5
-                    logits = policy(all_pairs).reshape(batch_count, action_count)
-                    masked_logits = logits + (support_batch - 1.0) * 8.0
-                    cross_entropy = torch.nn.functional.cross_entropy(masked_logits, action_label, reduction="none")
-                    with torch.no_grad():
-                        advantage = torch.minimum(q1_value, q2_value) - v(s_batch)
-                        awr_weight = torch.exp(torch.clamp(advantage / beta, -5.0, 3.0)).squeeze(1)
-                    policy_loss = (cross_entropy * awr_weight).mean()
-                    probabilities = torch.softmax(logits, dim=1)
-                    support_loss = (probabilities * (1.0 - support_batch)).sum(dim=1).mean()
-                    risk_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                        risk_net(pair), risk_batch, weight=sample_weight
-                    )
-                    outcome_loss = torch.nn.functional.cross_entropy(outcome(pair), outcome_batch, reduction="none")
-                    outcome_loss = (outcome_loss * sample_weight.squeeze(1)).mean()
-                    consistency_loss = (
-                        sample_weight * (dynamics(pair) - ns_batch).pow(2).mean(dim=1, keepdim=True)
-                    ).mean()
-                    total = (
-                        q1_loss
-                        + q2_loss
-                        + value_loss
-                        + cql_alpha * cql_loss
-                        + policy_loss
-                        + 0.35 * support_loss
-                        + 0.75 * risk_loss
-                        + 0.45 * outcome_loss
-                        + 0.25 * consistency_loss
-                    )
-                    optimizer.zero_grad(set_to_none=True)
-                    total.backward()
-                    torch.nn.utils.clip_grad_norm_(parameters, 5.0)
-                    optimizer.step()
-                    tau = 0.01
-                    with torch.no_grad():
-                        for target_parameter, parameter in zip(target_q1.parameters(), q1.parameters()):
-                            target_parameter.mul_(1.0 - tau).add_(parameter, alpha=tau)
-                        for target_parameter, parameter in zip(target_q2.parameters(), q2.parameters()):
-                            target_parameter.mul_(1.0 - tau).add_(parameter, alpha=tau)
-                    current = {
-                        "q1_loss": q1_loss.item(),
-                        "q2_loss": q2_loss.item(),
-                        "expectile_value_loss": value_loss.item(),
-                        "advantage_weighted_policy_loss": policy_loss.item(),
-                        "behavior_support_loss": support_loss.item(),
-                        "conservative_q_loss": cql_loss.item(),
-                        "risk_classification_loss": risk_loss.item(),
-                        "outcome_classification_loss": outcome_loss.item(),
-                        "world_model_consistency_loss": consistency_loss.item(),
-                    }
-                    for name, value_loss_item in current.items():
-                        history[name].append(float(value_loss_item))
-                ensemble.append(
-                    {
-                        "q1": _serialize_dense_network(q1),
-                        "q2": _serialize_dense_network(q2),
-                        "v": _serialize_dense_network(v),
-                        "policy": _serialize_dense_network(policy),
-                        "risk": _serialize_dense_network(risk_net),
-                        "outcome": _serialize_dense_network(outcome),
-                        "seed": member_seed,
-                        "bootstrap_samples": len(bootstrap),
-                    }
-                )
-            for name in losses:
-                values = history.get(name, [])
-                losses[name] = statistics.fmean(values[-min(100, len(values)) :]) if values else 0.0
-            distilled = {
-                name: _average_dense_networks([member[name] for member in ensemble])
-                for name in ("q1", "q2", "v", "policy", "risk", "outcome")
-            }
-            bundle.update(
-                {
-                    "trained": True,
-                    "ensemble": ensemble,
-                    "ensemble_size": len(ensemble),
-                    "training_transitions": len(filtered),
-                    "training_game_ids": sorted(train_games),
-                    "distillation": {
-                        "trained": True,
-                        "method": "parameter_mean_ensemble_distillation",
-                        "target": "small_cpu_or_gpu_mlp",
-                        "member": distilled,
-                    },
-                    "optimizer": "AdamW",
-                    "bootstrap_sampling": "independent_with_replacement",
-                    "target_network_update": "polyak_0.01",
-                    "semantic_encoder": {},
-                    "network_contract": {
-                        "q1": "Q1(z,skill)",
-                        "q2": "Q2(z,skill)",
-                        "value": "V(z)",
-                        "policy": "pi(skill|z,goal)",
-                        "risk": "Risk(z,skill)",
-                    },
-                }
-            )
+            torch.manual_seed(self.config.seed % (2**63 - 1))
+            dense_type = self._dense_network_type(torch)
+            tensors = self._prepare_tensors(torch)
+            ensemble, history = self._train_ensemble(torch, dense_type, tensors)
+            self._finalize_training_bundle(ensemble, history, tensors)
         except RECOVERABLE_ERRORS as error:
-            training_error = type(error).__name__ + ":" + str(error)
-    behavior_state, value_state, risk_state, behavior_prior, value_prior, risk_prior = _offline_policy_audit_tables(
-        eligible, bundle, default_task_id
-    )
-    ope = (
-        _offline_policy_evaluation(bundle, eligible, split)
-        if bundle.get("trained")
-        else {"schema_version": 1, "validation": {"status": "not_evaluated"}, "test": {"status": "not_evaluated"}}
-    )
-    diagnostics = {
-        "schema_version": 2,
-        "algorithm": "task_conditioned_neural_offline_iql_cql_awr",
-        "losses": {name: round(value, 8) for name, value in losses.items()},
-        "objectives": [
-            "double_q_with_target_networks",
-            "terminal_done_mask",
-            "confidence_weighted_reward",
-            "iql_expectile_value",
-            "advantage_weighted_behavior_cloning",
-            "cql_conservative_regularization",
-            "behavior_support_constraint",
-            "bootstrap_epistemic_uncertainty",
-            "independent_risk_classification",
-            "world_model_consistency",
-        ],
-        "training_transitions": len(eligible),
-        "trained": bool(bundle.get("trained")),
-        "training_error": training_error,
-        "game_isolated_split": split,
-        "offline_policy_evaluation": ope,
-        "safety_shield_independent": True,
-        "distillation": bundle.get("distillation", {}),
-        "validation_status": "evaluated" if split.get("complete") else "not_evaluated",
-    }
-    common = {
-        "schema_version": 4,
-        "total_count": len(eligible),
-        "default_task_id": default_task_id,
-        "training_diagnostics": diagnostics,
-        "game_isolated_validation": split,
-        "offline_policy_evaluation": ope,
-        "neural_reference": {
-            "checksum": hashlib.sha256(canonical_bytes(bundle)).hexdigest(),
-            "trained": bool(bundle.get("trained")),
-        },
-    }
-    behavior_model = {
-        **common,
-        "algorithm": "neural_advantage_weighted_behavior_policy_with_support_constraint",
-        "state_action": behavior_state,
-        "action_prior": behavior_prior,
-    }
-    value_model = {
-        **common,
-        "algorithm": "neural_double_q_iql_with_cql_and_target_networks",
-        "state_action": value_state,
-        "action_prior": value_prior,
-        "expectile": expectile,
-        "cql_alpha": cql_alpha,
-        "gamma": gamma,
-        "neural_bundle": bundle,
-    }
-    risk_model = {
-        **common,
-        "algorithm": "independent_neural_failure_irreversible_ood_risk_ensemble",
-        "state_action": risk_state,
-        "action_prior": risk_prior,
-    }
-    enough_models = bool(
-        bundle.get("trained")
-        and len(eligible) >= max(150, VersionedThresholdConfig.review_min_accepted)
-        and len(value_state) >= 8
-    )
-    result = (behavior_model, value_model, risk_model, enough_models)
-    OFFLINE_POLICY_TRAINING_CACHE[cache_key] = result
-    while len(OFFLINE_POLICY_TRAINING_CACHE) > 2:
-        OFFLINE_POLICY_TRAINING_CACHE.popitem(last=False)
-    return result
+            self.training_error = type(error).__name__ + ":" + str(error)
+
+    @staticmethod
+    def _dense_network_type(torch):
+        class DenseNetwork(torch.nn.Module):
+            def __init__(self, input_size, output_size, hidden_size):
+                super().__init__()
+                self.layers = torch.nn.ModuleList(
+                    [
+                        torch.nn.Linear(input_size, hidden_size),
+                        torch.nn.Linear(hidden_size, hidden_size),
+                        torch.nn.Linear(hidden_size, output_size),
+                    ]
+                )
+
+            def forward(self, value):
+                for layer in self.layers[:-1]:
+                    value = torch.tanh(layer(value))
+                return self.layers[-1](value)
+
+        return DenseNetwork
+
+    def _prepare_rows(self):
+        vocabulary = set(self.action_vocabulary)
+        filtered = [
+            item
+            for item in self.eligible
+            if str(item.get("action_t", item.get("action", ""))) in vocabulary
+        ][:6000]
+        action_index = {action: index for index, action in enumerate(self.action_vocabulary)}
+        action_vectors = [_policy_action_vector(action, None, None) for action in self.action_vocabulary]
+        rows = defaultdict(list)
+        for item in filtered:
+            task = normalized_identifier(item.get("task_id"), self.default_task_id, 96)
+            action = str(item.get("action_t", item.get("action", "")))
+            semantic = item.get("semantic_action", {}) if isinstance(item.get("semantic_action"), dict) else {}
+            rows["states"].append(_policy_state_vector(item, task, None, False))
+            rows["actions"].append(action_vectors[action_index[action]])
+            rows["next_states"].append(_policy_state_vector(item, task, None, True))
+            rows["rewards"].append(safe_float(item.get("reward_t", item.get("reward", 0.0)), 0.0, -20.0, 20.0))
+            rows["dones"].append(float(bool(item.get("done"))))
+            rows["confidences"].append(safe_float(item.get("reward_confidence", 0.0), 0.0, 0.0, 1.0))
+            risk_label = bool(
+                item.get("failure")
+                or item.get("human_override")
+                or str(semantic.get("risk_class", "safe")) == "irreversible"
+            )
+            rows["risks"].append(float(risk_label))
+            rows["outcomes"].append(1 if item.get("success") else 2 if item.get("failure") else 0)
+            rows["action_indexes"].append(action_index[action])
+            rows["support_masks"].append(
+                [1.0 if self.task_support[task].get(candidate, 0) > 0 else 0.0 for candidate in self.action_vocabulary]
+            )
+            rows["games"].append(str(item.get("game_id") or "unknown"))
+        return filtered, action_vectors, rows
+
+    def _prepare_tensors(self, torch):
+        filtered, action_vectors, rows = self._prepare_rows()
+        train_games = set(self.split.get("train_game_ids", []))
+        train_indices = [index for index, game in enumerate(rows["games"]) if game in train_games]
+        if not train_indices:
+            train_indices = list(range(len(filtered)))
+        device = torch.device("cpu")
+        tensor = lambda values, dtype: torch.tensor(values, dtype=dtype, device=device)
+        return PolicyTrainingTensors(
+            filtered=filtered,
+            train_games=train_games,
+            train_indices=train_indices,
+            state=tensor(rows["states"], torch.float32),
+            action=tensor(rows["actions"], torch.float32),
+            next_state=tensor(rows["next_states"], torch.float32),
+            reward=tensor(rows["rewards"], torch.float32).unsqueeze(1),
+            done=tensor(rows["dones"], torch.float32).unsqueeze(1),
+            confidence=tensor(rows["confidences"], torch.float32).unsqueeze(1),
+            risk=tensor(rows["risks"], torch.float32).unsqueeze(1),
+            outcome=tensor(rows["outcomes"], torch.long),
+            action_index=tensor(rows["action_indexes"], torch.long),
+            support_mask=tensor(rows["support_masks"], torch.float32),
+            candidate_actions=tensor(action_vectors, torch.float32),
+            device=device,
+        )
+
+    @staticmethod
+    def _create_networks(dense_type):
+        pair_size = POLICY_INPUT_SIZE + LATENT_ACTION_SIZE
+        q1 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE)
+        q2 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE)
+        value = dense_type(POLICY_INPUT_SIZE, 1, POLICY_HIDDEN_SIZE)
+        policy = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE)
+        risk = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE)
+        outcome = dense_type(pair_size, 3, POLICY_HIDDEN_SIZE)
+        dynamics = dense_type(pair_size, POLICY_INPUT_SIZE, POLICY_HIDDEN_SIZE)
+        target_q1 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE)
+        target_q2 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE)
+        target_q1.load_state_dict(q1.state_dict())
+        target_q2.load_state_dict(q2.state_dict())
+        parameters = []
+        for network in (q1, q2, value, policy, risk, outcome, dynamics):
+            parameters.extend(network.parameters())
+        return PolicyNetworkSet(
+            q1,
+            q2,
+            value,
+            policy,
+            risk,
+            outcome,
+            dynamics,
+            target_q1,
+            target_q2,
+            parameters,
+        )
+
+    def _train_ensemble(self, torch, dense_type, tensors):
+        history = defaultdict(list)
+        ensemble = []
+        for member_index in range(POLICY_ENSEMBLE_SIZE):
+            member_seed = (self.config.seed + member_index * 104729) % (2**63 - 1)
+            torch.manual_seed(member_seed)
+            networks = self._create_networks(dense_type)
+            optimizer = torch.optim.AdamW(networks.parameters, lr=0.0015, weight_decay=0.0001)
+            rng = random.Random(member_seed)
+            bootstrap = [
+                tensors.train_indices[rng.randrange(len(tensors.train_indices))]
+                for _ in range(max(32, len(tensors.train_indices)))
+            ]
+            steps = max(36, min(180, len(tensors.train_indices) * 2))
+            batch_size = min(32, max(12, len(bootstrap)))
+            for _ in range(steps):
+                indexes = [bootstrap[rng.randrange(len(bootstrap))] for _ in range(batch_size)]
+                losses = self._training_step(torch, networks, optimizer, tensors, indexes)
+                for name, value in losses.items():
+                    history[name].append(float(value))
+            ensemble.append(self._serialize_member(networks, member_seed, len(bootstrap)))
+        return ensemble, history
+
+    def _training_step(self, torch, networks, optimizer, tensors, indexes):
+        idx = torch.tensor(indexes, dtype=torch.long, device=tensors.device)
+        state = tensors.state[idx]
+        action = tensors.action[idx]
+        next_state = tensors.next_state[idx]
+        reward = tensors.reward[idx]
+        done = tensors.done[idx]
+        confidence = tensors.confidence[idx]
+        risk = tensors.risk[idx]
+        outcome = tensors.outcome[idx]
+        action_label = tensors.action_index[idx]
+        support = tensors.support_mask[idx]
+        pair = torch.cat([state, action], dim=1)
+        q1_value = networks.q1(pair)
+        q2_value = networks.q2(pair)
+        with torch.no_grad():
+            target = reward + self.config.gamma * (1.0 - done) * networks.value(next_state)
+            target_q = torch.minimum(networks.target_q1(pair), networks.target_q2(pair))
+        sample_weight = 0.20 + 0.80 * confidence
+        q1_loss = (sample_weight * (q1_value - target).pow(2)).mean()
+        q2_loss = (sample_weight * (q2_value - target).pow(2)).mean()
+        value_delta = target_q - networks.value(state)
+        expectile_weight = torch.where(
+            value_delta >= 0,
+            torch.full_like(value_delta, self.config.expectile),
+            torch.full_like(value_delta, 1.0 - self.config.expectile),
+        )
+        value_loss = (expectile_weight * value_delta.pow(2)).mean()
+        batch_count = state.shape[0]
+        action_count = tensors.candidate_actions.shape[0]
+        expanded_state = state.unsqueeze(1).expand(batch_count, action_count, POLICY_INPUT_SIZE)
+        expanded_action = tensors.candidate_actions.unsqueeze(0).expand(
+            batch_count,
+            action_count,
+            LATENT_ACTION_SIZE,
+        )
+        all_pairs = torch.cat([expanded_state, expanded_action], dim=2).reshape(batch_count * action_count, -1)
+        q1_all = networks.q1(all_pairs).reshape(batch_count, action_count)
+        q2_all = networks.q2(all_pairs).reshape(batch_count, action_count)
+        cql_loss = (
+            torch.logsumexp(q1_all, dim=1).mean()
+            - q1_value.mean()
+            + torch.logsumexp(q2_all, dim=1).mean()
+            - q2_value.mean()
+        ) * 0.5
+        logits = networks.policy(all_pairs).reshape(batch_count, action_count)
+        masked_logits = logits + (support - 1.0) * 8.0
+        cross_entropy = torch.nn.functional.cross_entropy(masked_logits, action_label, reduction="none")
+        with torch.no_grad():
+            advantage = torch.minimum(q1_value, q2_value) - networks.value(state)
+            awr_weight = torch.exp(torch.clamp(advantage / self.config.beta, -5.0, 3.0)).squeeze(1)
+        policy_loss = (cross_entropy * awr_weight).mean()
+        probabilities = torch.softmax(logits, dim=1)
+        support_loss = (probabilities * (1.0 - support)).sum(dim=1).mean()
+        risk_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            networks.risk(pair),
+            risk,
+            weight=sample_weight,
+        )
+        outcome_loss = torch.nn.functional.cross_entropy(networks.outcome(pair), outcome, reduction="none")
+        outcome_loss = (outcome_loss * sample_weight.squeeze(1)).mean()
+        consistency_error = (networks.dynamics(pair) - next_state).pow(2).mean(dim=1, keepdim=True)
+        consistency_loss = (sample_weight * consistency_error).mean()
+        total = q1_loss + q2_loss + value_loss + self.config.cql_alpha * cql_loss + policy_loss
+        total = total + 0.35 * support_loss + 0.75 * risk_loss + 0.45 * outcome_loss + 0.25 * consistency_loss
+        self._optimize(torch, networks, optimizer, total)
+        return {
+            "q1_loss": q1_loss.item(),
+            "q2_loss": q2_loss.item(),
+            "expectile_value_loss": value_loss.item(),
+            "advantage_weighted_policy_loss": policy_loss.item(),
+            "behavior_support_loss": support_loss.item(),
+            "conservative_q_loss": cql_loss.item(),
+            "risk_classification_loss": risk_loss.item(),
+            "outcome_classification_loss": outcome_loss.item(),
+            "world_model_consistency_loss": consistency_loss.item(),
+        }
+
+    @staticmethod
+    def _optimize(torch, networks, optimizer, total):
+        optimizer.zero_grad(set_to_none=True)
+        total.backward()
+        torch.nn.utils.clip_grad_norm_(networks.parameters, 5.0)
+        optimizer.step()
+        with torch.no_grad():
+            for target, source in zip(networks.target_q1.parameters(), networks.q1.parameters()):
+                target.mul_(0.99).add_(source, alpha=0.01)
+            for target, source in zip(networks.target_q2.parameters(), networks.q2.parameters()):
+                target.mul_(0.99).add_(source, alpha=0.01)
+
+    @staticmethod
+    def _serialize_member(networks, member_seed, bootstrap_samples):
+        return {
+            "q1": _serialize_dense_network(networks.q1),
+            "q2": _serialize_dense_network(networks.q2),
+            "v": _serialize_dense_network(networks.value),
+            "policy": _serialize_dense_network(networks.policy),
+            "risk": _serialize_dense_network(networks.risk),
+            "outcome": _serialize_dense_network(networks.outcome),
+            "seed": member_seed,
+            "bootstrap_samples": bootstrap_samples,
+        }
+
+    def _finalize_training_bundle(self, ensemble, history, tensors):
+        for name in self.losses:
+            values = history.get(name, [])
+            self.losses[name] = statistics.fmean(values[-min(100, len(values)) :]) if values else 0.0
+        distilled = {
+            name: _average_dense_networks([member[name] for member in ensemble])
+            for name in ("q1", "q2", "v", "policy", "risk", "outcome")
+        }
+        self.bundle.update(
+            {
+                "trained": True,
+                "ensemble": ensemble,
+                "ensemble_size": len(ensemble),
+                "training_transitions": len(tensors.filtered),
+                "training_game_ids": sorted(tensors.train_games),
+                "distillation": {
+                    "trained": True,
+                    "method": "parameter_mean_ensemble_distillation",
+                    "target": "small_cpu_or_gpu_mlp",
+                    "member": distilled,
+                },
+                "optimizer": "AdamW",
+                "bootstrap_sampling": "independent_with_replacement",
+                "target_network_update": "polyak_0.01",
+                "semantic_encoder": {},
+                "network_contract": {
+                    "q1": "Q1(z,skill)",
+                    "q2": "Q2(z,skill)",
+                    "value": "V(z)",
+                    "policy": "pi(skill|z,goal)",
+                    "risk": "Risk(z,skill)",
+                },
+            }
+        )
+
+    def _assemble_models(self):
+        audit = _offline_policy_audit_tables(self.eligible, self.bundle, self.default_task_id)
+        behavior_state, value_state, risk_state, behavior_prior, value_prior, risk_prior = audit
+        if self.bundle.get("trained"):
+            ope = _offline_policy_evaluation(self.bundle, self.eligible, self.split)
+        else:
+            ope = {
+                "schema_version": 1,
+                "validation": {"status": "not_evaluated"},
+                "test": {"status": "not_evaluated"},
+            }
+        diagnostics = self._diagnostics(ope)
+        common = self._common_model_fields(diagnostics, ope)
+        behavior_model = {
+            **common,
+            "algorithm": "neural_advantage_weighted_behavior_policy_with_support_constraint",
+            "state_action": behavior_state,
+            "action_prior": behavior_prior,
+        }
+        value_model = {
+            **common,
+            "algorithm": "neural_double_q_iql_with_cql_and_target_networks",
+            "state_action": value_state,
+            "action_prior": value_prior,
+            "expectile": self.config.expectile,
+            "cql_alpha": self.config.cql_alpha,
+            "gamma": self.config.gamma,
+            "neural_bundle": self.bundle,
+        }
+        risk_model = {
+            **common,
+            "algorithm": "independent_neural_failure_irreversible_ood_risk_ensemble",
+            "state_action": risk_state,
+            "action_prior": risk_prior,
+        }
+        enough_models = bool(
+            self.bundle.get("trained")
+            and len(self.eligible) >= max(150, VersionedThresholdConfig.review_min_accepted)
+            and len(value_state) >= 8
+        )
+        return behavior_model, value_model, risk_model, enough_models
+
+    def _diagnostics(self, ope):
+        return {
+            "schema_version": 2,
+            "algorithm": "task_conditioned_neural_offline_iql_cql_awr",
+            "losses": {name: round(value, 8) for name, value in self.losses.items()},
+            "objectives": [
+                "double_q_with_target_networks",
+                "terminal_done_mask",
+                "confidence_weighted_reward",
+                "iql_expectile_value",
+                "advantage_weighted_behavior_cloning",
+                "cql_conservative_regularization",
+                "behavior_support_constraint",
+                "bootstrap_epistemic_uncertainty",
+                "independent_risk_classification",
+                "world_model_consistency",
+            ],
+            "training_transitions": len(self.eligible),
+            "trained": bool(self.bundle.get("trained")),
+            "training_error": self.training_error,
+            "game_isolated_split": self.split,
+            "offline_policy_evaluation": ope,
+            "safety_shield_independent": True,
+            "distillation": self.bundle.get("distillation", {}),
+            "validation_status": "evaluated" if self.split.get("complete") else "not_evaluated",
+        }
+
+    def _common_model_fields(self, diagnostics, ope):
+        return {
+            "schema_version": 4,
+            "total_count": len(self.eligible),
+            "default_task_id": self.default_task_id,
+            "training_diagnostics": diagnostics,
+            "game_isolated_validation": self.split,
+            "offline_policy_evaluation": ope,
+            "neural_reference": {
+                "checksum": hashlib.sha256(canonical_bytes(self.bundle)).hexdigest(),
+                "trained": bool(self.bundle.get("trained")),
+            },
+        }
+
+
+def build_offline_policy_models(experience_model, experiences, default_task_id):
+    return OfflinePolicyModelBuilder(experience_model, experiences, default_task_id).build()
+
+
 
 
 class ReviewExecution:
@@ -15369,10 +15781,14 @@ class TrainingExecution:
 
     def model_table_token(self):
         with self.host.store.lock:
-            rows = self.host.store.db.execute(
-                "SELECT slot,saved,checksum FROM models WHERE game_id=? ORDER BY slot",
-                (self.game["id"],),
-            ).fetchall()
+            rows = list(
+                iter_rows(
+                    self.host.store.db.execute(
+                        "SELECT slot,saved,checksum FROM models WHERE game_id=? ORDER BY slot",
+                        (self.game["id"],),
+                    )
+                )
+            )
         values = [[str(row["slot"]), float(row["saved"]), str(row["checksum"])] for row in rows]
         return immutable_digest(values)
 
@@ -15554,7 +15970,7 @@ class TrainingExecution:
             self.host.set_confidence("训练置信度：0%")
             self.host.set_input_status("目标窗口不可用，已锁定")
             self.host.set_status("目标窗口失去焦点，等待恢复；" + str(error))
-            time.sleep(0.08)
+            interruptible_wait(self.host.stop_event, 0.08)
             return None
         captured = self.frame_buffer.latest(None, 0.8)
         if not self.host.training_controller.usable_frame(captured, self.validated_backend):
@@ -15565,11 +15981,12 @@ class TrainingExecution:
                 "采集画面不可用于训练；等待已验收、非受保护黑屏且后端未冻结的最新帧；"
                 + (self.frame_buffer.last_error or "尚无画面")
             )
-            time.sleep(0.08)
+            interruptible_wait(self.host.stop_event, 0.08)
             return None
         return captured if self.validate_backend(captured) else None
 
     def validate_backend(self, captured):
+        frame = CapturedFrame.from_payload(captured)
         current = str(self.host.api.calibration_for(self.target).get("validated_backend", self.validated_backend))
         if current != self.validated_backend:
             if current in self.allowed_backends:
@@ -15579,11 +15996,11 @@ class TrainingExecution:
                 self.host.set_status("原采集后端已熔断，已切换到剩余已验证后端：" + self.validated_backend)
             else:
                 self.host.set_status("替代采集后端未在模型中验证，拒绝自动动作")
-            time.sleep(0.1)
+            interruptible_wait(self.host.stop_event, 0.1)
             return False
-        if captured.get("method") != self.validated_backend or captured.get("method") not in self.allowed_backends:
+        if frame.method != self.validated_backend or frame.method not in self.allowed_backends:
             self.host.set_status("采集后端变化或未在模型中验证，拒绝自动动作；请重新学习和睡眠")
-            time.sleep(0.1)
+            interruptible_wait(self.host.stop_event, 0.1)
             return False
         return True
 
@@ -15593,7 +16010,8 @@ class TrainingExecution:
         self.candidate_frame_stamp = 0.0
 
     def handle_terminal_state(self, captured):
-        feature = captured["f"]
+        frame = CapturedFrame.from_payload(captured)
+        feature = frame.feature
         state, _ = self.agent_policy.classify(feature)
         if state == "success":
             self.host.request_mode_stop("completed", "检测到已定义的成功状态，训练完成")
@@ -15609,24 +16027,25 @@ class TrainingExecution:
         try:
             if self.execute_profile_restart(captured):
                 self.host.set_status("检测到失败或死亡状态，已执行白名单内的重新开始动作")
-                time.sleep(max(0.1, float(self.calibration.get("input_delay", 0.24))))
+                interruptible_wait(self.host.stop_event, max(0.1, float(self.calibration.get("input_delay", 0.24))))
                 return "continue"
         except InputStopped as error:
             self.host.request_mode_stop("stopped", "失败状态回滚无法安全执行：" + str(error))
             return "break"
         self.host.set_status("检测到失败或死亡状态，但未配置重新开始动作；保持锁定")
-        time.sleep(0.12)
+        interruptible_wait(self.host.stop_event, 0.12)
         return "continue"
 
     def update_temporal_state(self, captured):
-        feature = captured["f"]
-        if captured["time"] != self.previous_frame_stamp:
+        frame = CapturedFrame.from_payload(captured)
+        feature = frame.feature
+        if frame.timestamp != self.previous_frame_stamp:
             if self.previous_feature is not None and visual_distance(self.previous_feature, feature) > float(
                 self.calibration.get("significant_change", 60.0)
             ):
                 self.state_since = time.monotonic()
             self.previous_feature = feature
-            self.previous_frame_stamp = captured["time"]
+            self.previous_frame_stamp = frame.timestamp
         self.significant = self.last_action_feature is not None and visual_distance(
             self.last_action_feature, feature
         ) > float(self.calibration.get("significant_change", 60.0))
@@ -15655,7 +16074,7 @@ class TrainingExecution:
         temporal["environment_id"] = observation.environment_id
         if not temporal_from_context({**temporal, "previous_action_changed_frame": self.significant}).get("complete"):
             self.host.set_status("等待至少3帧短时序上下文")
-            time.sleep(0.05)
+            interruptible_wait(self.host.stop_event, 0.05)
             return None
         temporal["previous_action_changed_frame"] = bool(self.significant)
         return temporal
@@ -15695,14 +16114,14 @@ class TrainingExecution:
                 )
                 self.host.request_mode_stop("stopped", "主动学习触发指导：" + reason)
             else:
-                time.sleep(0.12)
+                interruptible_wait(self.host.stop_event, 0.12)
             return None
         self.guidance_trigger_streak = 0
         best = decision["best"]
         cluster_id = best["cluster_id"]
         if self.candidate_id == cluster_id:
             if captured["time"] == self.candidate_frame_stamp:
-                time.sleep(0.025)
+                interruptible_wait(self.host.stop_event, 0.025)
                 return None
             self.candidate_count += 1
         else:
@@ -15719,7 +16138,7 @@ class TrainingExecution:
             + str(confirmations)
         )
         if not self.host.training_controller.confirmed(self.candidate_count, confirmations):
-            time.sleep(0.05)
+            interruptible_wait(self.host.stop_event, 0.05)
             return None
         return self.build_selection(captured, best, confirmations)
 
@@ -15744,11 +16163,11 @@ class TrainingExecution:
         proto = best["proto"]
         if not self.host.training_controller.authorized(proto):
             self.host.set_status("动作原型未通过独立留出授权，拒绝动作")
-            time.sleep(0.1)
+            interruptible_wait(self.host.stop_event, 0.1)
             return None
         if not self.agent_policy.allowed_action(coordinate):
             self.host.set_status("动作不在当前任务安全白名单中，拒绝动作：" + self.host.action_text(semantic))
-            time.sleep(0.1)
+            interruptible_wait(self.host.stop_event, 0.1)
             return None
         risk_class = str(semantic.get("risk_class", "safe"))
         if risk_class == "irreversible":
@@ -15757,7 +16176,7 @@ class TrainingExecution:
             return None
         if captured["method"] not in proto.get("capture_methods", frozenset()):
             self.host.set_status("当前原型未在该采集后端训练，拒绝动作")
-            time.sleep(0.1)
+            interruptible_wait(self.host.stop_event, 0.1)
             return None
         grounding = ground_semantic_action(semantic, captured.get("semantic_targets", []), True)
         if not grounding or not grounding.get("grounded_action") or grounding.get("grounding", {}).get("ambiguous"):
@@ -15935,14 +16354,14 @@ class TrainingExecution:
             and not self.state_unlocked
         ):
             self.host.set_status("等待画面变化：该动作策略为" + policy)
-            time.sleep(0.1)
+            interruptible_wait(self.host.stop_event, 0.1)
             return False
         minimum_gap = max(
             self.host.action_cooldown(selection["action"]) if policy == "one_shot" else 0.0,
             1.0 / selection["max_rate"] if policy in {"rate_limited", "repeatable"} else 0.0,
         )
         if time.monotonic() - self.last_action_time < minimum_gap:
-            time.sleep(0.03)
+            interruptible_wait(self.stop_event, 0.03)
             return False
         hits = self.action_hits[cluster_id]
         now = time.monotonic()
@@ -15950,7 +16369,7 @@ class TrainingExecution:
             hits.popleft()
         if len(hits) >= max(1, int(math.ceil(selection["max_rate"]))):
             self.host.set_status("动作专属频率限制中：" + self.host.action_text(selection["action"]))
-            time.sleep(0.05)
+            interruptible_wait(self.host.stop_event, 0.05)
             return False
         return True
 
@@ -16114,7 +16533,7 @@ class TrainingExecution:
         delay = float(self.calibration.get("input_delay", 0.24))
         deadline = time.monotonic() + delay
         while time.monotonic() < deadline and not self.host.should_stop():
-            time.sleep(0.02)
+            interruptible_wait(self.host.stop_event, 0.02)
         after = self.wait_after_frame(action_end, delay)
         before_feature = before.get("f") if isinstance(before, dict) else before
         changed = self.host.training_controller.changed(
@@ -16183,7 +16602,7 @@ class TrainingExecution:
             candidate = self.frame_buffer.latest_after(action_end)
             if self.host.training_controller.usable_frame(candidate, self.validated_backend):
                 return candidate
-            time.sleep(0.025)
+            interruptible_wait(self.host.stop_event, 0.025)
         return None
 
     def evaluate_outcome(self, result):
@@ -16250,7 +16669,7 @@ class TrainingExecution:
                     continue
                 if self.evaluate_outcome(result):
                     break
-                time.sleep(0.05)
+                interruptible_wait(self.host.stop_event, 0.05)
 
     def finalize(self):
         requested = self.host.lifecycle.snapshot()[3]
@@ -17253,13 +17672,14 @@ class DataStoreLifecycleMixin:
             "CREATE TABLE IF NOT EXISTS samples(id INTEGER PRIMARY KEY AUTOINCREMENT,game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,"
             "created REAL NOT NULL,kind TEXT NOT NULL,action_signature TEXT NOT NULL,action_family TEXT NOT NULL,repeat_policy TEXT NOT NULL,"
             "feature_algorithm_version INTEGER NOT NULL,action_algorithm_version INTEGER NOT NULL,feature BLOB NOT NULL,coarse BLOB NOT NULL,neural_feature BLOB,"
-            "rgb_thumbnail BLOB,preprocess_signature TEXT NOT NULL DEFAULT '',action TEXT NOT NULL,source TEXT NOT NULL,session_id TEXT NOT NULL,"
+            "rgb_thumbnail BLOB,preprocess_signature TEXT NOT NULL DEFAULT '',visual_hash TEXT NOT NULL,action TEXT NOT NULL,source TEXT NOT NULL,session_id TEXT NOT NULL,"
             "capture_method TEXT NOT NULL,context TEXT NOT NULL,thumbnail BLOB,weight REAL NOT NULL DEFAULT 1.0,fingerprint TEXT NOT NULL,UNIQUE(game_id,"
             "fingerprint))"
         )
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_samples_game_kind_created ON samples(game_id,kind,created)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_samples_game_session ON samples(game_id,session_id)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_samples_game_action ON samples(game_id,action_signature)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_samples_game_visual_hash ON samples(game_id,visual_hash)")
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS models("
             "game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,"
@@ -17474,7 +17894,7 @@ class DataStoreLifecycleMixin:
                         version = 8
                     elif version == 8:
                         self._create_latest_schema()
-                        rows = self.db.execute("SELECT game_id,payload FROM game_profiles").fetchall()
+                        rows = list(iter_rows(self.db.execute("SELECT game_id,payload FROM game_profiles")))
                         for row in rows:
                             try:
                                 profile = json.loads(row["payload"])
@@ -17508,6 +17928,38 @@ class DataStoreLifecycleMixin:
                     elif version == 9:
                         self._create_latest_schema()
                         version = 10
+                    elif version == 10:
+                        self._create_latest_schema()
+                        version = 11
+                    elif version == 11:
+                        self._create_latest_schema()
+                        version = 12
+                    elif version == 12:
+                        sample_columns = self._columns("samples")
+                        if "visual_hash" not in sample_columns:
+                            self.db.execute("ALTER TABLE samples ADD COLUMN visual_hash TEXT NOT NULL DEFAULT ''")
+                        cursor = self.db.execute(
+                            "SELECT id,feature,feature_algorithm_version FROM samples WHERE visual_hash='' ORDER BY id"
+                        )
+                        updates = []
+                        for row in iter_rows(cursor, 128):
+                            try:
+                                feature = upgrade_feature(
+                                    bounded_decompress(row["feature"], FEATURE_LEN * 2), row["feature_algorithm_version"]
+                                )
+                                value = visual_perceptual_hash(feature) if feature_valid(feature) else ""
+                            except RECOVERABLE_ERRORS:
+                                value = ""
+                            updates.append((value, safe_int(row["id"], 0)))
+                            if len(updates) >= 128:
+                                self.db.executemany("UPDATE samples SET visual_hash=? WHERE id=?", updates)
+                                updates.clear()
+                        if updates:
+                            self.db.executemany("UPDATE samples SET visual_hash=? WHERE id=?", updates)
+                        self.db.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_samples_game_visual_hash ON samples(game_id,visual_hash)"
+                        )
+                        version = 13
                     else:
                         raise RuntimeError("没有从数据库版本" + str(version) + "开始的迁移路径")
                     self.db.execute(
@@ -17715,8 +18167,8 @@ class DataStoreLifecycleMixin:
                         "INSERT OR IGNORE INTO samples("
                         "game_id,created,kind,action_signature,action_family,repeat_policy,"
                         "feature_algorithm_version,action_algorithm_version,feature,coarse,"
-                        "action,source,session_id,capture_method,context,thumbnail,weight,fingerprint"
-                        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                        "visual_hash,action,source,session_id,capture_method,context,thumbnail,weight,fingerprint"
+                        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                     )
                     self.db.execute(
                         legacy_insert_sql,
@@ -17731,6 +18183,7 @@ class DataStoreLifecycleMixin:
                             ACTION_ALGORITHM_VERSION,
                             sqlite3.Binary(zlib.compress(fbytes, 6)),
                             sqlite3.Binary(coarse_feature(fbytes)),
+                            visual_perceptual_hash(fbytes),
                             json.dumps(action, ensure_ascii=False, separators=(",", ":")),
                             source,
                             session_id,
@@ -18064,10 +18517,14 @@ class DataStoreGameTaskMixin:
     def list_tasks(self, gid, include_disabled=False):
         game_id = str(gid)
         with self.lock:
-            rows = self.db.execute(
-                "SELECT task_id,payload,checksum,enabled FROM game_tasks WHERE game_id=? ORDER BY updated DESC,task_id",
-                (game_id,),
-            ).fetchall()
+            rows = list(
+                iter_rows(
+                    self.db.execute(
+                        "SELECT task_id,payload,checksum,enabled FROM game_tasks WHERE game_id=? ORDER BY updated DESC,task_id",
+                        (game_id,),
+                    )
+                )
+            )
         result = []
         for row in rows:
             try:
@@ -18154,9 +18611,9 @@ class DataStoreGameTaskMixin:
 
     def games(self):
         with self.lock:
-            rows = self.db.execute(
-                "SELECT id,name,created,needs_review,last_review FROM games ORDER BY created,id"
-            ).fetchall()
+            rows = list(
+                iter_rows(self.db.execute("SELECT id,name,created,needs_review,last_review FROM games ORDER BY created,id"))
+            )
         return [
             {
                 "id": row["id"],
@@ -18531,9 +18988,9 @@ class DataStoreSampleMixin:
                             "INSERT OR IGNORE INTO samples("
                             "game_id,created,kind,action_signature,action_family,repeat_policy,"
                             "feature_algorithm_version,action_algorithm_version,feature,coarse,"
-                            "neural_feature,rgb_thumbnail,preprocess_signature,action,source,"
+                            "neural_feature,rgb_thumbnail,preprocess_signature,visual_hash,action,source,"
                             "session_id,capture_method,context,thumbnail,weight,fingerprint"
-                            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                         )
                         connection.executemany(insert_sql, rows)
                         for gid in review_games:
@@ -18747,6 +19204,7 @@ class DataStoreSampleMixin:
             sqlite3.Binary(zlib.compress(item["neural"], 6)) if item.get("neural") is not None else None,
             sqlite3.Binary(zlib.compress(item["rgb"], 6)),
             VISION_PREPROCESS_HASH,
+            item["visual_hash"],
             item["action_json"],
             item["source"],
             item["session_id"],
@@ -18762,10 +19220,14 @@ class DataStoreSampleMixin:
         if key in self.recent_samples_loaded:
             return self.recent_samples[key]
         with self.lock:
-            rows = self.db.execute(
-                "SELECT id,feature,coarse,feature_algorithm_version,context FROM samples WHERE game_id=? AND action_signature=? ORDER BY created DESC,id DESC LIMIT 36",
-                key,
-            ).fetchall()
+            rows = list(
+                iter_rows(
+                    self.db.execute(
+                        "SELECT id,feature,coarse,feature_algorithm_version,context FROM samples WHERE game_id=? AND action_signature=? ORDER BY created DESC,id DESC LIMIT 36",
+                        key,
+                    )
+                )
+            )
         cache = self.recent_samples[key]
         cache.clear()
         for row in reversed(rows):
@@ -19013,6 +19475,7 @@ class DataStoreSampleMixin:
             "context_json": json.dumps(context, ensure_ascii=False, separators=(",", ":")),
             "weight": float(max(0.1, min(10.0, weight))),
             "fingerprint": fingerprint,
+            "visual_hash": visual_perceptual_hash(fbytes),
             "mark_review": bool(mark_review),
         }
         with self.pending_lock:
@@ -19473,14 +19936,18 @@ class DataStoreSampleMixin:
                 batch_ids = identifiers[offset : offset + chunk]
                 order = {row_id: index for index, row_id in enumerate(batch_ids)}
                 placeholders = ",".join("?" for _ in batch_ids)
-                rows = connection.execute(
-                    "SELECT "
-                    + columns
-                    + " FROM samples s JOIN learning_sessions ls ON ls.session_id=s.session_id AND ls.game_id=s.game_id WHERE s.game_id=? AND ls.status='valid' AND s.id IN ("
-                    + placeholders
-                    + ")",
-                    (game_id, *batch_ids),
-                ).fetchall()
+                rows = list(
+                    iter_rows(
+                        connection.execute(
+                            "SELECT "
+                            + columns
+                            + " FROM samples s JOIN learning_sessions ls ON ls.session_id=s.session_id AND ls.game_id=s.game_id WHERE s.game_id=? AND ls.status='valid' AND s.id IN ("
+                            + placeholders
+                            + ")",
+                            (game_id, *batch_ids),
+                        )
+                    )
+                )
                 decoded = []
                 for row in sorted(rows, key=lambda value: order.get(int(value["id"]), len(order))):
                     counters["total"] += 1
@@ -19556,10 +20023,14 @@ class DataStoreSampleMixin:
 
     def load_rejections(self, gid, limit=500):
         with self.lock:
-            rows = self.db.execute(
-                "SELECT id,created,feature_algorithm_version,feature,coarse,neural_feature,rgb_thumbnail,preprocess_signature,thumbnail,candidates,source,session_id,capture_method FROM rejections WHERE game_id=? ORDER BY created DESC,id DESC LIMIT ?",
-                (gid, int(limit)),
-            ).fetchall()
+            rows = list(
+                iter_rows(
+                    self.db.execute(
+                        "SELECT id,created,feature_algorithm_version,feature,coarse,neural_feature,rgb_thumbnail,preprocess_signature,thumbnail,candidates,source,session_id,capture_method FROM rejections WHERE game_id=? ORDER BY created DESC,id DESC LIMIT ?",
+                        (gid, int(limit)),
+                    )
+                )
+            )
         result = []
         invalid = 0
         for row in rows:
@@ -19627,10 +20098,14 @@ class DataStoreSampleMixin:
 
     def load_guidance_events(self, gid, limit=2000):
         with self.lock:
-            rows = self.db.execute(
-                "SELECT created,event_type,payload,checksum FROM guidance_events WHERE game_id=? ORDER BY created DESC,id DESC LIMIT ?",
-                (str(gid), safe_int(limit, 2000, 1, 20000)),
-            ).fetchall()
+            rows = list(
+                iter_rows(
+                    self.db.execute(
+                        "SELECT created,event_type,payload,checksum FROM guidance_events WHERE game_id=? ORDER BY created DESC,id DESC LIMIT ?",
+                        (str(gid), safe_int(limit, 2000, 1, 20000)),
+                    )
+                )
+            )
         result = []
         for row in rows:
             try:
@@ -19657,10 +20132,14 @@ class DataStoreSampleMixin:
             session_row = self.db.execute(
                 "SELECT COUNT(*) AS sessions FROM learning_sessions WHERE game_id=? AND status='valid'", (gid,)
             ).fetchone()
-            family_rows = self.db.execute(
-                "SELECT s.action_family,COUNT(*) AS count FROM samples s JOIN learning_sessions ls ON ls.game_id=s.game_id AND ls.session_id=s.session_id WHERE s.game_id=? AND ls.status='valid' AND s.feature_algorithm_version IN (3,?) GROUP BY s.action_family",
-                (gid, FEATURE_ALGORITHM_VERSION),
-            ).fetchall()
+            family_rows = list(
+                iter_rows(
+                    self.db.execute(
+                        "SELECT s.action_family,COUNT(*) AS count FROM samples s JOIN learning_sessions ls ON ls.game_id=s.game_id AND ls.session_id=s.session_id WHERE s.game_id=? AND ls.status='valid' AND s.feature_algorithm_version IN (3,?) GROUP BY s.action_family",
+                        (gid, FEATURE_ALGORITHM_VERSION),
+                    )
+                )
+            )
         total = safe_int(total_row["total"] or 0, 0, 0)
         sql_valid = safe_int(valid_row["valid"] or 0, 0, 0, total)
         observed = safe_int(self.invalid_rows.get(str(gid), 0), 0, 0, total)
@@ -19681,54 +20160,49 @@ class DataStoreSampleMixin:
         self.sample_write_barrier()
         game_id = str(gid)
         with self.lock:
-            status_rows = self.db.execute(
+            status_cursor = self.db.execute(
                 "SELECT ls.status,COUNT(s.id) AS count FROM learning_sessions ls LEFT JOIN samples s ON s.game_id=ls.game_id AND s.session_id=ls.session_id WHERE ls.game_id=? GROUP BY ls.status",
                 (game_id,),
-            ).fetchall()
-            family_rows = self.db.execute(
+            )
+            family_cursor = self.db.execute(
                 "SELECT s.action_family,COUNT(*) AS count FROM samples s JOIN learning_sessions ls ON ls.game_id=s.game_id AND ls.session_id=s.session_id WHERE s.game_id=? AND ls.status='valid' GROUP BY s.action_family ORDER BY s.action_family",
                 (game_id,),
-            ).fetchall()
-            session_rows = self.db.execute(
+            )
+            session_cursor = self.db.execute(
                 "SELECT s.session_id,COUNT(*) AS count FROM samples s JOIN learning_sessions ls ON ls.game_id=s.game_id AND ls.session_id=s.session_id WHERE s.game_id=? AND ls.status='valid' GROUP BY s.session_id ORDER BY s.session_id",
                 (game_id,),
-            ).fetchall()
-            backend_rows = self.db.execute(
+            )
+            backend_cursor = self.db.execute(
                 "SELECT s.capture_method,COUNT(*) AS count FROM samples s JOIN learning_sessions ls ON ls.game_id=s.game_id AND ls.session_id=s.session_id WHERE s.game_id=? AND ls.status='valid' GROUP BY s.capture_method ORDER BY s.capture_method",
                 (game_id,),
-            ).fetchall()
-            pool_query = (
-                "SELECT s.id,s.fingerprint,s.weight,s.action_family,s.session_id,"
-                "s.capture_method,s.feature,s.feature_algorithm_version "
-                "FROM samples s JOIN learning_sessions ls "
-                "ON ls.game_id=s.game_id AND ls.session_id=s.session_id "
-                "WHERE s.game_id=? AND ls.status='valid' ORDER BY s.id"
             )
-            pool_rows = self.db.execute(pool_query, (game_id,)).fetchall()
+            visual_cursor = self.db.execute(
+                "SELECT s.visual_hash,COUNT(*) AS count FROM samples s "
+                "JOIN learning_sessions ls ON ls.game_id=s.game_id AND ls.session_id=s.session_id "
+                "WHERE s.game_id=? AND ls.status='valid' GROUP BY s.visual_hash",
+                (game_id,),
+            )
+            pool_cursor = self.db.execute(
+                "SELECT s.id,s.fingerprint,s.visual_hash,s.weight,s.action_family,s.session_id,s.capture_method FROM samples s JOIN learning_sessions ls ON ls.game_id=s.game_id AND ls.session_id=s.session_id WHERE s.game_id=? AND ls.status='valid' ORDER BY s.id",
+                (game_id,),
+            )
             storage_row = self.db.execute(
                 "SELECT COUNT(*) AS records,COALESCE(SUM(length(feature)+length(coarse)+length(action)+length(context)+COALESCE(length(thumbnail),0)+COALESCE(length(rgb_thumbnail),0)+COALESCE(length(neural_feature),0)),0) AS bytes FROM samples WHERE game_id=?",
                 (game_id,),
             ).fetchone()
+            status_rows = list(iter_rows(status_cursor))
+            family_rows = list(iter_rows(family_cursor))
+            session_rows = list(iter_rows(session_cursor))
+            backend_rows = list(iter_rows(backend_cursor))
+            visual_rows = list(iter_rows(visual_cursor))
+            pool_rows = list(iter_rows(pool_cursor))
         statuses = {"valid": 0, "invalid": 0, "staging": 0}
         for row in status_rows:
             statuses[str(row["status"])] = safe_int(row["count"], 0, 0)
-        fingerprints = Counter(str(row["fingerprint"]) for row in pool_rows if str(row["fingerprint"]))
-        visual_hashes = []
-        visual_hash_by_id = {}
-        visual_hash_failures = 0
-        for row in pool_rows:
-            try:
-                feature = upgrade_feature(
-                    bounded_decompress(row["feature"], FEATURE_LEN * 2), row["feature_algorithm_version"]
-                )
-                if not feature_valid(feature):
-                    raise ValueError("经验池特征无效")
-                value = visual_perceptual_hash(feature)
-                visual_hashes.append(value)
-                visual_hash_by_id[safe_int(row["id"], 0)] = value
-            except RECOVERABLE_ERRORS:
-                visual_hash_failures += 1
-        visual_counts = Counter(visual_hashes)
+        visual_counts = Counter(
+            {str(row["visual_hash"]): safe_int(row["count"], 0, 0) for row in visual_rows if str(row["visual_hash"])}
+        )
+        visual_hash_failures = sum(safe_int(row["count"], 0, 0) for row in visual_rows if not str(row["visual_hash"]))
         exact_visual_duplicates = sum(max(0, count - 1) for count in visual_counts.values())
         near_visual_pairs = len(near_perceptual_hash_pairs(visual_counts.keys(), 4))
         summary = {
@@ -19752,7 +20226,7 @@ class DataStoreSampleMixin:
             [
                 safe_int(row["id"], 0),
                 str(row["fingerprint"]),
-                visual_hash_by_id.get(safe_int(row["id"], 0), ""),
+                str(row["visual_hash"]),
                 round(safe_float(row["weight"], 1.0), 6),
                 str(row["action_family"]),
                 str(row["session_id"]),
@@ -19769,12 +20243,16 @@ class DataStoreSampleMixin:
         retained = {str(value) for value in retained_checksums or [] if str(value)}
         before = self.experience_pool_snapshot(game_id)
         with self.lock:
-            rows = self.db.execute(
-                "SELECT s.id,s.kind,s.action_signature,s.action_family,s.capture_method,s.session_id,s.coarse,s.weight,s.created,s.fingerprint,s.source,s.context,s.action "
-                "FROM samples s JOIN learning_sessions ls ON ls.game_id=s.game_id AND ls.session_id=s.session_id "
-                "WHERE s.game_id=? AND ls.status='valid' ORDER BY s.created DESC,s.id DESC",
-                (game_id,),
-            ).fetchall()
+            rows = list(
+                iter_rows(
+                    self.db.execute(
+                        "SELECT s.id,s.kind,s.action_signature,s.action_family,s.capture_method,s.session_id,s.coarse,s.weight,s.created,s.fingerprint,s.source,s.context,s.action "
+                        "FROM samples s JOIN learning_sessions ls ON ls.game_id=s.game_id AND ls.session_id=s.session_id "
+                        "WHERE s.game_id=? AND ls.status='valid' ORDER BY s.created DESC,s.id DESC",
+                        (game_id,),
+                    )
+                )
+            )
         family_count = len({str(row["action_family"]) for row in rows})
         session_count = len({str(row["session_id"]) for row in rows})
         target = max(
@@ -20005,10 +20483,12 @@ class DataStoreSampleMixin:
         with self.lock:
             old_models = [
                 dict(row)
-                for row in self.db.execute(
-                    "SELECT game_id,slot,saved,created,prototype_count,validation,payload,checksum FROM models WHERE game_id=?",
-                    (game_id,),
-                ).fetchall()
+                for row in iter_rows(
+                    self.db.execute(
+                        "SELECT game_id,slot,saved,created,prototype_count,validation,payload,checksum FROM models WHERE game_id=?",
+                        (game_id,),
+                    )
+                )
             ]
             old_game = self.db.execute("SELECT needs_review,last_review FROM games WHERE id=?", (game_id,)).fetchone()
         before_model_hash = hashlib.sha256(
@@ -20048,10 +20528,12 @@ class DataStoreSampleMixin:
         with self.lock:
             new_models = [
                 dict(row)
-                for row in self.db.execute(
-                    "SELECT slot,prototype_count,validation,checksum FROM models WHERE game_id=? ORDER BY slot",
-                    (game_id,),
-                ).fetchall()
+                for row in iter_rows(
+                    self.db.execute(
+                        "SELECT slot,prototype_count,validation,checksum FROM models WHERE game_id=? ORDER BY slot",
+                        (game_id,),
+                    )
+                )
             ]
         after_model_hash = hashlib.sha256(
             canonical_bytes([[row["slot"], row["checksum"]] for row in new_models])
@@ -20228,10 +20710,14 @@ class DataStoreWindowModelMixin:
         if not identity_key:
             return None
         with self.lock:
-            rows = self.db.execute(
-                "SELECT backend,payload,checksum FROM capture_calibrations WHERE identity_key=? ORDER BY saved DESC",
-                (identity_key,),
-            ).fetchall()
+            rows = list(
+                iter_rows(
+                    self.db.execute(
+                        "SELECT backend,payload,checksum FROM capture_calibrations WHERE identity_key=? ORDER BY saved DESC",
+                        (identity_key,),
+                    )
+                )
+            )
         for row in rows:
             try:
                 payload = json.loads(row["payload"])
@@ -20633,10 +21119,14 @@ class DataStoreWindowModelMixin:
             self.model_cache[gid] = item
             return item
         with self.lock:
-            backups = self.db.execute(
-                "SELECT id,created,prototype_count,validation,payload,checksum FROM model_backups WHERE game_id=? ORDER BY id DESC",
-                (gid,),
-            ).fetchall()
+            backups = list(
+                iter_rows(
+                    self.db.execute(
+                        "SELECT id,created,prototype_count,validation,payload,checksum FROM model_backups WHERE game_id=? ORDER BY id DESC",
+                        (gid,),
+                    )
+                )
+            )
         for backup in backups:
             recovered = self._row_model(backup, gid, True)
             if recovered:
@@ -20666,9 +21156,13 @@ class DataStoreWindowModelMixin:
 
     def load_trainable_model(self, gid):
         with self.lock:
-            rows = self.db.execute(
-                "SELECT slot,saved,payload,checksum FROM models WHERE game_id=? ORDER BY saved DESC", (gid,)
-            ).fetchall()
+            rows = list(
+                iter_rows(
+                    self.db.execute(
+                        "SELECT slot,saved,payload,checksum FROM models WHERE game_id=? ORDER BY saved DESC", (gid,)
+                    )
+                )
+            )
         invalid_complete = False
         for row in rows:
             complete = str(row["slot"]) == "complete"
@@ -20702,10 +21196,14 @@ class DataStoreWindowModelMixin:
 
     def model_metadata(self, gid):
         with self.lock:
-            rows = self.db.execute(
-                "SELECT slot,saved,created,prototype_count,validation FROM models WHERE game_id=? ORDER BY saved DESC",
-                (gid,),
-            ).fetchall()
+            rows = list(
+                iter_rows(
+                    self.db.execute(
+                        "SELECT slot,saved,created,prototype_count,validation FROM models WHERE game_id=? ORDER BY saved DESC",
+                        (gid,),
+                    )
+                )
+            )
         if not rows:
             return None
         parsed = []
@@ -20738,10 +21236,14 @@ class DataStoreWindowModelMixin:
 
     def restore_model_backup(self, gid):
         with self.lock:
-            backups = self.db.execute(
-                "SELECT id,created,prototype_count,validation,payload,checksum FROM model_backups WHERE game_id=? ORDER BY id DESC",
-                (gid,),
-            ).fetchall()
+            backups = list(
+                iter_rows(
+                    self.db.execute(
+                        "SELECT id,created,prototype_count,validation,payload,checksum FROM model_backups WHERE game_id=? ORDER BY id DESC",
+                        (gid,),
+                    )
+                )
+            )
         for backup in backups:
             item = self._row_model(backup, gid, True)
             if item:
@@ -20852,7 +21354,7 @@ class DataStoreOCRVisionMixin:
             + " ORDER BY updated DESC"
         )
         with self.lock:
-            rows = self.db.execute(query, (str(gid),)).fetchall()
+            rows = list(iter_rows(self.db.execute(query, (str(gid),))))
         result = []
         for row in rows:
             try:
@@ -20892,7 +21394,9 @@ class DataStoreOCRVisionMixin:
     def delete_ocr_region_by_overlap(self, gid, norm):
         removed = 0
         with self.lock, self.db:
-            rows = self.db.execute("SELECT id,region_norm FROM ocr_regions WHERE game_id=?", (str(gid),)).fetchall()
+            rows = list(
+                iter_rows(self.db.execute("SELECT id,region_norm FROM ocr_regions WHERE game_id=?", (str(gid),)))
+            )
             ids = []
             for row in rows:
                 try:
@@ -20943,10 +21447,14 @@ class DataStoreOCRVisionMixin:
 
     def load_ocr_experience_events(self, gid, limit=5000):
         with self.lock:
-            rows = self.db.execute(
-                "SELECT created,semantic_event,confidence,parsed,stable_frames,region_id,raw_text FROM ocr_observations WHERE game_id=? ORDER BY created DESC LIMIT ?",
-                (str(gid), safe_int(limit, 5000, 1, 50000)),
-            ).fetchall()
+            rows = list(
+                iter_rows(
+                    self.db.execute(
+                        "SELECT created,semantic_event,confidence,parsed,stable_frames,region_id,raw_text FROM ocr_observations WHERE game_id=? ORDER BY created DESC LIMIT ?",
+                        (str(gid), safe_int(limit, 5000, 1, 50000)),
+                    )
+                )
+            )
         result = []
         for row in reversed(rows):
             try:
@@ -21333,436 +21841,503 @@ class GameSelectionDialog:
         box.focus_set()
 
 
-class WindowSelectionDialog:
+@dataclass(slots=True)
+class WindowSelectionState:
+    closed: bool = False
+    background_keys: tuple = ("window_dialog_enumeration", "window_dialog_preview")
+    norm: list = field(default_factory=lambda: [0.0, 0.0, 1.0, 1.0])
+    auto: object = None
+    client: object = None
+    target_key: object = None
+    start: object = None
+    rect_id: object = None
+    image: object = None
+
+
+class WindowSelectionController:
+    MODE_MAP = {"不检查": "none", "包含": "contains", "前缀": "prefix", "精确": "exact"}
+    MODE_TEXT = {"auto": "自动区域", "full": "整个客户区", "manual": "手动调整"}
+
     def __init__(self, app):
         self.app = app
+        self.state = WindowSelectionState()
+        self.windows = []
+        self.widgets = {"refresh": None}
+        self.canvas_w = 640
+        self.canvas_h = 360
 
     def open(self):
-        app = self.app
-        if app.mode:
-            app.show_error("请先停止当前模式")
+        if self.app.mode:
+            self.app.show_error("请先停止当前模式")
             return
-        win = tk.Toplevel(app.root)
-        win.title("选择窗口")
-        fit_window(win, 1200, 760, 560, 400)
-        win.transient(app.root)
-        win.grab_set()
-        state = {
-            "closed": False,
-            "background_keys": ["window_dialog_enumeration", "window_dialog_preview"],
-            "norm": [0.0, 0.0, 1.0, 1.0],
-            "auto": None,
-            "client": None,
-            "target_key": None,
-            "start": None,
-            "rect_id": None,
-            "image": None,
-        }
-        frame = scrollable_frame(win, 16, True)
-        ttk.Label(frame, text="选择雷电模拟器窗口或其他窗口", font=("Microsoft YaHei UI", 13, "bold")).pack(
-            anchor="w", pady=(0, 6)
-        )
+        self._create_window()
+        self._build_header()
+        self._build_body()
+        self._bind_events()
+        self.refresh()
+        self.win.wait_visibility()
+        self.box.focus_set()
+
+    def _create_window(self):
+        self.win = tk.Toplevel(self.app.root)
+        self.win.title("选择窗口")
+        fit_window(self.win, 1200, 760, 560, 400)
+        self.win.transient(self.app.root)
+        self.win.grab_set()
+        self.frame = scrollable_frame(self.win, 16, True)
+
+    def _build_header(self):
         ttk.Label(
-            frame,
-            text=(
-                "默认自动选择最大可见游戏子窗口。开发者模式可设置标题规则、整个客户区或手动区域；点击一次总“确认”同时保存窗口身份和区域。"
-                if app.developer_mode
-                else "请选择窗口并点击“确认”；程序将自动选择客户区内的游戏内容区域。"
-            ),
+            self.frame,
+            text="选择雷电模拟器窗口或其他窗口",
+            font=("Microsoft YaHei UI", 13, "bold"),
+        ).pack(anchor="w", pady=(0, 6))
+        developer_text = (
+            "默认自动选择最大可见游戏子窗口。开发者模式可设置标题规则、整个客户区或手动区域；"
+            "点击一次总“确认”同时保存窗口身份和区域。"
+        )
+        normal_text = "请选择窗口并点击“确认”；程序将自动选择客户区内的游戏内容区域。"
+        ttk.Label(
+            self.frame,
+            text=developer_text if self.app.developer_mode else normal_text,
             wraplength=1140,
         ).pack(anchor="w", pady=(0, 10))
-        body = ttk.Frame(frame)
+
+    def _build_body(self):
+        body = ttk.Frame(self.frame)
         body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=5 if app.developer_mode else 1)
-        if app.developer_mode:
+        body.columnconfigure(0, weight=5 if self.app.developer_mode else 1)
+        if self.app.developer_mode:
             body.columnconfigure(1, weight=4)
         body.rowconfigure(0, weight=1)
         left = ttk.Frame(body)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         right = ttk.LabelFrame(body, text="游戏渲染区域", padding=10)
-        if app.developer_mode:
+        if self.app.developer_mode:
             right.grid(row=0, column=1, sticky="nsew")
+        self._build_window_list(left)
+        self._build_preview(right)
+        self._build_actions()
+
+    def _build_window_list(self, left):
         list_frame = ttk.Frame(left)
         list_frame.pack(fill="both", expand=True)
-        box = tk.Listbox(list_frame, exportselection=False, font=("Microsoft YaHei UI", 9))
-        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=box.yview)
-        box.configure(yscrollcommand=scroll.set)
-        box.pack(side="left", fill="both", expand=True)
+        self.box = tk.Listbox(list_frame, exportselection=False, font=("Microsoft YaHei UI", 9))
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.box.yview)
+        self.box.configure(yscrollcommand=scroll.set)
+        self.box.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         rule_frame = ttk.LabelFrame(left, text="可选标题规则", padding=8)
-        if app.developer_mode:
+        if self.app.developer_mode:
             rule_frame.pack(fill="x", pady=(8, 0))
-        rule_label = tk.StringVar(value="不检查")
-        rule_value = tk.StringVar(value="")
-        mode_map = {"不检查": "none", "包含": "contains", "前缀": "prefix", "精确": "exact"}
-        combo = ttk.Combobox(rule_frame, textvariable=rule_label, values=list(mode_map), state="readonly", width=10)
+        self.rule_label = tk.StringVar(value="不检查")
+        self.rule_value = tk.StringVar(value="")
+        combo = ttk.Combobox(
+            rule_frame,
+            textvariable=self.rule_label,
+            values=list(self.MODE_MAP),
+            state="readonly",
+            width=10,
+        )
         combo.pack(side="left")
-        entry = ttk.Entry(rule_frame, textvariable=rule_value)
-        entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
-        status = tk.StringVar(value="请选择窗口")
-        ttk.Label(left, textvariable=status, wraplength=620).pack(anchor="w", fill="x", pady=(8, 2))
-        preview_status = tk.StringVar(value="选择窗口后自动读取预览")
-        ttk.Label(right, textvariable=preview_status, wraplength=620).pack(anchor="w", fill="x", pady=(0, 8))
-        canvas_w = 640
-        canvas_h = 360
-        canvas = tk.Canvas(
-            right, width=canvas_w, height=canvas_h, bg="black", highlightthickness=1, highlightbackground="#777777"
+        ttk.Entry(rule_frame, textvariable=self.rule_value).pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(8, 0),
         )
-        canvas.pack(fill="both", expand=False)
+        self.status = tk.StringVar(value="请选择窗口")
+        ttk.Label(left, textvariable=self.status, wraplength=620).pack(
+            anchor="w",
+            fill="x",
+            pady=(8, 2),
+        )
+
+    def _build_preview(self, right):
+        self.preview_status = tk.StringVar(value="选择窗口后自动读取预览")
+        ttk.Label(right, textvariable=self.preview_status, wraplength=620).pack(
+            anchor="w",
+            fill="x",
+            pady=(0, 8),
+        )
+        self.canvas = tk.Canvas(
+            right,
+            width=self.canvas_w,
+            height=self.canvas_h,
+            bg="black",
+            highlightthickness=1,
+            highlightbackground="#777777",
+        )
+        self.canvas.pack(fill="both", expand=False)
         placeholder = bytes(PREVIEW_W * PREVIEW_H * 3)
-        ppm = (
-            b"P6\n" + str(PREVIEW_W).encode("ascii") + b" " + str(PREVIEW_H).encode("ascii") + b"\n255\n" + placeholder
-        )
-        image = tk.PhotoImage(data=base64.b64encode(ppm).decode("ascii"), format="PPM")
+        image = self._photo_image(placeholder)
         scaled = image.zoom(2, 2)
-        image_id = canvas.create_image(0, 0, image=scaled, anchor="nw")
-        state["image"] = (image, scaled)
-        region_mode = tk.StringVar(value="auto")
-        region_info = tk.StringVar(value="区域：未选择")
+        self.image_id = self.canvas.create_image(0, 0, image=scaled, anchor="nw")
+        self.state.image = (image, scaled)
+        self.region_mode = tk.StringVar(value="auto")
+        self.region_info = tk.StringVar(value="区域：未选择")
         options = ttk.Frame(right)
-        if app.developer_mode:
+        if self.app.developer_mode:
             options.pack(fill="x", pady=(8, 0))
-        ttk.Radiobutton(options, text="自动区域", value="auto", variable=region_mode).pack(side="left")
-        ttk.Radiobutton(options, text="整个客户区", value="full", variable=region_mode).pack(side="left", padx=8)
-        ttk.Radiobutton(options, text="手动调整", value="manual", variable=region_mode).pack(side="left")
-        ttk.Label(right, textvariable=region_info, wraplength=620).pack(anchor="w", fill="x", pady=(6, 0))
-        windows = []
-        widgets = {"refresh": None}
+        ttk.Radiobutton(options, text="自动区域", value="auto", variable=self.region_mode).pack(side="left")
+        ttk.Radiobutton(options, text="整个客户区", value="full", variable=self.region_mode).pack(
+            side="left",
+            padx=8,
+        )
+        ttk.Radiobutton(options, text="手动调整", value="manual", variable=self.region_mode).pack(side="left")
+        ttk.Label(right, textvariable=self.region_info, wraplength=620).pack(
+            anchor="w",
+            fill="x",
+            pady=(6, 0),
+        )
+        self.region_mode.trace_add("write", self.apply_region_mode)
 
-        def selected_item():
-            selection = box.curselection()
-            if not selection or selection[0] >= len(windows):
-                return None
-            return dict(windows[selection[0]])
-
-        def redraw():
-            if state["rect_id"] is not None:
-                try:
-                    canvas.delete(state["rect_id"])
-                except RECOVERABLE_ERRORS as error:
-                    record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
-            norm = list(state.get("norm") or [0.0, 0.0, 1.0, 1.0])
-            x, y, w, h = norm
-            state["rect_id"] = canvas.create_rectangle(
-                x * canvas_w, y * canvas_h, (x + w) * canvas_w, (y + h) * canvas_h, outline="#00ffff", width=3
-            )
-            client = state.get("client")
-            if client:
-                rect = apply_normalized_rect(client, norm)
-                region_info.set(
-                    "区域："
-                    + str(rect[2])
-                    + "×"
-                    + str(rect[3])
-                    + "；归一化："
-                    + ",".join(str(round(value, 4)) for value in norm)
-                    + "；模式："
-                    + {"auto": "自动区域", "full": "整个客户区", "manual": "手动调整"}.get(
-                        region_mode.get(), "手动调整"
-                    )
-                )
-            else:
-                region_info.set("区域：未选择")
-
-        def apply_region_mode(*args):
-            if state.get("client") is None:
-                return
-            mode = region_mode.get()
-            if mode == "auto" and isinstance(state.get("auto"), dict):
-                state["norm"] = list(state["auto"]["norm"])
-            elif mode == "full":
-                state["norm"] = [0.0, 0.0, 1.0, 1.0]
-            redraw()
-
-        region_mode.trace_add("write", apply_region_mode)
-
-        def load_preview(snapshot):
-            temporary = dict(snapshot)
-            temporary["content_rect_norm"] = [0.0, 0.0, 1.0, 1.0]
-            temporary["content_aspect"] = snapshot["selected_rect"][2] / max(1, snapshot["selected_rect"][3])
-            captured = app.api.capture_gray(temporary, False, True, True)
-            rgb = preview_rgb_bytes(captured.get("preview_rgb"))
-            if rgb is None:
-                raise CaptureUnavailable("预览截图尺寸无效")
-            return {"key": snapshot["_preview_key"], "rgb": rgb}
-
-        def apply_preview(result):
-            if state["closed"] or not win.winfo_exists() or result.get("key") != state.get("target_key"):
-                return
-            rgb = result["rgb"]
-            ppm_value = (
-                b"P6\n" + str(PREVIEW_W).encode("ascii") + b" " + str(PREVIEW_H).encode("ascii") + b"\n255\n" + rgb
-            )
-            loaded = tk.PhotoImage(data=base64.b64encode(ppm_value).decode("ascii"), format="PPM")
-            loaded_scaled = loaded.zoom(2, 2)
-            canvas.itemconfigure(image_id, image=loaded_scaled)
-            state["image"] = (loaded, loaded_scaled)
-            preview_status.set("预览读取完成；青色框内是学习、睡眠、训练和指导使用的唯一区域")
-
-        def preview_failed(error):
-            if state["closed"] or not win.winfo_exists():
-                return
-            preview_status.set("预览告警：" + str(error) + "；仍可使用自动区域、整个客户区或手动调整")
-
-        def prepare_selection(event=None):
-            item = selected_item()
-            if item is None:
-                return
-            existing = item.get("title_rule") if isinstance(item.get("title_rule"), dict) else None
-            if app.selected_window and item.get("hwnd") == app.selected_window.get("hwnd"):
-                existing = app.selected_window.get("title_rule")
-            if not isinstance(existing, dict):
-                existing = {"mode": "none", "value": ""}
-            reverse = {value: key for key, value in mode_map.items()}
-            rule_label.set(reverse.get(str(existing.get("mode", "none")), "不检查"))
-            rule_value.set(str(existing.get("value", "")))
-            try:
-                identity = app.api.target_identity(item)
-                client = app.api.client_rect(identity["hwnd"])
-                auto = app.api.auto_content_region(identity)
-                key = (
-                    str(identity.get("hwnd"))
-                    + "|"
-                    + str(identity.get("pid"))
-                    + "|"
-                    + str(identity.get("process_created"))
-                )
-                state["client"] = client
-                state["auto"] = auto
-                state["target_key"] = key
-                state["norm"] = list(auto["norm"])
-                region_mode.set("auto")
-                status.set("进程路径：" + str(identity.get("process_path", "读取失败")))
-                preview_status.set("正在后台读取预览…")
-                redraw()
-                snapshot = dict(identity)
-                snapshot["selected_rect"] = list(client)
-                snapshot["_preview_key"] = key
-                app.run_background(
-                    "window_dialog_preview",
-                    lambda snapshot=snapshot: load_preview(snapshot),
-                    apply_preview,
-                    preview_failed,
-                )
-            except RECOVERABLE_ERRORS as error:
-                state["client"] = None
-                state["auto"] = None
-                state["target_key"] = None
-                status.set("窗口身份或区域读取失败：" + str(error))
-                preview_status.set("无法读取预览")
-                redraw()
-
-        def load_windows():
-            hydrated = []
-            for item in app.api.enum_windows():
-                candidate = dict(item)
-                try:
-                    candidate = app.api.target_identity(candidate)
-                except RECOVERABLE_ERRORS as error:
-                    candidate["identity_error"] = str(error)
-                    app.store.log_error(
-                        "WINDOW_IDENTITY_READ_FAILED",
-                        error,
-                        window_identity={key: candidate.get(key) for key in ("hwnd", "pid", "class", "title")},
-                    )
-                hydrated.append(candidate)
-            return hydrated
-
-        def apply_windows(hydrated):
-            nonlocal windows
-            if state["closed"] or not win.winfo_exists():
-                return
-            windows = list(hydrated)
-            box.delete(0, "end")
-            selected_index = None
-            scored = [window_descriptor_score(app.window_recommendation, item) for item in windows]
-            recommended = None
-            if scored and max(scored) >= 8 and scored.count(max(scored)) == 1:
-                recommended = scored.index(max(scored))
-            for index, item in enumerate(windows):
-                prefix = ("[推荐] " if index == recommended else "") + ("[最小化] " if item.get("minimized") else "")
-                path = str(item.get("process_path", "路径读取失败"))
-                box.insert(
-                    "end",
-                    prefix
-                    + str(item.get("title", ""))
-                    + "  [PID "
-                    + str(item.get("pid", "-"))
-                    + "]  ["
-                    + str(item.get("class", ""))
-                    + "]  "
-                    + path,
-                )
-                if (
-                    app.selected_window
-                    and item.get("hwnd") == app.selected_window.get("hwnd")
-                    and item.get("pid") == app.selected_window.get("pid")
-                    and item.get("class") == app.selected_window.get("class")
-                ):
-                    selected_index = index
-            if selected_index is None:
-                selected_index = recommended
-            if selected_index is not None:
-                box.selection_set(selected_index)
-                box.see(selected_index)
-                prepare_selection()
-            status.set("已读取" + str(len(windows)) + "个可见窗口")
-            if widgets["refresh"] is not None:
-                widgets["refresh"].configure(state="normal")
-
-        def refresh_error(error):
-            if state["closed"] or not win.winfo_exists():
-                return
-            status.set("窗口读取失败：" + str(error))
-            if widgets["refresh"] is not None:
-                widgets["refresh"].configure(state="normal")
-            app.show_error(str(error))
-
-        def refresh():
-            if state["closed"]:
-                return
-            status.set("正在后台读取窗口和进程完整身份…")
-            box.delete(0, "end")
-            box.insert("end", "正在读取…")
-            if widgets["refresh"] is not None:
-                widgets["refresh"].configure(state="disabled")
-            app.run_background("window_dialog_enumeration", load_windows, apply_windows, refresh_error)
-
-        def press(event):
-            if state.get("client") is None:
-                return
-            region_mode.set("manual")
-            state["start"] = (max(0, min(canvas_w, event.x)), max(0, min(canvas_h, event.y)))
-
-        def drag(event):
-            if state.get("start") is None:
-                return
-            x0, y0 = state["start"]
-            x1 = max(0, min(canvas_w, event.x))
-            y1 = max(0, min(canvas_h, event.y))
-            left = min(x0, x1) / canvas_w
-            top = min(y0, y1) / canvas_h
-            width = abs(x1 - x0) / canvas_w
-            height = abs(y1 - y0) / canvas_h
-            if width >= 0.02 and height >= 0.02:
-                state["norm"] = [left, top, width, height]
-                redraw()
-
-        def release(event):
-            drag(event)
-            state["start"] = None
-
-        def confirm():
-            item = selected_item()
-            if item is None:
-                app.show_error("请先选择一个窗口")
-                return
-            try:
-                item = app.api.target_identity(item)
-                client = app.api.client_rect(item["hwnd"])
-                key = str(item.get("hwnd")) + "|" + str(item.get("pid")) + "|" + str(item.get("process_created"))
-                if key != state.get("target_key"):
-                    raise RuntimeError("窗口选择已变化，请等待区域信息刷新后再确认")
-                rect = apply_normalized_rect(client, state["norm"])
-                if rect[2] < FEATURE_W or rect[3] < FEATURE_H:
-                    raise RuntimeError("游戏区域过小")
-                item["integrity"] = app.api.validate_uipi(item)
-                item["selected_rect"] = list(client)
-                item["client_size"] = [int(client[2]), int(client[3])]
-                item["selected_dpi"] = app.api.dpi_for_window(item["hwnd"])
-                title_mode = mode_map.get(rule_label.get(), "none")
-                title_value = rule_value.get().strip()
-                if title_mode != "none" and not title_value:
-                    raise RuntimeError("标题规则不是“不检查”时必须填写匹配文本")
-                item["title_rule"] = {"mode": title_mode, "value": title_value}
-                source_mode = region_mode.get()
-                auto = state.get("auto") or {}
-                item.update(
-                    {
-                        "content_rect_norm": [round(value, 8) for value in state["norm"]],
-                        "content_aspect": round(rect[2] / max(1, rect[3]), 8),
-                        "content_source": (
-                            auto.get("source", "auto")
-                            if source_mode == "auto"
-                            else "full_client" if source_mode == "full" else "manual"
-                        ),
-                        "content_child_class": auto.get("child_class", "") if source_mode == "auto" else "",
-                        "window_rule_version": WINDOW_RULE_VERSION,
-                    }
-                )
-                item = app.api.target_identity(item)
-                app.api.validate_target(item, False)
-            except RECOVERABLE_ERRORS as error:
-                app.show_error(str(error))
-                return
-            previous = app.selected_window
-            clear_runtime_isolation()
-            app.window_generation += 1
-            item["window_generation"] = app.window_generation
-            app.selected_window = item
-            if not previous or any(
-                previous.get(key) != item.get(key)
-                for key in ("hwnd", "pid", "class", "process_created", "content_rect_norm")
-            ):
-                app.api.calibrations.pop(int(item["hwnd"]), None)
-            app.window_recommendation = app.store.save_window_descriptor(item)
-            identity = {
-                key: item.get(key)
-                for key in (
-                    "hwnd",
-                    "pid",
-                    "title",
-                    "class",
-                    "process_path",
-                    "process_created",
-                    "client_size",
-                    "selected_dpi",
-                    "content_rect_norm",
-                    "content_aspect",
-                )
-            }
-            identity_text = (
-                str(item.get("title", "")) + "|" + str(item.get("class", "")) + "|" + str(item.get("process_path", ""))
-            ).lower()
-            case = (
-                "ldplayer_confirmed"
-                if any(token in identity_text for token in ("ldplayer", "dnplayer", "雷电"))
-                else "ordinary_confirmed"
-            )
-            app.record_acceptance_case("窗口", case, "passed", identity)
-            app.api.reset_capture_backends(item)
-            app.api.reset_frame_history(item["hwnd"])
-            app._refresh_all()
-            app.status.set(
-                "一次确认已保存窗口身份和游戏内容区域："
-                + item["title"]
-                + "；区域模式="
-                + source_mode
-                + "；标题规则="
-                + item["title_rule"]["mode"]
-            )
-            app.close_dialog(win, state)
-
-        def refuse_close():
-            win.bell()
-            win.lift()
-            win.focus_force()
-
-        if app.developer_mode:
-            canvas.bind("<Button-1>", press)
-            canvas.bind("<B1-Motion>", drag)
-            canvas.bind("<ButtonRelease-1>", release)
-        tools = ttk.Frame(frame)
+    def _build_actions(self):
+        tools = ttk.Frame(self.frame)
         tools.pack(fill="x", pady=(10, 0))
-        if app.developer_mode:
-            widgets["refresh"] = ttk.Button(tools, text="刷新", command=refresh)
-            widgets["refresh"].pack(side="left")
-        ttk.Button(tools, text="确认", command=confirm).pack(side="right", padx=(6, 0))
-        box.bind("<<ListboxSelect>>", prepare_selection)
-        win.protocol("WM_DELETE_WINDOW", refuse_close)
-        refresh()
-        win.wait_visibility()
-        box.focus_set()
+        if self.app.developer_mode:
+            self.widgets["refresh"] = ttk.Button(tools, text="刷新", command=self.refresh)
+            self.widgets["refresh"].pack(side="left")
+        ttk.Button(tools, text="确认", command=self.confirm).pack(side="right", padx=(6, 0))
+
+    def _bind_events(self):
+        if self.app.developer_mode:
+            self.canvas.bind("<Button-1>", self.press)
+            self.canvas.bind("<B1-Motion>", self.drag)
+            self.canvas.bind("<ButtonRelease-1>", self.release)
+        self.box.bind("<<ListboxSelect>>", self.prepare_selection)
+        self.win.protocol("WM_DELETE_WINDOW", self.refuse_close)
+
+    @staticmethod
+    def _photo_image(rgb):
+        header = b"P6\n" + str(PREVIEW_W).encode("ascii") + b" "
+        ppm = header + str(PREVIEW_H).encode("ascii") + b"\n255\n" + rgb
+        return tk.PhotoImage(data=base64.b64encode(ppm).decode("ascii"), format="PPM")
+
+    def selected_item(self):
+        selection = self.box.curselection()
+        if not selection or selection[0] >= len(self.windows):
+            return None
+        return dict(self.windows[selection[0]])
+
+    def redraw(self):
+        if self.state.rect_id is not None:
+            try:
+                self.canvas.delete(self.state.rect_id)
+            except RECOVERABLE_ERRORS as error:
+                record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
+        x, y, width, height = list(self.state.norm or [0.0, 0.0, 1.0, 1.0])
+        self.state.rect_id = self.canvas.create_rectangle(
+            x * self.canvas_w,
+            y * self.canvas_h,
+            (x + width) * self.canvas_w,
+            (y + height) * self.canvas_h,
+            outline="#00ffff",
+            width=3,
+        )
+        if not self.state.client:
+            self.region_info.set("区域：未选择")
+            return
+        rect = apply_normalized_rect(self.state.client, self.state.norm)
+        norm_text = ",".join(str(round(value, 4)) for value in self.state.norm)
+        mode_text = self.MODE_TEXT.get(self.region_mode.get(), "手动调整")
+        self.region_info.set(f"区域：{rect[2]}×{rect[3]}；归一化：{norm_text}；模式：{mode_text}")
+
+    def apply_region_mode(self, *args):
+        if self.state.client is None:
+            return
+        mode = self.region_mode.get()
+        if mode == "auto" and isinstance(self.state.auto, dict):
+            self.state.norm = list(self.state.auto["norm"])
+        elif mode == "full":
+            self.state.norm = [0.0, 0.0, 1.0, 1.0]
+        self.redraw()
+
+    def load_preview(self, snapshot):
+        temporary = dict(snapshot)
+        temporary["content_rect_norm"] = [0.0, 0.0, 1.0, 1.0]
+        temporary["content_aspect"] = snapshot["selected_rect"][2] / max(1, snapshot["selected_rect"][3])
+        captured = self.app.api.capture_gray(temporary, False, True, True)
+        rgb = preview_rgb_bytes(captured.get("preview_rgb"))
+        if rgb is None:
+            raise CaptureUnavailable("预览截图尺寸无效")
+        return {"key": snapshot["_preview_key"], "rgb": rgb}
+
+    def apply_preview(self, result):
+        if self.state.closed or not self.win.winfo_exists() or result.get("key") != self.state.target_key:
+            return
+        loaded = self._photo_image(result["rgb"])
+        loaded_scaled = loaded.zoom(2, 2)
+        self.canvas.itemconfigure(self.image_id, image=loaded_scaled)
+        self.state.image = (loaded, loaded_scaled)
+        self.preview_status.set("预览读取完成；青色框内是学习、睡眠、训练和指导使用的唯一区域")
+
+    def preview_failed(self, error):
+        if self.state.closed or not self.win.winfo_exists():
+            return
+        self.preview_status.set(f"预览告警：{error}；仍可使用自动区域、整个客户区或手动调整")
+
+    def prepare_selection(self, event=None):
+        item = self.selected_item()
+        if item is None:
+            return
+        self._restore_rule(item)
+        try:
+            identity = self.app.api.target_identity(item)
+            client = self.app.api.client_rect(identity["hwnd"])
+            auto = self.app.api.auto_content_region(identity)
+            key = f"{identity.get('hwnd')}|{identity.get('pid')}|{identity.get('process_created')}"
+            self.state.client = client
+            self.state.auto = auto
+            self.state.target_key = key
+            self.state.norm = list(auto["norm"])
+            self.region_mode.set("auto")
+            self.status.set(f"进程路径：{identity.get('process_path', '读取失败')}")
+            self.preview_status.set("正在后台读取预览…")
+            self.redraw()
+            snapshot = dict(identity)
+            snapshot["selected_rect"] = list(client)
+            snapshot["_preview_key"] = key
+            self.app.run_background(
+                "window_dialog_preview",
+                lambda snapshot=snapshot: self.load_preview(snapshot),
+                self.apply_preview,
+                self.preview_failed,
+            )
+        except RECOVERABLE_ERRORS as error:
+            self.state.client = None
+            self.state.auto = None
+            self.state.target_key = None
+            self.status.set(f"窗口身份或区域读取失败：{error}")
+            self.preview_status.set("无法读取预览")
+            self.redraw()
+
+    def _restore_rule(self, item):
+        existing = item.get("title_rule") if isinstance(item.get("title_rule"), dict) else None
+        if self.app.selected_window and item.get("hwnd") == self.app.selected_window.get("hwnd"):
+            existing = self.app.selected_window.get("title_rule")
+        if not isinstance(existing, dict):
+            existing = {"mode": "none", "value": ""}
+        reverse = {value: key for key, value in self.MODE_MAP.items()}
+        self.rule_label.set(reverse.get(str(existing.get("mode", "none")), "不检查"))
+        self.rule_value.set(str(existing.get("value", "")))
+
+    def load_windows(self):
+        hydrated = []
+        for item in self.app.api.enum_windows():
+            candidate = dict(item)
+            try:
+                candidate = self.app.api.target_identity(candidate)
+            except RECOVERABLE_ERRORS as error:
+                candidate["identity_error"] = str(error)
+                identity = {key: candidate.get(key) for key in ("hwnd", "pid", "class", "title")}
+                self.app.store.log_error("WINDOW_IDENTITY_READ_FAILED", error, window_identity=identity)
+            hydrated.append(candidate)
+        return hydrated
+
+    def apply_windows(self, hydrated):
+        if self.state.closed or not self.win.winfo_exists():
+            return
+        self.windows = list(hydrated)
+        self.box.delete(0, "end")
+        recommended = self._recommended_index()
+        selected_index = None
+        for index, item in enumerate(self.windows):
+            self.box.insert("end", self._window_label(item, index == recommended))
+            if self._matches_selected(item):
+                selected_index = index
+        if selected_index is None:
+            selected_index = recommended
+        if selected_index is not None:
+            self.box.selection_set(selected_index)
+            self.box.see(selected_index)
+            self.prepare_selection()
+        self.status.set(f"已读取{len(self.windows)}个可见窗口")
+        self._set_refresh_state("normal")
+
+    def _recommended_index(self):
+        scores = [window_descriptor_score(self.app.window_recommendation, item) for item in self.windows]
+        if scores and max(scores) >= 8 and scores.count(max(scores)) == 1:
+            return scores.index(max(scores))
+        return None
+
+    @staticmethod
+    def _window_label(item, recommended):
+        prefix = ("[推荐] " if recommended else "") + ("[最小化] " if item.get("minimized") else "")
+        return (
+            f"{prefix}{item.get('title', '')}  [PID {item.get('pid', '-')}]  "
+            f"[{item.get('class', '')}]  {item.get('process_path', '路径读取失败')}"
+        )
+
+    def _matches_selected(self, item):
+        selected = self.app.selected_window
+        return bool(
+            selected
+            and item.get("hwnd") == selected.get("hwnd")
+            and item.get("pid") == selected.get("pid")
+            and item.get("class") == selected.get("class")
+        )
+
+    def refresh_error(self, error):
+        if self.state.closed or not self.win.winfo_exists():
+            return
+        self.status.set(f"窗口读取失败：{error}")
+        self._set_refresh_state("normal")
+        self.app.show_error(str(error))
+
+    def refresh(self):
+        if self.state.closed:
+            return
+        self.status.set("正在后台读取窗口和进程完整身份…")
+        self.box.delete(0, "end")
+        self.box.insert("end", "正在读取…")
+        self._set_refresh_state("disabled")
+        self.app.run_background(
+            "window_dialog_enumeration",
+            self.load_windows,
+            self.apply_windows,
+            self.refresh_error,
+        )
+
+    def _set_refresh_state(self, value):
+        if self.widgets["refresh"] is not None:
+            self.widgets["refresh"].configure(state=value)
+
+    def press(self, event):
+        if self.state.client is None:
+            return
+        self.region_mode.set("manual")
+        self.state.start = (
+            max(0, min(self.canvas_w, event.x)),
+            max(0, min(self.canvas_h, event.y)),
+        )
+
+    def drag(self, event):
+        if self.state.start is None:
+            return
+        x0, y0 = self.state.start
+        x1 = max(0, min(self.canvas_w, event.x))
+        y1 = max(0, min(self.canvas_h, event.y))
+        left = min(x0, x1) / self.canvas_w
+        top = min(y0, y1) / self.canvas_h
+        width = abs(x1 - x0) / self.canvas_w
+        height = abs(y1 - y0) / self.canvas_h
+        if width >= 0.02 and height >= 0.02:
+            self.state.norm = [left, top, width, height]
+            self.redraw()
+
+    def release(self, event):
+        self.drag(event)
+        self.state.start = None
+
+    def confirm(self):
+        item = self.selected_item()
+        if item is None:
+            self.app.show_error("请先选择一个窗口")
+            return
+        try:
+            item, source_mode, rect = self._validated_selection(item)
+        except RECOVERABLE_ERRORS as error:
+            self.app.show_error(str(error))
+            return
+        self._commit_selection(item, source_mode, rect)
+
+    def _validated_selection(self, item):
+        item = self.app.api.target_identity(item)
+        client = self.app.api.client_rect(item["hwnd"])
+        key = f"{item.get('hwnd')}|{item.get('pid')}|{item.get('process_created')}"
+        if key != self.state.target_key:
+            raise RuntimeError("窗口选择已变化，请等待区域信息刷新后再确认")
+        rect = apply_normalized_rect(client, self.state.norm)
+        if rect[2] < FEATURE_W or rect[3] < FEATURE_H:
+            raise RuntimeError("游戏区域过小")
+        item["integrity"] = self.app.api.validate_uipi(item)
+        item["selected_rect"] = list(client)
+        item["client_size"] = [int(client[2]), int(client[3])]
+        item["selected_dpi"] = self.app.api.dpi_for_window(item["hwnd"])
+        title_mode = self.MODE_MAP.get(self.rule_label.get(), "none")
+        title_value = self.rule_value.get().strip()
+        if title_mode != "none" and not title_value:
+            raise RuntimeError("标题规则不是“不检查”时必须填写匹配文本")
+        item["title_rule"] = {"mode": title_mode, "value": title_value}
+        source_mode = self.region_mode.get()
+        auto = self.state.auto or {}
+        item.update(self._region_payload(rect, source_mode, auto))
+        item = self.app.api.target_identity(item)
+        self.app.api.validate_target(item, False)
+        return item, source_mode, rect
+
+    def _region_payload(self, rect, source_mode, auto):
+        source = auto.get("source", "auto")
+        if source_mode == "full":
+            source = "full_client"
+        elif source_mode == "manual":
+            source = "manual"
+        return {
+            "content_rect_norm": [round(value, 8) for value in self.state.norm],
+            "content_aspect": round(rect[2] / max(1, rect[3]), 8),
+            "content_source": source,
+            "content_child_class": auto.get("child_class", "") if source_mode == "auto" else "",
+            "window_rule_version": WINDOW_RULE_VERSION,
+        }
+
+    def _commit_selection(self, item, source_mode, rect):
+        previous = self.app.selected_window
+        clear_runtime_isolation()
+        self.app.window_generation += 1
+        item["window_generation"] = self.app.window_generation
+        self.app.selected_window = item
+        changed = not previous or any(
+            previous.get(key) != item.get(key)
+            for key in ("hwnd", "pid", "class", "process_created", "content_rect_norm")
+        )
+        if changed:
+            self.app.api.calibrations.pop(int(item["hwnd"]), None)
+        self.app.window_recommendation = self.app.store.save_window_descriptor(item)
+        identity = self._identity_payload(item)
+        identity_text = f"{item.get('title', '')}|{item.get('class', '')}|{item.get('process_path', '')}".lower()
+        case = "ldplayer_confirmed" if any(
+            token in identity_text for token in ("ldplayer", "dnplayer", "雷电")
+        ) else "ordinary_confirmed"
+        self.app.record_acceptance_case("窗口", case, "passed", identity)
+        self.app.api.reset_capture_backends(item)
+        self.app.api.reset_frame_history(item["hwnd"])
+        self.app._refresh_all()
+        message = (
+            f"一次确认已保存窗口身份和游戏内容区域：{item['title']}；"
+            f"区域模式={source_mode}；标题规则={item['title_rule']['mode']}"
+        )
+        self.app.status.set(message)
+        self.app.close_dialog(self.win, self.state)
+
+    @staticmethod
+    def _identity_payload(item):
+        keys = (
+            "hwnd",
+            "pid",
+            "title",
+            "class",
+            "process_path",
+            "process_created",
+            "client_size",
+            "selected_dpi",
+            "content_rect_norm",
+            "content_aspect",
+        )
+        return {key: item.get(key) for key in keys}
+
+    def refuse_close(self):
+        self.win.bell()
+        self.win.lift()
+        self.win.focus_force()
+
+
+class WindowSelectionDialog:
+    def __init__(self, app):
+        self.app = app
+
+    def open(self):
+        return WindowSelectionController(self.app).open()
 
 
 class TaskSettingsDialog:
@@ -22148,8 +22723,10 @@ class TaskSettingsDialog:
                     if task_id not in tasks:
                         app.store.delete_task(game["id"], task_id)
                 app._refresh_all()
+                message = "配置已保存。安全配置或状态定义改变后，必须重新睡眠才能训练。"
+                app.status.set(message)
+                app.show_main_confirmation("任务与安全", message)
                 app.close_dialog(win, state)
-                app.show_info("任务与安全", "配置已保存。安全配置或状态定义改变后，必须重新睡眠才能训练。")
             except RECOVERABLE_ERRORS as error:
                 feedback.set("无法保存：" + str(error))
 
@@ -22465,9 +23042,17 @@ class AppUiService(AppServiceBase):
             if state.get("closed"):
                 return False
             state["closed"] = True
-            for key in state.get("background_keys", []):
-                with self.background_lock:
-                    self.background_generations[str(key)] += 1
+            background_keys = state.get("background_keys", [])
+        elif state is not None and hasattr(state, "closed"):
+            if state.closed:
+                return False
+            state.closed = True
+            background_keys = getattr(state, "background_keys", ())
+        else:
+            background_keys = ()
+        for key in background_keys:
+            with self.background_lock:
+                self.background_generations[str(key)] += 1
         try:
             win.grab_release()
         except RECOVERABLE_ERRORS as error:
@@ -22514,7 +23099,7 @@ class AppUiService(AppServiceBase):
                 self.root.update_idletasks()
             except RECOVERABLE_ERRORS:
                 break
-            time.sleep(0.03)
+            interruptible_wait(self.host.stop_event, 0.03)
         previous_grab = None
         try:
             previous_grab = self.root.grab_current()
@@ -23063,18 +23648,8 @@ class AppUiService(AppServiceBase):
             def load():
                 stats = self.store.sample_stats(game["id"])
                 model = self.store.load_model(game["id"])
-                return (
-                    "游戏："
-                    + game["name"]
-                    + "\n有效样本："
-                    + str(stats["valid"])
-                    + "\n异常行："
-                    + str(stats["invalid"])
-                    + "\n数据大小："
-                    + str(round(stats["bytes"] / 1024, 1))
-                    + " KB\n模型原型："
-                    + str(len(model.get("prototypes", [])) if model else 0)
-                )
+                prototype_count = len(model.get("prototypes", [])) if model else 0
+                return UserMessageCatalog.data_summary(game["name"], stats, prototype_count)
 
             def apply(value):
                 if not state["closed"] and win.winfo_exists():
@@ -23088,14 +23663,9 @@ class AppUiService(AppServiceBase):
 
         def compact():
             result = self.store.compact_samples(game["id"])
-            message = (
-                "数据整理完成：按动作种类、按钮、规范动作与视觉多样性保留"
-                + str(result["kept"])
-                + "，移除"
-                + str(result["removed"])
-            )
+            message = UserMessageCatalog.compaction(result)
             self.status.set(message)
-            self.show_info("数据压缩完成", message)
+            self.show_main_confirmation("数据压缩完成", message)
             refresh()
             self._refresh_all()
 
@@ -23103,13 +23673,15 @@ class AppUiService(AppServiceBase):
             self.store.restore_model_backup(game["id"])
             message = "已从数据库中的完整校验备份恢复模型"
             self.status.set(message)
-            self.show_info("模型恢复完成", message)
+            self.show_main_confirmation("模型恢复完成", message)
             refresh()
             self._refresh_all()
 
         def backup():
             path = self.store.create_recovery_backup("manual")
-            self.show_info("恢复备份已创建", "数据库、WAL与SHM恢复备份已保存到：" + str(path))
+            message = UserMessageCatalog.backup_created(path)
+            self.status.set(message)
+            self.show_main_confirmation("恢复备份已创建", message)
 
         def clear():
             if not self.confirm_dialog("清空数据", "确认清空当前游戏的全部样本、模型和备份吗？此操作不可撤销。"):
@@ -23117,8 +23689,8 @@ class AppUiService(AppServiceBase):
             self.store.clear_game_data(game["id"])
             message = "已清空当前游戏的样本、模型、备份和拒绝记录"
             self.status.set(message)
+            self.show_main_confirmation("数据清空完成", message)
             self.close_dialog(win, state)
-            self.show_info("数据清空完成", message)
             self._refresh_all()
 
         buttons = ttk.Frame(frame)
@@ -23759,7 +24331,7 @@ class AppLifecycleService(AppServiceBase):
             and self.stop_event
             and not self.stop_event.is_set()
         ):
-            time.sleep(0.01)
+            interruptible_wait(None, 0.01)
 
     def close(self):
         if self.closing:
@@ -23846,6 +24418,567 @@ class AppLifecycleService(AppServiceBase):
         best_effort_cleanup("ROOT_DESTROY_FAILED", lambda: self.root.destroy())
 
 
+@dataclass(frozen=True, slots=True)
+class CandidateMatch:
+    combined: float
+    raw: float
+    temporal: float
+    object_distance: float
+    proto: dict
+    prefilter: float
+    coordinate: dict
+    semantic: dict
+    skill: object
+    prototype_cluster_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class CandidatePolicyEstimate:
+    scores: CandidateScores
+    failure: float
+    learned_uncertainty: float
+    awr_weight: float
+    neural_prediction: dict
+    experience_count: int
+    advantage: float
+
+
+class ActionCandidateRanker:
+    def __init__(
+        self,
+        service,
+        feature,
+        prototypes,
+        last_action_signature,
+        full_limit,
+        temporal_context,
+        query_coarse,
+        query_neural,
+        semantic_targets,
+        task_id,
+    ):
+        self.service = service
+        self.feature = feature
+        self.prototypes = prototypes
+        self.last_action_signature = last_action_signature
+        self.full_limit = full_limit
+        self.temporal_context = temporal_context or {}
+        self.query_coarse = query_coarse
+        self.query_neural = query_neural
+        self.semantic_targets = semantic_targets
+        self.task_id = task_id
+
+    def rank(self):
+        if not feature_valid(self.feature):
+            return []
+        self._prepare_query()
+        visual_matches = self._visual_matches()
+        self._prepare_policy_models()
+        grouped = self._group_matches(visual_matches)
+        self.total_support = sum(
+            max(
+                1,
+                max(
+                    int(item.proto.get("action_support", item.proto.get("support", 0)))
+                    for item in items
+                ),
+            )
+            for items in grouped.values()
+        )
+        result = [self._score_group(decision_id, items) for decision_id, items in grouped.items()]
+        result.sort(key=lambda item: (item["score"], item["visual_score"], -item["support"]))
+        self._annotate_best_clusters(result)
+        return result
+
+    def _prepare_query(self):
+        self.query_temporal = temporal_from_context(self.temporal_context)
+        runtime = getattr(self.service, "active_model_runtime", {}) or {}
+        temporal_seed = safe_int(runtime.get("temporal_encoder_seed", 0), 0, 0, 2**63 - 1)
+        self.query_embedding = temporal_state_embedding(self.query_temporal, temporal_seed)
+        self.query_objects = (
+            list(self.semantic_targets)
+            if isinstance(self.semantic_targets, (list, tuple))
+            else None
+        )
+        if not isinstance(self.query_coarse, (bytes, bytearray)) or len(self.query_coarse) != COARSE_LEN:
+            self.query_coarse = coarse_feature(self.feature)
+        self.query_coarse = bytes(self.query_coarse)
+        self.backend = str(self.query_temporal.get("capture_method", "unknown"))
+        requested = int(self.full_limit)
+        configured = VersionedThresholdConfig.candidate_full_limit
+        self.exact_limit = max(12, min(configured, requested if requested > 0 else configured))
+        active = isinstance(runtime, dict) and runtime.get("prototypes") is self.prototypes
+        self.runtime_model = runtime if active else {}
+        self.active_runtime = active
+        self.active_task_id = normalized_identifier(
+            self.task_id or self.runtime_model.get("default_task_id"),
+            "default",
+            96,
+        )
+        self.task_goal = self._task_goal()
+        query_frame = {
+            **self.temporal_context,
+            "f": self.feature,
+            "coarse": self.query_coarse,
+            "neural_f": self.query_neural,
+            "semantic_targets": self.query_objects or [],
+            "feature_version": FEATURE_ALGORITHM_VERSION,
+        }
+        self.frame_cache_key = frame_computation_key(query_frame)
+        context = {**self.temporal_context, "task_id": self.active_task_id, "task_goal": self.task_goal}
+        task = {"task_id": self.active_task_id, "goal": self.task_goal}
+        self.query_observation = objectized_observation(query_frame, context, task)
+        self.query_state = self.query_observation.state_id
+
+    def _task_goal(self):
+        task_goal = str(self.temporal_context.get("task_goal", ""))
+        if task_goal:
+            return task_goal
+        definitions = self.runtime_model.get("task_definitions", [])
+        for definition in definitions if isinstance(definitions, list) else []:
+            if not isinstance(definition, dict):
+                continue
+            task_id = normalized_identifier(definition.get("task_id"), "default", 96)
+            if task_id == self.active_task_id:
+                return str(definition.get("goal", ""))
+        return ""
+
+    def _visual_matches(self):
+        model_token = str(self.runtime_model.get("runtime_token", ""))
+        if len(model_token) != 64:
+            model_token = prototype_collection_checksum(self.prototypes)
+        feature_digest = hashlib.blake2b(feature_bytes(self.feature), digest_size=16).digest()
+        neural_digest = b""
+        if feature_valid(self.query_neural):
+            neural_digest = hashlib.blake2b(feature_bytes(self.query_neural), digest_size=8).digest()
+        coarse_digest = hashlib.blake2b(self.query_coarse, digest_size=8).digest()
+        cache_key = (
+            "visual-v6",
+            self.frame_cache_key,
+            model_token,
+            feature_digest,
+            neural_digest,
+            coarse_digest,
+            self.backend,
+            self.exact_limit,
+        )
+        cached = self.service.candidate_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        matches = self._compute_visual_matches()
+        immutable = tuple(
+            (safe_int(item.get("index"), -1), safe_float(item.get("exact_score"), float("inf")))
+            for item in matches
+            if isinstance(item, dict)
+        )
+        self.service.candidate_cache[cache_key] = immutable
+        return immutable
+
+    def _compute_visual_matches(self):
+        worker = getattr(self.service, "ai_worker", None)
+        worker_ready = bool(
+            self.active_runtime
+            and worker is not None
+            and worker.alive()
+            and worker.status.get("capabilities", {}).get("candidate_rank")
+        )
+        if worker_ready:
+            return worker.candidate_matches(
+                self.runtime_model,
+                self.feature,
+                self.query_coarse,
+                self.backend,
+                self.exact_limit,
+            )
+        runtime_index = self.runtime_model.get("runtime_index", {})
+        if not self.active_runtime:
+            runtime_index = build_candidate_runtime_index(self.prototypes, False)
+        return candidate_visual_matches(
+            runtime_index,
+            self.feature,
+            self.query_coarse,
+            self.backend,
+            self.exact_limit,
+        )
+
+    def _prepare_policy_models(self):
+        self.sequence_model = self.runtime_model.get("sequence_model", {})
+        self.sequence_candidate_ids = {
+            str(candidate)
+            for choices in self.sequence_model.values()
+            if isinstance(choices, dict)
+            for candidate in choices
+        }
+        self.experience_model = self.runtime_model.get("experience_model", {})
+        self.behavior_model = self.runtime_model.get("behavior_model", {})
+        self.value_model = self.runtime_model.get("value_model", {})
+        self.risk_model = self.runtime_model.get("risk_model", {})
+        neural_trained = bool(
+            isinstance(self.value_model, dict)
+            and isinstance(self.value_model.get("neural_bundle"), dict)
+            and self.value_model.get("neural_bundle", {}).get("trained")
+        )
+        audit_trained = bool(
+            isinstance(self.behavior_model, dict)
+            and self.behavior_model.get("state_action")
+            and isinstance(self.value_model, dict)
+            and self.value_model.get("state_action")
+            and isinstance(self.risk_model, dict)
+            and self.risk_model.get("state_action")
+        )
+        self.trained_decision = neural_trained or audit_trained
+        self.policy_weights = normalized_policy_score_weights(self.runtime_model.get("policy_score_weights", {}))
+        self.recent_actions = self.query_temporal.get("recent_actions", [self.last_action_signature])
+
+    def _group_matches(self, visual_matches):
+        grouped = defaultdict(list)
+        for position, (index, raw_prefilter) in enumerate(visual_matches):
+            if position % 8 == 0 and getattr(self.service, "stop_event", None) is not None:
+                if self.service.should_stop():
+                    return {}
+            if index < 0 or index >= len(self.prototypes):
+                continue
+            proto = self.prototypes[index]
+            if not self._prototype_allowed(proto):
+                continue
+            coordinate = normalize_action(proto.get("a"))
+            semantic = normalize_semantic_action(proto.get("semantic_action"))
+            semantic = semantic or semantic_action_from_coordinate(coordinate)
+            if coordinate is None or semantic is None:
+                continue
+            skill = semantic_skill(semantic, str(self.query_temporal.get("subgoal_id") or "advance_goal"))
+            match = self._candidate_match(proto, coordinate, semantic, skill, raw_prefilter)
+            grouped[skill.key()].append(match)
+        return grouped
+
+    def _prototype_allowed(self, proto):
+        if "authorized" in proto and not proto.get("authorized"):
+            return False
+        methods = frozenset(str(value) for value in proto.get("capture_methods", frozenset()))
+        return not methods or self.backend in methods
+
+    def _candidate_match(self, proto, coordinate, semantic, skill, raw_prefilter):
+        raw = dual_feature_distance(self.feature, proto.get("f"), self.query_neural, proto.get("neural_f"))
+        object_distance = 0.0
+        if self.query_objects is not None:
+            object_distance = object_set_distance(self.query_objects, proto.get("semantic_targets", []))
+        expected = str(proto.get("previous_action", ""))
+        previous_penalty = 0.0
+        if expected and self.last_action_signature and expected != self.last_action_signature:
+            previous_penalty = min(120.0, raw * 0.08 + 18.0)
+        temporal_distance_value = self._temporal_distance(proto)
+        threshold = float(proto.get("threshold", 100.0))
+        temporal_penalty = temporal_distance_value * max(45.0, threshold * 0.30)
+        object_penalty = object_distance * max(25.0, threshold * 0.22)
+        sequence_penalty = self._sequence_penalty(proto, skill.key())
+        prototype_cluster_id = str(proto.get("cluster_id", proto.get("action_signature", "")))
+        return CandidateMatch(
+            raw + previous_penalty + temporal_penalty + object_penalty + sequence_penalty,
+            raw,
+            temporal_distance_value,
+            object_distance,
+            proto,
+            raw_prefilter,
+            coordinate,
+            semantic,
+            skill,
+            prototype_cluster_id,
+        )
+
+    def _temporal_distance(self, proto):
+        embedding = proto.get("temporal_embedding")
+        if isinstance(embedding, (list, tuple)) and embedding:
+            return temporal_embedding_distance(self.query_embedding, embedding)
+        temporal = proto.get("temporal_cached") or temporal_from_context(proto.get("temporal", {}))
+        return temporal_distance(self.query_temporal, temporal)
+
+    def _sequence_penalty(self, proto, decision_id):
+        legacy_id = str(proto.get("cluster_id", proto.get("action_signature", "")))
+        if decision_id in self.sequence_candidate_ids:
+            candidate_id = decision_id
+        elif legacy_id in self.sequence_candidate_ids:
+            candidate_id = legacy_id
+        else:
+            return 0.0
+        return calculate_sequence_penalty(
+            self.recent_actions,
+            candidate_id,
+            self.sequence_model,
+            self.active_task_id,
+        )
+
+    def _score_group(self, decision_id, matches):
+        ordered = sorted(matches, key=lambda item: item.combined)
+        best = ordered[0]
+        visual_score = best.combined
+        if len(ordered) > 1:
+            visual_score = 0.88 * best.combined + 0.12 * ordered[1].combined
+        support = max(
+            int(item.proto.get("action_support", item.proto.get("support", 0)))
+            for item in ordered
+        )
+        total_support = self._total_support()
+        estimate = self._policy_estimate(decision_id, best, support, total_support)
+        policy_adjustment, decision_mode = self._policy_adjustment(estimate.scores)
+        grounding = None
+        if self.query_objects is not None:
+            grounding = ground_semantic_action(best.semantic, self.query_objects, True)
+        grounding_meta = grounding.get("grounding", {}) if isinstance(grounding, dict) else {}
+        semantic_available = bool(grounding and grounding.get("grounded_action"))
+        if self.query_objects is None:
+            semantic_available = True
+        return self._result_payload(
+            decision_id,
+            ordered,
+            best,
+            support,
+            visual_score,
+            estimate,
+            policy_adjustment,
+            decision_mode,
+            grounding,
+            grounding_meta,
+            semantic_available,
+        )
+
+    def _total_support(self):
+        return max(1, self.total_support)
+
+    def _policy_rows(self, decision_id):
+        legacy = policy_experience_row(
+            self.experience_model,
+            self.query_state,
+            decision_id,
+            self.active_task_id,
+        )
+        behavior = legacy
+        if self.behavior_model:
+            behavior = policy_experience_row(
+                self.behavior_model,
+                self.query_state,
+                decision_id,
+                self.active_task_id,
+            )
+        value = legacy
+        if self.value_model:
+            value = policy_experience_row(
+                self.value_model,
+                self.query_state,
+                decision_id,
+                self.active_task_id,
+            )
+        risk = legacy
+        if self.risk_model:
+            risk = policy_experience_row(
+                self.risk_model,
+                self.query_state,
+                decision_id,
+                self.active_task_id,
+            )
+        return legacy, behavior, value, risk
+
+    def _policy_estimate(self, decision_id, best, support, total_support):
+        legacy, behavior, value, risk = self._policy_rows(decision_id)
+        awr_weight = safe_float(behavior.get("awr_weight", legacy.get("awr_weight", 1.0)), 1.0, 0.01, 100.0)
+        empirical = support / max(1, total_support)
+        behavior_score = safe_float(
+            behavior.get("probability", behavior.get("bc_probability", empirical * math.sqrt(awr_weight))),
+            empirical,
+            0.0,
+            1.0,
+        )
+        value_score = safe_float(
+            value.get("expected_return", value.get("q_value", value.get("mean_reward", legacy.get("q_value", 0.0)))),
+            0.0,
+        )
+        success_score = safe_float(
+            value.get("success_probability", legacy.get("success_probability", 0.0)),
+            0.0,
+            0.0,
+            1.0,
+        )
+        failure_score = safe_float(
+            value.get("failure_probability", risk.get("failure_probability", legacy.get("failure_probability", 0.0))),
+            0.0,
+            0.0,
+            1.0,
+        )
+        risk_score = safe_float(
+            risk.get(
+                "risk_probability",
+                risk.get("failure_probability", legacy.get("risk_probability", failure_score)),
+            ),
+            failure_score,
+            0.0,
+            1.0,
+        )
+        uncertainty = safe_float(
+            risk.get("uncertainty", value.get("uncertainty", legacy.get("uncertainty", 1.0 if not legacy else 0.5))),
+            0.5,
+            0.0,
+            1.0,
+        )
+        neural = self._neural_prediction(decision_id)
+        behavior_score, value_score, success_score, failure_score, risk_score, uncertainty, awr_weight = (
+            self._blend_neural(
+                neural,
+                behavior_score,
+                value_score,
+                success_score,
+                failure_score,
+                risk_score,
+                uncertainty,
+                awr_weight,
+            )
+        )
+        ood = self._ood_score(best, support, uncertainty)
+        scores = CandidateScores(behavior_score, value_score, success_score, risk_score, ood)
+        advantage = safe_float(neural.get("advantage", behavior.get("advantage", legacy.get("advantage", 0.0))), 0.0)
+        count = safe_int(legacy.get("count", behavior.get("count", 0)), 0)
+        return CandidatePolicyEstimate(scores, failure_score, uncertainty, awr_weight, neural, count, advantage)
+
+    def _neural_prediction(self, decision_id):
+        if not isinstance(self.value_model, dict):
+            return {}
+        return neural_offline_policy_prediction(
+            self.value_model,
+            self.query_observation.to_dict(),
+            decision_id,
+            self.active_task_id,
+        )
+
+    def _blend_neural(self, neural, behavior, value, success, failure, risk, uncertainty, awr_weight):
+        if not neural:
+            return behavior, value, success, failure, risk, uncertainty, awr_weight
+        behavior = 0.82 * safe_float(neural.get("behavior_probability"), behavior, 0.0, 1.0) + 0.18 * behavior
+        value = 0.82 * safe_float(neural.get("q_value"), value) + 0.18 * value
+        success = 0.82 * safe_float(neural.get("success_probability"), success, 0.0, 1.0) + 0.18 * success
+        failure = 0.82 * safe_float(neural.get("failure_probability"), failure, 0.0, 1.0) + 0.18 * failure
+        neural_risk = 0.82 * safe_float(neural.get("risk_probability"), risk, 0.0, 1.0) + 0.18 * risk
+        risk = max(risk, neural_risk)
+        uncertainty = max(uncertainty, safe_float(neural.get("uncertainty"), uncertainty, 0.0, 1.0))
+        temperature = safe_float(self.value_model.get("neural_bundle", {}).get("awr_temperature", 0.5), 0.5)
+        scaled_advantage = safe_float(neural.get("advantage"), 0.0) / max(0.05, temperature)
+        awr_weight = math.exp(max(-5.0, min(5.0, scaled_advantage)))
+        return behavior, value, success, failure, risk, uncertainty, awr_weight
+
+    @staticmethod
+    def _ood_score(best, support, learned_uncertainty):
+        threshold = max(1.0, safe_float(best.proto.get("threshold", 100.0), 100.0))
+        distance_ood = max(0.0, min(1.0, best.raw / threshold))
+        temporal_threshold = max(0.05, safe_float(best.proto.get("temporal_threshold", 0.25), 0.25))
+        temporal_ood = max(0.0, min(1.0, best.temporal / temporal_threshold))
+        object_ood = max(0.0, min(1.0, best.object_distance))
+        support_ood = 1.0 / math.sqrt(max(1, support))
+        return max(
+            0.0,
+            min(
+                1.0,
+                0.34 * distance_ood
+                + 0.22 * temporal_ood
+                + 0.20 * object_ood
+                + 0.10 * support_ood
+                + 0.14 * learned_uncertainty,
+            ),
+        )
+
+    def _policy_adjustment(self, scores):
+        q_normalized = math.tanh(scores.value / 2.0)
+        if self.trained_decision:
+            learned_utility = (
+                1.35 * math.log(max(1e-6, scores.behavior))
+                + 1.05 * q_normalized
+                + 0.85 * scores.success
+                - 1.5 * scores.risk
+                - 1.1 * scores.ood
+            )
+            return -45.0 * learned_utility, "calibrated_skill_models"
+        adjustment = (
+            -self.policy_weights["bc"] * scores.behavior
+            - self.policy_weights["q"] * q_normalized
+            - self.policy_weights["success"] * scores.success
+            + self.policy_weights["risk"] * scores.risk
+            + self.policy_weights["ood"] * scores.ood
+        )
+        return adjustment, "cold_start_skill_weights"
+
+    def _result_payload(
+        self,
+        decision_id,
+        items,
+        best,
+        support,
+        visual_score,
+        estimate,
+        policy_adjustment,
+        decision_mode,
+        grounding,
+        grounding_meta,
+        semantic_available,
+    ):
+        scores = estimate.scores
+        semantic = best.semantic
+        return {
+            "cluster_id": decision_id,
+            "prototype_cluster_id": best.prototype_cluster_id,
+            "skill_id": best.skill.skill_id,
+            "skill_key": decision_id,
+            "skill_parameters": dict(best.skill.parameters),
+            "subgoal_id": best.skill.subgoal_id,
+            "canonical_action_signature": str(
+                best.proto.get("canonical_action_signature") or semantic_action_signature(semantic)
+            ),
+            "score": visual_score + policy_adjustment,
+            "visual_score": visual_score,
+            "best_score": best.combined,
+            "distance": best.raw,
+            "temporal_distance": best.temporal,
+            "object_distance": best.object_distance,
+            "proto": best.proto,
+            "a": best.coordinate,
+            "semantic_action": semantic,
+            "grounding": grounding,
+            "semantic_available": semantic_available,
+            "semantic_ambiguous": bool(grounding_meta.get("ambiguous", False)),
+            "risk_class": str(semantic.get("risk_class", best.proto.get("risk_class", "safe"))),
+            "support": support,
+            "prototype_votes": len(items),
+            "bc_probability": scores.behavior,
+            "q_value": scores.value,
+            "success_probability": scores.success,
+            "failure_probability": estimate.failure,
+            "risk_probability": scores.risk,
+            "ood_uncertainty": scores.ood,
+            "policy_adjustment": policy_adjustment,
+            "policy_weights": self.policy_weights if not self.trained_decision else {},
+            "decision_mode": decision_mode,
+            "experience_count": estimate.experience_count,
+            "advantage": estimate.advantage,
+            "awr_weight": estimate.awr_weight,
+            "observation_state_id": self.query_state,
+            "environment_id": self.query_observation.environment_id,
+            "task_id": self.active_task_id,
+            "neural_policy_prediction": estimate.neural_prediction,
+        }
+
+    @staticmethod
+    def _annotate_best_clusters(result):
+        if not result:
+            return
+        behavior_best = max(result, key=lambda item: (item["bc_probability"], -item["score"]))["cluster_id"]
+        value_best = max(
+            result,
+            key=lambda item: (
+                item["success_probability"] - item["risk_probability"] + 0.25 * math.tanh(item["q_value"]),
+                -item["score"],
+            ),
+        )["cluster_id"]
+        for item in result:
+            item["behavior_best_cluster"] = behavior_best
+            item["value_best_cluster"] = value_best
+            item["policy_value_disagreement"] = behavior_best != value_best
+
+
 class AppModeService(AppServiceBase):
     def start_learning(self):
         try:
@@ -23893,7 +25026,7 @@ class AppModeService(AppServiceBase):
                 message = worker.receive(0.08)
                 if message is not None:
                     kind, payload = message
-                    if kind == "progress":
+                    if kind == WorkerMessageKind.PROGRESS.value:
                         self.set_progress(payload)
                     elif kind == "status":
                         self.set_status(payload)
@@ -23910,7 +25043,7 @@ class AppModeService(AppServiceBase):
                     raise InputStopped("睡眠子进程已停止")
                 raise RuntimeError("睡眠子进程异常退出且未返回结果")
             kind, payload = packet
-            if kind == "error":
+            if kind == WorkerMessageKind.ERROR.value:
                 raise RuntimeError(payload.get("traceback", "睡眠子进程失败"))
             models = list(payload.get("models", []))
             status = str(payload.get("status", "failed"))
@@ -24322,401 +25455,18 @@ class AppModeService(AppServiceBase):
         semantic_targets=None,
         task_id=None,
     ):
-        if not feature_valid(feature):
-            return []
-        query_temporal = temporal_from_context(temporal_context or {})
-        query_embedding = temporal_state_embedding(
-            query_temporal,
-            safe_int(
-                (getattr(self, "active_model_runtime", {}) or {}).get("temporal_encoder_seed", 0), 0, 0, 2**63 - 1
-            ),
-        )
-        query_objects = list(semantic_targets) if isinstance(semantic_targets, (list, tuple)) else None
-        if not isinstance(query_coarse, (bytes, bytearray)) or len(query_coarse) != COARSE_LEN:
-            query_coarse = coarse_feature(feature)
-        query_coarse = bytes(query_coarse)
-        backend = str(query_temporal.get("capture_method", "unknown"))
-        exact_limit = max(
-            12,
-            min(
-                VersionedThresholdConfig.candidate_full_limit,
-                int(full_limit) if int(full_limit) > 0 else VersionedThresholdConfig.candidate_full_limit,
-            ),
-        )
-        runtime_model = getattr(self, "active_model_runtime", None)
-        active_runtime = bool(isinstance(runtime_model, dict) and runtime_model.get("prototypes") is prototypes)
-        runtime_model = runtime_model if active_runtime else {}
-        active_task_id = normalized_identifier(task_id or runtime_model.get("default_task_id"), "default", 96)
-        task_goal = str((temporal_context or {}).get("task_goal", "")) if isinstance(temporal_context, dict) else ""
-        if not task_goal:
-            for definition in (
-                runtime_model.get("task_definitions", [])
-                if isinstance(runtime_model.get("task_definitions"), list)
-                else []
-            ):
-                if (
-                    isinstance(definition, dict)
-                    and normalized_identifier(definition.get("task_id"), "default", 96) == active_task_id
-                ):
-                    task_goal = str(definition.get("goal", ""))
-                    break
-        query_frame = {
-            "f": feature,
-            "coarse": query_coarse,
-            "neural_f": query_neural,
-            "semantic_targets": query_objects or [],
-        }
-        query_observation = objectized_observation(
-            query_frame,
-            {**(temporal_context or {}), "task_id": active_task_id, "task_goal": task_goal},
-            {"task_id": active_task_id, "goal": task_goal},
-        )
-        query_state = query_observation.state_id
-        model_token = str(runtime_model.get("runtime_token", "")) or prototype_collection_checksum(prototypes)
-        if len(model_token) != 64:
-            model_token = prototype_collection_checksum(prototypes)
-        feature_digest = hashlib.blake2b(feature_bytes(feature), digest_size=16).digest()
-        neural_digest = (
-            hashlib.blake2b(feature_bytes(query_neural), digest_size=8).digest() if feature_valid(query_neural) else b""
-        )
-        coarse_digest = hashlib.blake2b(query_coarse, digest_size=8).digest()
-        visual_cache_key = (
-            "visual-v6",
-            model_token,
-            feature_digest,
-            neural_digest,
-            coarse_digest,
-            backend,
-            exact_limit,
-        )
-        visual_matches = self.candidate_cache.get(visual_cache_key)
-        if visual_matches is None:
-            worker = getattr(self, "ai_worker", None)
-            if (
-                active_runtime
-                and worker is not None
-                and worker.alive()
-                and bool(worker.status.get("capabilities", {}).get("candidate_rank"))
-            ):
-                visual_matches = worker.candidate_matches(runtime_model, feature, query_coarse, backend, exact_limit)
-            else:
-                runtime_index = (
-                    runtime_model.get("runtime_index", {})
-                    if active_runtime
-                    else build_candidate_runtime_index(prototypes, False)
-                )
-                visual_matches = candidate_visual_matches(runtime_index, feature, query_coarse, backend, exact_limit)
-            visual_matches = tuple(
-                (safe_int(item.get("index"), -1), safe_float(item.get("exact_score"), float("inf")))
-                for item in visual_matches
-                if isinstance(item, dict)
-            )
-            self.candidate_cache[visual_cache_key] = visual_matches
-        sequence_model = runtime_model.get("sequence_model", {})
-        sequence_candidate_ids = {
-            str(candidate) for choices in sequence_model.values() if isinstance(choices, dict) for candidate in choices
-        }
-        experience_model = runtime_model.get("experience_model", {})
-        behavior_model = runtime_model.get("behavior_model", {})
-        value_model = runtime_model.get("value_model", {})
-        risk_model = runtime_model.get("risk_model", {})
-        trained_decision = bool(
-            isinstance(value_model, dict)
-            and (
-                (
-                    isinstance(value_model.get("neural_bundle"), dict)
-                    and value_model.get("neural_bundle", {}).get("trained")
-                )
-                or isinstance(behavior_model, dict)
-                and behavior_model.get("state_action")
-                and value_model.get("state_action")
-                and isinstance(risk_model, dict)
-                and risk_model.get("state_action")
-            )
-        )
-        policy_weights = normalized_policy_score_weights(runtime_model.get("policy_score_weights", {}))
-        recent_actions = query_temporal.get("recent_actions", [last_action_signature])
-        grouped = defaultdict(list)
-        for position, (index, raw_prefilter) in enumerate(visual_matches):
-            if position % 8 == 0 and getattr(self, "stop_event", None) is not None and self.should_stop():
-                return []
-            if index < 0 or index >= len(prototypes):
-                continue
-            proto = prototypes[index]
-            if "authorized" in proto and not proto.get("authorized"):
-                continue
-            methods = frozenset(str(value) for value in proto.get("capture_methods", frozenset()))
-            if methods and backend not in methods:
-                continue
-            coordinate = normalize_action(proto.get("a"))
-            semantic = normalize_semantic_action(proto.get("semantic_action")) or semantic_action_from_coordinate(
-                coordinate
-            )
-            if coordinate is None or semantic is None:
-                continue
-            skill = semantic_skill(semantic, str(query_temporal.get("subgoal_id") or "advance_goal"))
-            decision_id = skill.key()
-            raw = dual_feature_distance(feature, proto.get("f"), query_neural, proto.get("neural_f"))
-            object_distance = (
-                object_set_distance(query_objects, proto.get("semantic_targets", []))
-                if query_objects is not None
-                else 0.0
-            )
-            expected = str(proto.get("previous_action", ""))
-            previous_penalty = (
-                min(120.0, raw * 0.08 + 18.0)
-                if expected and last_action_signature and expected != last_action_signature
-                else 0.0
-            )
-            proto_embedding = proto.get("temporal_embedding")
-            if isinstance(proto_embedding, (list, tuple)) and proto_embedding:
-                tdistance = temporal_embedding_distance(query_embedding, proto_embedding)
-            else:
-                tdistance = temporal_distance(
-                    query_temporal, proto.get("temporal_cached") or temporal_from_context(proto.get("temporal", {}))
-                )
-            temporal_penalty = tdistance * max(45.0, float(proto.get("threshold", 100.0)) * 0.30)
-            object_penalty = object_distance * max(25.0, float(proto.get("threshold", 100.0)) * 0.22)
-            legacy_candidate = str(proto.get("cluster_id", proto.get("action_signature", "")))
-            if decision_id in sequence_candidate_ids:
-                sequence_penalty = calculate_sequence_penalty(
-                    recent_actions, decision_id, sequence_model, active_task_id
-                )
-            elif legacy_candidate in sequence_candidate_ids:
-                sequence_penalty = calculate_sequence_penalty(
-                    recent_actions, legacy_candidate, sequence_model, active_task_id
-                )
-            else:
-                sequence_penalty = 0.0
-            grouped[decision_id].append(
-                {
-                    "combined": raw + previous_penalty + temporal_penalty + object_penalty + sequence_penalty,
-                    "raw": raw,
-                    "temporal": tdistance,
-                    "object": object_distance,
-                    "proto": proto,
-                    "prefilter": raw_prefilter,
-                    "coordinate": coordinate,
-                    "semantic": semantic,
-                    "skill": skill,
-                    "prototype_cluster_id": str(proto.get("cluster_id", proto.get("action_signature", ""))),
-                }
-            )
-        total_support = sum(
-            max(1, max(int(item["proto"].get("action_support", item["proto"].get("support", 0))) for item in items))
-            for items in grouped.values()
-        )
-        result = []
-        for decision_id, items in grouped.items():
-            items.sort(key=lambda item: item["combined"])
-            best = items[0]
-            best_proto = best["proto"]
-            semantic = best["semantic"]
-            coordinate = best["coordinate"]
-            skill = best["skill"]
-            visual_best = best["combined"]
-            visual_distance_value = best["raw"]
-            best_temporal = best["temporal"]
-            best_object = best["object"]
-            visual_score = visual_best if len(items) == 1 else 0.88 * visual_best + 0.12 * items[1]["combined"]
-            support = max(int(item["proto"].get("action_support", item["proto"].get("support", 0))) for item in items)
-            legacy = policy_experience_row(experience_model, query_state, decision_id, active_task_id)
-            behavior = (
-                policy_experience_row(behavior_model, query_state, decision_id, active_task_id)
-                if behavior_model
-                else legacy
-            )
-            value = (
-                policy_experience_row(value_model, query_state, decision_id, active_task_id) if value_model else legacy
-            )
-            risk = policy_experience_row(risk_model, query_state, decision_id, active_task_id) if risk_model else legacy
-            awr_weight = safe_float(behavior.get("awr_weight", legacy.get("awr_weight", 1.0)), 1.0, 0.01, 100.0)
-            empirical = support / max(1, total_support)
-            bc_probability = safe_float(
-                behavior.get("probability", behavior.get("bc_probability", empirical * math.sqrt(awr_weight))),
-                empirical,
-                0.0,
-                1.0,
-            )
-            q_value = safe_float(
-                value.get(
-                    "expected_return", value.get("q_value", value.get("mean_reward", legacy.get("q_value", 0.0)))
-                ),
-                0.0,
-            )
-            success_probability = safe_float(
-                value.get("success_probability", legacy.get("success_probability", 0.0)), 0.0, 0.0, 1.0
-            )
-            failure_probability = safe_float(
-                value.get(
-                    "failure_probability", risk.get("failure_probability", legacy.get("failure_probability", 0.0))
-                ),
-                0.0,
-                0.0,
-                1.0,
-            )
-            risk_probability = safe_float(
-                risk.get(
-                    "risk_probability",
-                    risk.get("failure_probability", legacy.get("risk_probability", failure_probability)),
-                ),
-                failure_probability,
-                0.0,
-                1.0,
-            )
-            learned_uncertainty = safe_float(
-                risk.get(
-                    "uncertainty", value.get("uncertainty", legacy.get("uncertainty", 1.0 if not legacy else 0.5))
-                ),
-                0.5,
-                0.0,
-                1.0,
-            )
-            neural_prediction = (
-                neural_offline_policy_prediction(value_model, query_observation.to_dict(), decision_id, active_task_id)
-                if isinstance(value_model, dict)
-                else {}
-            )
-            if neural_prediction:
-                bc_probability = (
-                    0.82 * safe_float(neural_prediction.get("behavior_probability"), bc_probability, 0.0, 1.0)
-                    + 0.18 * bc_probability
-                )
-                q_value = 0.82 * safe_float(neural_prediction.get("q_value"), q_value) + 0.18 * q_value
-                success_probability = (
-                    0.82 * safe_float(neural_prediction.get("success_probability"), success_probability, 0.0, 1.0)
-                    + 0.18 * success_probability
-                )
-                failure_probability = (
-                    0.82 * safe_float(neural_prediction.get("failure_probability"), failure_probability, 0.0, 1.0)
-                    + 0.18 * failure_probability
-                )
-                risk_probability = max(
-                    risk_probability,
-                    0.82 * safe_float(neural_prediction.get("risk_probability"), risk_probability, 0.0, 1.0)
-                    + 0.18 * risk_probability,
-                )
-                learned_uncertainty = max(
-                    learned_uncertainty, safe_float(neural_prediction.get("uncertainty"), learned_uncertainty, 0.0, 1.0)
-                )
-                awr_weight = math.exp(
-                    max(
-                        -5.0,
-                        min(
-                            5.0,
-                            safe_float(neural_prediction.get("advantage"), 0.0)
-                            / max(
-                                0.05, safe_float(value_model.get("neural_bundle", {}).get("awr_temperature", 0.5), 0.5)
-                            ),
-                        ),
-                    )
-                )
-            threshold = max(1.0, safe_float(best_proto.get("threshold", 100.0), 100.0))
-            distance_ood = max(0.0, min(1.0, visual_distance_value / threshold))
-            temporal_ood = max(
-                0.0, min(1.0, best_temporal / max(0.05, safe_float(best_proto.get("temporal_threshold", 0.25), 0.25)))
-            )
-            object_ood = max(0.0, min(1.0, best_object))
-            support_ood = 1.0 / math.sqrt(max(1, support))
-            ood_uncertainty = max(
-                0.0,
-                min(
-                    1.0,
-                    0.34 * distance_ood
-                    + 0.22 * temporal_ood
-                    + 0.20 * object_ood
-                    + 0.10 * support_ood
-                    + 0.14 * learned_uncertainty,
-                ),
-            )
-            q_normalized = math.tanh(q_value / 2.0)
-            if trained_decision:
-                learned_utility = (
-                    1.35 * math.log(max(1e-6, bc_probability))
-                    + 1.05 * q_normalized
-                    + 0.85 * success_probability
-                    - 1.5 * risk_probability
-                    - 1.1 * ood_uncertainty
-                )
-                policy_adjustment = -45.0 * learned_utility
-                decision_mode = "calibrated_skill_models"
-            else:
-                policy_adjustment = (
-                    -policy_weights["bc"] * bc_probability
-                    - policy_weights["q"] * q_normalized
-                    - policy_weights["success"] * success_probability
-                    + policy_weights["risk"] * risk_probability
-                    + policy_weights["ood"] * ood_uncertainty
-                )
-                decision_mode = "cold_start_skill_weights"
-            grounding = ground_semantic_action(semantic, query_objects, True) if query_objects is not None else None
-            grounding_meta = grounding.get("grounding", {}) if isinstance(grounding, dict) else {}
-            semantic_available = (
-                bool(grounding and grounding.get("grounded_action")) if query_objects is not None else True
-            )
-            semantic_ambiguous = bool(grounding_meta.get("ambiguous", False))
-            final_cost = visual_score + policy_adjustment
-            result.append(
-                {
-                    "cluster_id": decision_id,
-                    "prototype_cluster_id": best["prototype_cluster_id"],
-                    "skill_id": skill.skill_id,
-                    "skill_key": decision_id,
-                    "skill_parameters": dict(skill.parameters),
-                    "subgoal_id": skill.subgoal_id,
-                    "canonical_action_signature": str(
-                        best_proto.get("canonical_action_signature") or semantic_action_signature(semantic)
-                    ),
-                    "score": final_cost,
-                    "visual_score": visual_score,
-                    "best_score": visual_best,
-                    "distance": visual_distance_value,
-                    "temporal_distance": best_temporal,
-                    "object_distance": best_object,
-                    "proto": best_proto,
-                    "a": coordinate,
-                    "semantic_action": semantic,
-                    "grounding": grounding,
-                    "semantic_available": semantic_available,
-                    "semantic_ambiguous": semantic_ambiguous,
-                    "risk_class": str(semantic.get("risk_class", best_proto.get("risk_class", "safe"))),
-                    "support": support,
-                    "prototype_votes": len(items),
-                    "bc_probability": bc_probability,
-                    "q_value": q_value,
-                    "success_probability": success_probability,
-                    "failure_probability": failure_probability,
-                    "risk_probability": risk_probability,
-                    "ood_uncertainty": ood_uncertainty,
-                    "policy_adjustment": policy_adjustment,
-                    "policy_weights": policy_weights if not trained_decision else {},
-                    "decision_mode": decision_mode,
-                    "experience_count": safe_int(legacy.get("count", behavior.get("count", 0)), 0),
-                    "advantage": safe_float(
-                        neural_prediction.get("advantage", behavior.get("advantage", legacy.get("advantage", 0.0))), 0.0
-                    ),
-                    "awr_weight": awr_weight,
-                    "observation_state_id": query_state,
-                    "environment_id": query_observation.environment_id,
-                    "task_id": active_task_id,
-                    "neural_policy_prediction": neural_prediction,
-                }
-            )
-        result.sort(key=lambda item: (item["score"], item["visual_score"], -item["support"]))
-        if result:
-            behavior_best = max(result, key=lambda item: (item["bc_probability"], -item["score"]))["cluster_id"]
-            value_best = max(
-                result,
-                key=lambda item: (
-                    item["success_probability"] - item["risk_probability"] + 0.25 * math.tanh(item["q_value"]),
-                    -item["score"],
-                ),
-            )["cluster_id"]
-            for item in result:
-                item["behavior_best_cluster"] = behavior_best
-                item["value_best_cluster"] = value_best
-                item["policy_value_disagreement"] = behavior_best != value_best
-        return result
+        return ActionCandidateRanker(
+            self,
+            feature,
+            prototypes,
+            last_action_signature,
+            full_limit,
+            temporal_context,
+            query_coarse,
+            query_neural,
+            semantic_targets,
+            task_id,
+        ).rank()
 
     def rank_action_candidates(self, *args, **kwargs):
         ranked = self._rank_action_candidates_base(*args, **kwargs)
@@ -25238,7 +25988,7 @@ class AppModeService(AppServiceBase):
             deadline = time.monotonic() + max(0.0, float(duration))
             while time.monotonic() < deadline:
                 stop_check()
-                time.sleep(min(0.008, max(0.001, deadline - time.monotonic())))
+                interruptible_wait(self.stop_event, min(0.008, max(0.001, deadline - time.monotonic())))
 
         kind = item["kind"]
         if kind in CONTROL_ACTION_KINDS:
@@ -26154,11 +26904,184 @@ class AppStorageService(AppServiceBase):
 
 
 class App:
-    def __getattr__(self, name):
-        for service in self.__dict__.get("_services", ()):
-            if name in type(service).__dict__:
-                return getattr(service, name)
-        raise AttributeError(name)
+    def _build(self, *args, **kwargs):
+        return self.ui_service._build(*args, **kwargs)
+    def _capture_options_from_vars(self, *args, **kwargs):
+        return self.ui_service._capture_options_from_vars(*args, **kwargs)
+    def _set_capture_options(self, *args, **kwargs):
+        return self.ui_service._set_capture_options(*args, **kwargs)
+    def _sync_capture_options_from_profile(self, *args, **kwargs):
+        return self.ui_service._sync_capture_options_from_profile(*args, **kwargs)
+    def _capture_options_changed(self, *args, **kwargs):
+        return self.ui_service._capture_options_changed(*args, **kwargs)
+    def show_main_confirmation(self, *args, **kwargs):
+        return self.ui_service.show_main_confirmation(*args, **kwargs)
+    def acknowledge_main_confirmation(self, *args, **kwargs):
+        return self.ui_service.acknowledge_main_confirmation(*args, **kwargs)
+    def _hide_main_confirmation(self, *args, **kwargs):
+        return self.ui_service._hide_main_confirmation(*args, **kwargs)
+    def _toggle_advanced(self, *args, **kwargs):
+        return self.ui_service._toggle_advanced(*args, **kwargs)
+    def tk_exception(self, *args, **kwargs):
+        return self.ui_service.tk_exception(*args, **kwargs)
+    def ui(self, *args, **kwargs):
+        return self.ui_service.ui(*args, **kwargs)
+    def close_dialog(self, *args, **kwargs):
+        return self.ui_service.close_dialog(*args, **kwargs)
+    def _destroy_ask_window(self, *args, **kwargs):
+        return self.ui_service._destroy_ask_window(*args, **kwargs)
+    def _show_result_modal(self, *args, **kwargs):
+        return self.ui_service._show_result_modal(*args, **kwargs)
+    def show_error(self, *args, **kwargs):
+        return self.ui_service.show_error(*args, **kwargs)
+    def show_info(self, *args, **kwargs):
+        return self.ui_service.show_info(*args, **kwargs)
+    def prompt_text(self, *args, **kwargs):
+        return self.ui_service.prompt_text(*args, **kwargs)
+    def confirm_dialog(self, *args, **kwargs):
+        return self.ui_service.confirm_dialog(*args, **kwargs)
+    def _window_state_signature(self, *args, **kwargs):
+        return self.ui_service._window_state_signature(*args, **kwargs)
+    def _collect_refresh_snapshot(self, *args, **kwargs):
+        return self.ui_service._collect_refresh_snapshot(*args, **kwargs)
+    def _apply_refresh_snapshot(self, *args, **kwargs):
+        return self.ui_service._apply_refresh_snapshot(*args, **kwargs)
+    def refresh_all_async(self, *args, **kwargs):
+        return self.ui_service.refresh_all_async(*args, **kwargs)
+    def _refresh_all(self, *args, **kwargs):
+        return self.ui_service._refresh_all(*args, **kwargs)
+    def refresh_data_stats(self, *args, **kwargs):
+        return self.ui_service.refresh_data_stats(*args, **kwargs)
+    def periodic_refresh(self, *args, **kwargs):
+        return self.ui_service.periodic_refresh(*args, **kwargs)
+    def open_game_dialog(self, *args, **kwargs):
+        return self.ui_service.open_game_dialog(*args, **kwargs)
+    def open_window_dialog(self, *args, **kwargs):
+        return self.ui_service.open_window_dialog(*args, **kwargs)
+    def open_task_dialog(self, *args, **kwargs):
+        return self.ui_service.open_task_dialog(*args, **kwargs)
+    def open_data_dialog(self, *args, **kwargs):
+        return self.ui_service.open_data_dialog(*args, **kwargs)
+    def run_background(self, *args, **kwargs):
+        return self.lifecycle_service.run_background(*args, **kwargs)
+    def process_ui_queue(self, *args, **kwargs):
+        return self.lifecycle_service.process_ui_queue(*args, **kwargs)
+    def _make_shutdown_coordinator(self, *args, **kwargs):
+        return self.lifecycle_service._make_shutdown_coordinator(*args, **kwargs)
+    def _begin_mode_stopping(self, *args, **kwargs):
+        return self.lifecycle_service._begin_mode_stopping(*args, **kwargs)
+    def _handle_mode_thread_timeout(self, *args, **kwargs):
+        return self.lifecycle_service._handle_mode_thread_timeout(*args, **kwargs)
+    def _poll_mode_shutdown(self, *args, **kwargs):
+        return self.lifecycle_service._poll_mode_shutdown(*args, **kwargs)
+    def _fail_active_mode(self, *args, **kwargs):
+        return self.lifecycle_service._fail_active_mode(*args, **kwargs)
+    def retest_capture_backends(self, *args, **kwargs):
+        return self.lifecycle_service.retest_capture_backends(*args, **kwargs)
+    def retest_capture_worker(self, *args, **kwargs):
+        return self.lifecycle_service.retest_capture_worker(*args, **kwargs)
+    def _escape_hook_signal(self, *args, **kwargs):
+        return self.lifecycle_service._escape_hook_signal(*args, **kwargs)
+    def poll_global_escape(self, *args, **kwargs):
+        return self.lifecycle_service.poll_global_escape(*args, **kwargs)
+    def set_controls(self, *args, **kwargs):
+        return self.lifecycle_service.set_controls(*args, **kwargs)
+    def _start_mode_transaction(self, *args, **kwargs):
+        return self.lifecycle_service._start_mode_transaction(*args, **kwargs)
+    def start_worker(self, *args, **kwargs):
+        return self.lifecycle_service.start_worker(*args, **kwargs)
+    def worker_entry(self, *args, **kwargs):
+        return self.lifecycle_service.worker_entry(*args, **kwargs)
+    def request_mode_stop(self, *args, **kwargs):
+        return self.lifecycle_service.request_mode_stop(*args, **kwargs)
+    def request_stop(self, *args, **kwargs):
+        return self.lifecycle_service.request_stop(*args, **kwargs)
+    def _keyboard_escape(self, *args, **kwargs):
+        return self.lifecycle_service._keyboard_escape(*args, **kwargs)
+    def wait_escape_release(self, *args, **kwargs):
+        return self.lifecycle_service.wait_escape_release(*args, **kwargs)
+    def close(self, *args, **kwargs):
+        return self.lifecycle_service.close(*args, **kwargs)
+    def _poll_shutdown(self, *args, **kwargs):
+        return self.lifecycle_service._poll_shutdown(*args, **kwargs)
+    def start_learning(self, *args, **kwargs):
+        return self.mode_service.start_learning(*args, **kwargs)
+    def learning_worker(self, *args, **kwargs):
+        return self.mode_service.learning_worker(*args, **kwargs)
+    def _learning_worker_impl(self, *args, **kwargs):
+        return self.mode_service._learning_worker_impl(*args, **kwargs)
+    def _run_review_process(self, *args, **kwargs):
+        return self.mode_service._run_review_process(*args, **kwargs)
+    def _prototype_medoid(self, *args, **kwargs):
+        return self.mode_service._prototype_medoid(*args, **kwargs)
+    def _action_medoid(self, *args, **kwargs):
+        return self.mode_service._action_medoid(*args, **kwargs)
+    def _cluster_action_samples(self, *args, **kwargs):
+        return self.mode_service._cluster_action_samples(*args, **kwargs)
+    def _cluster_action_group(self, *args, **kwargs):
+        return self.mode_service._cluster_action_group(*args, **kwargs)
+    def _rank_action_candidates_base(self, *args, **kwargs):
+        return self.mode_service._rank_action_candidates_base(*args, **kwargs)
+    def rank_action_candidates(self, *args, **kwargs):
+        return self.mode_service.rank_action_candidates(*args, **kwargs)
+    def evaluate_action_candidates(self, *args, **kwargs):
+        return self.mode_service.evaluate_action_candidates(*args, **kwargs)
+    def validate_model_binding(self, *args, **kwargs):
+        return self.mode_service.validate_model_binding(*args, **kwargs)
+    def start_sleep(self, *args, **kwargs):
+        return self.mode_service.start_sleep(*args, **kwargs)
+    def _limit_prototypes(self, *args, **kwargs):
+        return self.mode_service._limit_prototypes(*args, **kwargs)
+    def _split_review_samples(self, *args, **kwargs):
+        return self.mode_service._split_review_samples(*args, **kwargs)
+    def _review_worker_impl(self, *args, **kwargs):
+        return self.mode_service._review_worker_impl(*args, **kwargs)
+    def review_worker(self, *args, **kwargs):
+        return self.mode_service.review_worker(*args, **kwargs)
+    def action_text(self, *args, **kwargs):
+        return self.mode_service.action_text(*args, **kwargs)
+    def action_cooldown(self, *args, **kwargs):
+        return self.mode_service.action_cooldown(*args, **kwargs)
+    def action_strictness(self, *args, **kwargs):
+        return self.mode_service.action_strictness(*args, **kwargs)
+    def execute_action(self, *args, **kwargs):
+        return self.mode_service.execute_action(*args, **kwargs)
+    def start_training(self, *args, **kwargs):
+        return self.mode_service.start_training(*args, **kwargs)
+    def training_worker(self, *args, **kwargs):
+        return self.mode_service.training_worker(*args, **kwargs)
+    def _training_worker_impl(self, *args, **kwargs):
+        return self.mode_service._training_worker_impl(*args, **kwargs)
+    def basic_actions(self, *args, **kwargs):
+        return self.mode_service.basic_actions(*args, **kwargs)
+    def start_ask(self, *args, **kwargs):
+        return self.mode_service.start_ask(*args, **kwargs)
+    def _create_ask_window(self, *args, **kwargs):
+        return self.mode_service._create_ask_window(*args, **kwargs)
+    def close_ask(self, *args, **kwargs):
+        return self.mode_service.close_ask(*args, **kwargs)
+    def _restore_directory_display(self, *args, **kwargs):
+        return self.storage_service._restore_directory_display(*args, **kwargs)
+    def _try_open_local_data_directory(self, *args, **kwargs):
+        return self.storage_service._try_open_local_data_directory(*args, **kwargs)
+    def choose_data_directory(self, *args, **kwargs):
+        return self.storage_service.choose_data_directory(*args, **kwargs)
+    def _commit_prepared_directory(self, *args, **kwargs):
+        return self.storage_service._commit_prepared_directory(*args, **kwargs)
+    def _ai_worker_failed(self, *args, **kwargs):
+        return self.storage_service._ai_worker_failed(*args, **kwargs)
+    def _start_ai_worker(self, *args, **kwargs):
+        return self.storage_service._start_ai_worker(*args, **kwargs)
+    def _update_runtime_status(self, *args, **kwargs):
+        return self.storage_service._update_runtime_status(*args, **kwargs)
+    def require_ai_runtime(self, *args, **kwargs):
+        return self.storage_service.require_ai_runtime(*args, **kwargs)
+    def start_integrity_check(self, *args, **kwargs):
+        return self.storage_service.start_integrity_check(*args, **kwargs)
+    def start_download(self, *args, **kwargs):
+        return self.storage_service.start_download(*args, **kwargs)
+    def integrity_check_worker(self, *args, **kwargs):
+        return self.storage_service.integrity_check_worker(*args, **kwargs)
 
     @property
     def mode_state(self):
@@ -27045,378 +27968,426 @@ def run_self_test(path=None):
     return run_static_contract_tests(path)
 
 
-def run_windows_smoke_test(path=None):
-    load_gui_runtime()
-    report = {"status": "failed", "checks": {}, "details": {}, "manual_required": []}
+@dataclass(slots=True)
+class WindowsSmokeContext:
+    report: dict = field(default_factory=lambda: {"status": "failed", "checks": {}, "details": {}, "manual_required": []})
+    bridge: object = None
+    root: object = None
+    app: object = None
+    workspace: object = None
+    folder: object = None
+    persistent: object = None
+    version: object = None
 
-    def record(name, value, detail=None):
-        report["checks"][str(name)] = bool(value)
+
+class WindowsSmokeTest:
+    def __init__(self, path=None):
+        self.path = path
+        self.context = WindowsSmokeContext()
+        self.original_local = os.environ.get("LOCALAPPDATA")
+
+    def record(self, name, value, detail=None):
+        self.context.report["checks"][str(name)] = bool(value)
         if detail is not None:
-            report["details"][str(name)] = detail
+            self.context.report["details"][str(name)] = detail
 
-    if os.name != "nt":
+    def run(self):
+        load_gui_runtime()
+        if os.name != "nt":
+            return self._unsupported()
+        try:
+            self._execute()
+        except RECOVERABLE_ERRORS as error:
+            self.context.report["details"]["fatal"] = "".join(
+                traceback.format_exception(type(error), error, error.__traceback__)
+            )
+        finally:
+            self._cleanup()
+        report = self.context.report
+        sys.stdout.write(json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+        return 0 if report["status"] == "passed" else 1
+
+    def _unsupported(self):
+        report = self.context.report
         report["status"] = "unsupported"
         report["details"]["platform"] = "真实Windows 11冒烟测试只能在Windows 11目标机运行"
         sys.stdout.write(json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
         return 2
-    bridge = None
-    root = None
-    app = None
-    original_local = os.environ.get("LOCALAPPDATA")
-    try:
-        version = sys.getwindowsversion()
-        record(
+
+    def _execute(self):
+        context = self.context
+        context.version = sys.getwindowsversion()
+        self._record_windows_version()
+        self._prepare_workspace()
+        os.environ["LOCALAPPDATA"] = str(context.folder)
+        self._start_application()
+        windows = self._enumerate_windows()
+        selected = self._select_target(windows)
+        if selected is not None:
+            self._test_selected_window(selected)
+        self._set_manual_requirements()
+        self._record_acceptance()
+        self._close_application()
+        automated = [
+            value
+            for key, value in context.report["checks"].items()
+            if key != "真实窗口移动缩放最小化重启观察"
+        ]
+        context.report["status"] = "passed" if automated and all(automated) else "needs_attention"
+
+    def _record_windows_version(self):
+        version = self.context.version
+        self.record(
             "Windows 11系统",
             int(version.major) == 10 and int(version.build) >= 22000,
             {"major": int(version.major), "build": int(version.build)},
         )
-        persistent = Path(path).expanduser().resolve() if path else None
-        workspace = tempfile.TemporaryDirectory() if persistent is None else None
-        folder = (
-            Path(workspace.name)
-            if workspace is not None
-            else persistent.parent / (".ugai_acceptance_workspace_" + uuid.uuid4().hex)
+
+    def _prepare_workspace(self):
+        context = self.context
+        context.persistent = Path(self.path).expanduser().resolve() if self.path else None
+        context.workspace = tempfile.TemporaryDirectory() if context.persistent is None else None
+        context.folder = (
+            Path(context.workspace.name)
+            if context.workspace is not None
+            else context.persistent.parent / (".ugai_acceptance_workspace_" + uuid.uuid4().hex)
         )
-        folder.mkdir(parents=True, exist_ok=True)
+        context.folder.mkdir(parents=True, exist_ok=True)
+
+    def _start_application(self):
+        context = self.context
+        enable_dpi_awareness()
+        context.root = tk.Tk()
+        context.app = App(context.root)
+        data_path = context.persistent if context.persistent is not None else context.folder / "data"
+        directory_lock = DataDirectoryLock(data_path).acquire()
         try:
-            os.environ["LOCALAPPDATA"] = str(folder)
-            enable_dpi_awareness()
-            root = tk.Tk()
-            app = App(root)
-            data_path = persistent if persistent is not None else folder / "data"
-            directory_lock = DataDirectoryLock(data_path).acquire()
-            try:
-                candidate = prepare_data_directory(data_path)
-                candidate.directory_lock = directory_lock
-                candidate.directory_lock_owned = True
-                app._commit_prepared_directory(candidate)
-                directory_lock = None
-            finally:
-                if directory_lock is not None:
-                    directory_lock.close()
-            root.deiconify()
-            root.update_idletasks()
-            root.update()
-            visible = bool(
-                app.controls
-                and app.root.winfo_exists()
-                and app.root.state() != "withdrawn"
-                and app.root.winfo_viewable()
-            )
-            record("控制面板真实可见", visible, {"control_count": len(app.controls), "state": app.root.state()})
-            record(
-                "冒烟测试文件夹已确认",
-                app.store is not None and app.lifecycle.data_ready,
-                {"directory": str(app.data_directory)},
-            )
-            bridge = app.api
-            windows = bridge.enum_windows()
-            record("窗口枚举", bool(windows), {"count": len(windows)})
-            hydrated = []
-            dpi_values = set()
-            for item in windows:
-                try:
-                    identity = bridge.target_identity(item)
-                    hydrated.append(identity)
-                    dpi_values.add(int(identity.get("dpi", 0)))
-                except Exception as error:
-                    app.store.log_error("WINDOWS_SMOKE_IDENTITY_FAILED", error, window_identity=item)
-            record("窗口完整身份读取", bool(hydrated), {"count": len(hydrated)})
-            record("DPI观测", bool(dpi_values), {"observed": sorted(dpi_values), "required": [96, 120, 144]})
-            exact = None
-            for argument in sys.argv:
-                if argument.startswith("--smoke-hwnd="):
-                    exact = safe_int(argument.split("=", 1)[1], 0)
-            selected = next((item for item in hydrated if exact and int(item.get("hwnd", 0)) == exact), None)
-            if selected is None:
-                selected = next(
-                    (
-                        item
-                        for item in hydrated
-                        if any(
-                            token
-                            in (
-                                str(item.get("title", ""))
-                                + " "
-                                + str(item.get("class", ""))
-                                + " "
-                                + str(item.get("process_path", ""))
-                            ).casefold()
-                            for token in ("雷电", "ldplayer", "dnplayer")
-                        )
-                    ),
-                    None,
-                )
-            record(
-                "雷电模拟器窗口识别",
-                selected is not None,
-                {"selected": selected or {}, "hint": "可使用--smoke-hwnd=窗口句柄指定其他目标窗口"},
-            )
-            if selected is not None:
-                selected["content_rect_norm"] = [0.0, 0.0, 1.0, 1.0]
-                selected["title_rule"] = {"mode": "none", "value": ""}
-                selected = bridge.target_identity(selected)
-                methods = []
-                capture_error = ""
-                try:
-                    captured = bridge.capture_gray(selected, False, True, False)
-                    methods = sorted(
-                        {
-                            str(item.get("method", ""))
-                            for item in captured.get("validation_candidates", [])
-                            if item.get("method")
-                        }
-                    )
-                except Exception as error:
-                    capture_error = str(error)
-                    app.store.log_error("WINDOWS_SMOKE_CAPTURE_FAILED", error, window_identity=selected)
-                required_methods = ["Windows Graphics Capture", "PrintWindow客户区", "窗口DC", "前台桌面裁剪"]
-                record(
-                    "四采集后端冒烟",
-                    all(name in methods for name in required_methods),
-                    {"methods": methods, "error": capture_error},
-                )
-                observe = 0.0
-                for argument in sys.argv:
-                    if argument.startswith("--smoke-observe-seconds="):
-                        observe = safe_float(argument.split("=", 1)[1], 0.0, 0.0, 300.0)
-                identity_changes = []
-                deadline = time.monotonic() + observe
-                previous = selected
-                while time.monotonic() < deadline:
-                    root.update()
-                    time.sleep(0.05)
-                    try:
-                        current = bridge.target_identity(previous)
-                        if any(
-                            current.get(key) != previous.get(key)
-                            for key in ("hwnd", "pid", "process_created", "client_size", "dpi")
-                        ):
-                            identity_changes.append({"before": previous, "after": current})
-                        previous = current
-                    except Exception as error:
-                        identity_changes.append({"error": str(error)})
-                record(
-                    "真实窗口移动缩放最小化重启观察",
-                    observe <= 0 or bool(identity_changes),
-                    {"observe_seconds": observe, "changes": identity_changes},
-                )
-            report["manual_required"] = [
-                "按真实顺序完成：选择文件夹、确认、运行所选目录main.py、检查文件完整性、游戏增删改选确认、选择雷电与普通窗口确认、学习、睡眠、训练、指导；普通成功流程不得出现确认弹窗",
-                "在STARTING、RUNNING、STOPPING阶段分别按ESC并确认停止延迟",
-                "使用真实外部鼠标和非ESC键盘输入确认立即停机且学习session变为invalid",
-                "在100%、125%、150%、200%及混合DPI、负坐标、跨屏环境完成验收",
-            ]
-            acceptance = app.acceptance_report or AcceptanceReport(app.data_directory)
-            acceptance.set_environment(
-                windows_build=int(version.build),
-                windows_major=int(version.major),
-                host_python=sys.version,
-                host_bits=ctypes.sizeof(ctypes.c_void_p) * 8,
-                fixed_runtime_python=FIXED_RUNTIME_PYTHON_VERSION,
-                smoke_run=time.time(),
-            )
-            acceptance.record_case(
-                "启动",
-                "control_panel_visible",
-                "passed" if visible else "failed",
-                report["details"].get("控制面板真实可见", {}),
-            )
-            exact_buttons = set(app.control_buttons) == REQUIRED_DEFAULT_BUTTONS and len(app.control_buttons) == 8
-            acceptance.record_case(
-                "默认界面",
-                "exact_eight_buttons",
-                "passed" if exact_buttons else "failed",
-                {"buttons": sorted(app.control_buttons)},
-            )
-            folder_ok = bool(
-                app.store is not None
-                and app.lifecycle.data_ready
-                and app.data_directory_lock is not None
-                and app.data_directory_lock.locked
-            )
-            acceptance.record_case(
-                "文件夹",
-                "select_prepare_confirm",
-                "passed" if folder_ok else "failed",
-                {"directory": str(app.data_directory)},
-            )
-            migration_ok, migration_evidence = data_migration_contract_test()
-            acceptance.record_case(
-                "文件夹", "migration_success", "passed" if migration_ok else "failed", migration_evidence
-            )
-            acceptance.record_case(
-                "文件夹",
-                "forced_failure_rollback",
-                "passed" if migration_evidence.get("failure_preserved") else "failed",
-                migration_evidence,
-            )
-            acceptance.record_case(
-                "文件夹",
-                "prepare_cancel_cleanup",
-                "pending",
-                {"reason": "必须在复制数据库、SHA-256、schema升级和原子替换各阶段强制退出"},
-            )
-            main_path = app.data_directory / "main.py"
-            main_hash_ok = main_path.is_file() and sha256_file(main_path) == sha256_file(Path(__file__).resolve())
-            interaction_evidence = {
-                "native_picker": True,
-                "custom_modal": False,
-                "inline_confirm": True,
-                "success_popup": False,
-                "global_input_lock": False,
-                "buttons": ["选择文件夹", "确认"],
-            }
-            for case in (
-                "folder_picker_direct",
-                "folder_no_custom_modal",
-                "folder_inline_confirm",
-                "folder_no_success_popup",
-                "no_global_input_lock",
-                "exact_user_sequence",
-            ):
-                acceptance.record_case("文件夹", case, "passed", interaction_evidence)
-            acceptance.record_case(
-                "文件夹", "folder_picker_cancel", "pending", {"reason": "需要真实点击原生选择器的取消按钮"}
-            )
-            acceptance.record_case(
-                "文件夹", "main_py_at_root", "passed" if main_path.is_file() else "failed", {"path": str(main_path)}
-            )
-            acceptance.record_case(
-                "文件夹", "main_py_hash_match", "passed" if main_hash_ok else "failed", {"path": str(main_path)}
-            )
-            acceptance.record_case("弹窗", "success_status_only", "passed", {"folder_success_popup": False})
-            process_first = None
-            named_ok = False
-            try:
-                process_first = ProcessInstanceLock().acquire()
-                try:
-                    ProcessInstanceLock().acquire()
-                except RuntimeError:
-                    named_ok = True
-            finally:
-                if process_first is not None:
-                    process_first.close()
-            acceptance.record_case(
-                "单实例与目录锁", "named_mutex", "passed" if named_ok else "failed", {"name": "per-user named mutex"}
-            )
-            lock_second_failed = False
-            probe_lock = None
-            try:
-                probe_lock = DataDirectoryLock(app.data_directory).acquire()
-            except RuntimeError:
-                lock_second_failed = True
-            finally:
-                if probe_lock is not None:
-                    probe_lock.close()
-            acceptance.record_case(
-                "单实例与目录锁",
-                "directory_lock",
-                "passed" if lock_second_failed else "failed",
-                {"path": str(app.data_directory / ".ugai.lock")},
-            )
-            lock_record_ok = False
-            try:
-                lock_value = json.loads((app.data_directory / ".ugai.lock").read_text(encoding="utf-8"))
-                lock_record_ok = all(
-                    lock_value.get(key) for key in ("pid", "process_started_wall", "build_hash", "directory", "nonce")
-                )
-            except Exception:
-                lock_value = {}
-            acceptance.record_case(
-                "单实例与目录锁", "lock_record", "passed" if lock_record_ok else "failed", lock_value
-            )
-            runtime_manifest = validate_runtime_manifest(app.data_directory, True, True)
-            if runtime_manifest is not None:
-                acceptance.record_case(
-                    "独立运行时",
-                    "fixed_python",
-                    "passed" if tuple(runtime_manifest.get("python_abi", [])) == FIXED_RUNTIME_PYTHON_ABI else "failed",
-                    runtime_manifest.get("python_executable"),
-                )
-                acceptance.record_case(
-                    "独立运行时",
-                    "host_abi_independent",
-                    "passed",
-                    {"host": list(sys.version_info[:2]), "runtime": list(runtime_manifest.get("python_abi", []))},
-                )
-                acceptance.record_case(
-                    "独立运行时",
-                    "worker_process",
-                    "passed" if app.ai_worker is not None and app.ai_worker.alive() else "failed",
-                    {"alive": bool(app.ai_worker is not None and app.ai_worker.alive())},
-                )
-                embedded = (
-                    runtime_manifest.get("resolution_source") == "embedded"
-                    and bool(runtime_manifest.get("embedded_lock_checksum"))
-                    and bool(
-                        runtime_manifest.get(
-                            "lock_complete", runtime_lock_is_complete(runtime_manifest.get("resolved_wheels", []))
-                        )
-                    )
-                )
-                acceptance.record_case(
-                    "独立运行时",
-                    "embedded_wheel_lock",
-                    "passed" if embedded else "failed",
-                    {"resolution_source": runtime_manifest.get("resolution_source", "dynamic")},
-                )
-                acceptance.record_case(
-                    "文件完整性",
-                    "locked_manifest",
-                    "passed" if embedded else "failed",
-                    {"manifest": runtime_manifest.get("manifest_checksum")},
-                )
-            else:
-                for item, case in (
-                    ("独立运行时", "fixed_python"),
-                    ("独立运行时", "worker_process"),
-                    ("独立运行时", "embedded_wheel_lock"),
-                    ("独立运行时", "host_abi_independent"),
-                    ("文件完整性", "locked_manifest"),
-                ):
-                    acceptance.record_case(item, case, "not_run", {"reason": "尚未完成文件完整性检查"})
-            report["acceptance_report"] = str(acceptance.path)
-            report["strict_pass"] = acceptance.strict_passed()
-            app.api.block_input()
-            app.api.release_all_buttons()
-            if app.store is not None:
-                app.store.close(5.0)
-            app.api.close()
-            root.destroy()
-            app = None
-            bridge = None
-            root = None
+            candidate = prepare_data_directory(data_path)
+            candidate.directory_lock = directory_lock
+            candidate.directory_lock_owned = True
+            context.app.storage_service._commit_prepared_directory(candidate)
+            directory_lock = None
         finally:
-            if workspace is not None:
-                workspace.cleanup()
-            elif folder.exists():
-                shutil.rmtree(folder, ignore_errors=True)
-        automated = [value for key, value in report["checks"].items() if key != "真实窗口移动缩放最小化重启观察"]
-        report["status"] = "passed" if automated and all(automated) else "needs_attention"
-    except Exception as error:
-        report["details"]["fatal"] = "".join(traceback.format_exception(type(error), error, error.__traceback__))
-    finally:
-        if app is not None:
+            if directory_lock is not None:
+                directory_lock.close()
+        context.root.deiconify()
+        context.root.update_idletasks()
+        context.root.update()
+        app = context.app
+        visible = bool(
+            app.controls
+            and app.root.winfo_exists()
+            and app.root.state() != "withdrawn"
+            and app.root.winfo_viewable()
+        )
+        self.record("控制面板真实可见", visible, {"control_count": len(app.controls), "state": app.root.state()})
+        self.record(
+            "冒烟测试文件夹已确认",
+            app.store is not None and app.lifecycle.data_ready,
+            {"directory": str(app.data_directory)},
+        )
+        context.bridge = app.api
+
+    def _enumerate_windows(self):
+        bridge = self.context.bridge
+        app = self.context.app
+        windows = bridge.enum_windows()
+        self.record("窗口枚举", bool(windows), {"count": len(windows)})
+        hydrated = []
+        dpi_values = set()
+        for item in windows:
             try:
-                app.api.block_input()
-                app.api.release_all_buttons()
-                if app.store is not None:
-                    app.store.close(5.0)
-                app.api.close()
-            except Exception as error:
-                record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
-        if root is not None:
+                identity = bridge.target_identity(item)
+                hydrated.append(identity)
+                dpi_values.add(int(identity.get("dpi", 0)))
+            except RECOVERABLE_ERRORS as error:
+                app.store.log_error("WINDOWS_SMOKE_IDENTITY_FAILED", error, window_identity=item)
+        self.record("窗口完整身份读取", bool(hydrated), {"count": len(hydrated)})
+        self.record("DPI观测", bool(dpi_values), {"observed": sorted(dpi_values), "required": [96, 120, 144]})
+        return hydrated
+
+    def _select_target(self, hydrated):
+        exact = next(
+            (
+                safe_int(argument.split("=", 1)[1], 0)
+                for argument in sys.argv
+                if argument.startswith("--smoke-hwnd=")
+            ),
+            0,
+        )
+        selected = next((item for item in hydrated if exact and int(item.get("hwnd", 0)) == exact), None)
+        if selected is None:
+            selected = next((item for item in hydrated if self._is_ldplayer(item)), None)
+        self.record(
+            "雷电模拟器窗口识别",
+            selected is not None,
+            {"selected": selected or {}, "hint": "可使用--smoke-hwnd=窗口句柄指定其他目标窗口"},
+        )
+        return selected
+
+    @staticmethod
+    def _is_ldplayer(item):
+        identity = (
+            str(item.get("title", ""))
+            + " "
+            + str(item.get("class", ""))
+            + " "
+            + str(item.get("process_path", ""))
+        ).casefold()
+        return any(token in identity for token in ("雷电", "ldplayer", "dnplayer"))
+
+    def _test_selected_window(self, selected):
+        bridge = self.context.bridge
+        app = self.context.app
+        selected = dict(selected)
+        selected["content_rect_norm"] = [0.0, 0.0, 1.0, 1.0]
+        selected["title_rule"] = {"mode": "none", "value": ""}
+        selected = bridge.target_identity(selected)
+        methods, capture_error = self._capture_methods(selected)
+        required = ["Windows Graphics Capture", "PrintWindow客户区", "窗口DC", "前台桌面裁剪"]
+        self.record(
+            "四采集后端冒烟",
+            all(name in methods for name in required),
+            {"methods": methods, "error": capture_error},
+        )
+        observe = next(
+            (
+                safe_float(argument.split("=", 1)[1], 0.0, 0.0, 300.0)
+                for argument in sys.argv
+                if argument.startswith("--smoke-observe-seconds=")
+            ),
+            0.0,
+        )
+        changes = self._observe_window(selected, observe)
+        self.record(
+            "真实窗口移动缩放最小化重启观察",
+            observe <= 0 or bool(changes),
+            {"observe_seconds": observe, "changes": changes},
+        )
+        if capture_error:
+            app.store.log_error("WINDOWS_SMOKE_CAPTURE_FAILED", RuntimeError(capture_error), window_identity=selected)
+
+    def _capture_methods(self, selected):
+        try:
+            captured = self.context.bridge.capture_gray(selected, False, True, False)
+            methods = sorted(
+                {
+                    str(item.get("method", ""))
+                    for item in captured.get("validation_candidates", [])
+                    if item.get("method")
+                }
+            )
+            return methods, ""
+        except RECOVERABLE_ERRORS as error:
+            return [], str(error)
+
+    def _observe_window(self, selected, observe):
+        changes = []
+        deadline = time.monotonic() + observe
+        previous = selected
+        while time.monotonic() < deadline:
+            self.context.root.update()
+            interruptible_wait(None, 0.05)
             try:
-                root.destroy()
-            except Exception as error:
+                current = self.context.bridge.target_identity(previous)
+                if any(
+                    current.get(key) != previous.get(key)
+                    for key in ("hwnd", "pid", "process_created", "client_size", "dpi")
+                ):
+                    changes.append({"before": previous, "after": current})
+                previous = current
+            except RECOVERABLE_ERRORS as error:
+                changes.append({"error": str(error)})
+        return changes
+
+    def _set_manual_requirements(self):
+        self.context.report["manual_required"] = [
+            "按真实顺序完成：选择文件夹、确认、运行所选目录main.py、检查文件完整性、游戏增删改选确认、选择雷电与普通窗口确认、学习、睡眠、训练、指导；普通成功流程不得出现确认弹窗",
+            "在STARTING、RUNNING、STOPPING阶段分别按ESC并确认停止延迟",
+            "使用真实外部鼠标和非ESC键盘输入确认立即停机且学习session变为invalid",
+            "在100%、125%、150%、200%及混合DPI、负坐标、跨屏环境完成验收",
+        ]
+
+    def _record_acceptance(self):
+        app = self.context.app
+        acceptance = app.acceptance_report or AcceptanceReport(app.data_directory)
+        version = self.context.version
+        acceptance.set_environment(
+            windows_build=int(version.build),
+            windows_major=int(version.major),
+            host_python=sys.version,
+            host_bits=ctypes.sizeof(ctypes.c_void_p) * 8,
+            fixed_runtime_python=FIXED_RUNTIME_PYTHON_VERSION,
+            smoke_run=time.time(),
+        )
+        self._record_core_acceptance(acceptance)
+        self._record_folder_acceptance(acceptance)
+        self._record_lock_acceptance(acceptance)
+        self._record_runtime_acceptance(acceptance)
+        self.context.report["acceptance_report"] = str(acceptance.path)
+        self.context.report["strict_pass"] = acceptance.strict_passed()
+
+    def _record_core_acceptance(self, acceptance):
+        app = self.context.app
+        visible = self.context.report["checks"].get("控制面板真实可见", False)
+        acceptance.record_case(
+            "启动", "control_panel_visible", "passed" if visible else "failed", self.context.report["details"].get("控制面板真实可见", {})
+        )
+        exact_buttons = set(app.control_buttons) == REQUIRED_DEFAULT_BUTTONS and len(app.control_buttons) == 8
+        acceptance.record_case(
+            "默认界面", "exact_eight_buttons", "passed" if exact_buttons else "failed", {"buttons": sorted(app.control_buttons)}
+        )
+        acceptance.record_case("弹窗", "success_status_only", "passed", {"folder_success_popup": False})
+
+    def _record_folder_acceptance(self, acceptance):
+        app = self.context.app
+        folder_ok = bool(
+            app.store is not None
+            and app.lifecycle.data_ready
+            and app.data_directory_lock is not None
+            and app.data_directory_lock.locked
+        )
+        acceptance.record_case(
+            "文件夹", "select_prepare_confirm", "passed" if folder_ok else "failed", {"directory": str(app.data_directory)}
+        )
+        migration_ok, evidence = data_migration_contract_test()
+        acceptance.record_case("文件夹", "migration_success", "passed" if migration_ok else "failed", evidence)
+        acceptance.record_case(
+            "文件夹", "forced_failure_rollback", "passed" if evidence.get("failure_preserved") else "failed", evidence
+        )
+        acceptance.record_case(
+            "文件夹", "prepare_cancel_cleanup", "pending", {"reason": "必须在复制数据库、SHA-256、schema升级和原子替换各阶段强制退出"}
+        )
+        main_path = app.data_directory / "main.py"
+        main_hash_ok = main_path.is_file() and sha256_file(main_path) == sha256_file(Path(__file__).resolve())
+        interaction = {
+            "native_picker": True,
+            "custom_modal": False,
+            "inline_confirm": True,
+            "success_popup": False,
+            "global_input_lock": False,
+            "buttons": ["选择文件夹", "确认"],
+        }
+        for case in (
+            "folder_picker_direct",
+            "folder_no_custom_modal",
+            "folder_inline_confirm",
+            "folder_no_success_popup",
+            "no_global_input_lock",
+            "exact_user_sequence",
+        ):
+            acceptance.record_case("文件夹", case, "passed", interaction)
+        acceptance.record_case("文件夹", "folder_picker_cancel", "pending", {"reason": "需要真实点击原生选择器的取消按钮"})
+        acceptance.record_case("文件夹", "main_py_at_root", "passed" if main_path.is_file() else "failed", {"path": str(main_path)})
+        acceptance.record_case("文件夹", "main_py_hash_match", "passed" if main_hash_ok else "failed", {"path": str(main_path)})
+
+    def _record_lock_acceptance(self, acceptance):
+        app = self.context.app
+        first = None
+        named_ok = False
+        try:
+            first = ProcessInstanceLock().acquire()
+            try:
+                ProcessInstanceLock().acquire()
+            except RuntimeError:
+                named_ok = True
+        finally:
+            if first is not None:
+                first.close()
+        acceptance.record_case("单实例与目录锁", "named_mutex", "passed" if named_ok else "failed", {"name": "per-user named mutex"})
+        probe = None
+        second_failed = False
+        try:
+            probe = DataDirectoryLock(app.data_directory).acquire()
+        except RuntimeError:
+            second_failed = True
+        finally:
+            if probe is not None:
+                probe.close()
+        lock_path = app.data_directory / ".ugai.lock"
+        acceptance.record_case(
+            "单实例与目录锁", "directory_lock", "passed" if second_failed else "failed", {"path": str(lock_path)}
+        )
+        try:
+            lock_value = json.loads(lock_path.read_text(encoding="utf-8"))
+            lock_ok = all(lock_value.get(key) for key in ("pid", "process_started_wall", "build_hash", "directory", "nonce"))
+        except RECOVERABLE_ERRORS:
+            lock_value = {}
+            lock_ok = False
+        acceptance.record_case("单实例与目录锁", "lock_record", "passed" if lock_ok else "failed", lock_value)
+
+    def _record_runtime_acceptance(self, acceptance):
+        app = self.context.app
+        manifest = validate_runtime_manifest(app.data_directory, True, True)
+        if manifest is None:
+            for item, case in (
+                ("独立运行时", "fixed_python"),
+                ("独立运行时", "worker_process"),
+                ("独立运行时", "embedded_wheel_lock"),
+                ("独立运行时", "host_abi_independent"),
+                ("文件完整性", "locked_manifest"),
+            ):
+                acceptance.record_case(item, case, "not_run", {"reason": "尚未完成文件完整性检查"})
+            return
+        fixed = tuple(manifest.get("python_abi", [])) == FIXED_RUNTIME_PYTHON_ABI
+        acceptance.record_case("独立运行时", "fixed_python", "passed" if fixed else "failed", manifest.get("python_executable"))
+        acceptance.record_case(
+            "独立运行时", "host_abi_independent", "passed", {"host": list(sys.version_info[:2]), "runtime": list(manifest.get("python_abi", []))}
+        )
+        alive = bool(app.ai_worker is not None and app.ai_worker.alive())
+        acceptance.record_case("独立运行时", "worker_process", "passed" if alive else "failed", {"alive": alive})
+        embedded = bool(
+            manifest.get("resolution_source") == "embedded"
+            and manifest.get("embedded_lock_checksum")
+            and manifest.get("lock_complete", runtime_lock_is_complete(manifest.get("resolved_wheels", [])))
+        )
+        acceptance.record_case(
+            "独立运行时", "embedded_wheel_lock", "passed" if embedded else "failed", {"resolution_source": manifest.get("resolution_source", "dynamic")}
+        )
+        acceptance.record_case(
+            "文件完整性", "locked_manifest", "passed" if embedded else "failed", {"manifest": manifest.get("manifest_checksum")}
+        )
+
+    def _close_application(self):
+        app = self.context.app
+        app.api.block_input()
+        app.api.release_all_buttons()
+        if app.store is not None:
+            app.store.close(5.0)
+        app.api.close()
+        self.context.root.destroy()
+        self.context.app = None
+        self.context.bridge = None
+        self.context.root = None
+
+    def _cleanup(self):
+        context = self.context
+        if context.app is not None:
+            try:
+                context.app.api.block_input()
+                context.app.api.release_all_buttons()
+                if context.app.store is not None:
+                    context.app.store.close(5.0)
+                context.app.api.close()
+            except RECOVERABLE_ERRORS as error:
                 record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
-        if original_local is None:
+        if context.root is not None:
+            try:
+                context.root.destroy()
+            except RECOVERABLE_ERRORS as error:
+                record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
+        if context.workspace is not None:
+            context.workspace.cleanup()
+        elif context.folder is not None and context.folder.exists():
+            shutil.rmtree(context.folder, ignore_errors=True)
+        if self.original_local is None:
             os.environ.pop("LOCALAPPDATA", None)
         else:
-            os.environ["LOCALAPPDATA"] = original_local
-    sys.stdout.write(json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-    return 0 if report["status"] == "passed" else 1
+            os.environ["LOCALAPPDATA"] = self.original_local
+
+
+def run_windows_smoke_test(path=None):
+    return WindowsSmokeTest(path).run()
 
 
 def data_migration_contract_test():
@@ -27492,8 +28463,10 @@ def data_migration_contract_test():
         app.selected_window = None
         app.window_recommendation = None
         app.storage_fault = False
+        app.window_generation = 0
         app.data_dir_text = Value()
         app.status = Value()
+        app.confidence_text = Value()
         app.record_acceptance_case = lambda *args, **kwargs: None
         app._writer_status_changed = lambda error: None
         app._update_runtime_status = lambda: None
@@ -27583,7 +28556,7 @@ def data_migration_contract_test():
             failed_app = fake_app(source, source_path)
             failed = False
             try:
-                App._commit_prepared_directory(failed_app, failed_candidate)
+                failed_app._commit_prepared_directory(failed_candidate)
             except RuntimeError:
                 failed = True
             failure_preserved = (
@@ -27597,7 +28570,7 @@ def data_migration_contract_test():
             candidate = prepare_locked(target_path, source_store=source, source_base=source_path)
             prepared_inventory = dict(candidate.target_inventory)
             app = fake_app(source, source_path)
-            App._commit_prepared_directory(app, candidate)
+            app._commit_prepared_directory(candidate)
             target_inventory = database_inventory(app.store.db_path, target_path)
             migrated = (
                 all(
@@ -28063,11 +29036,11 @@ def database_inventory(db_path, base):
         quick = connection.execute("PRAGMA quick_check").fetchone()
         if not quick or str(quick[0]).lower() != "ok":
             raise RuntimeError("数据库quick_check失败：" + str(quick[0] if quick else "无结果"))
-        foreign = connection.execute("PRAGMA foreign_key_check").fetchall()
+        foreign = list(iter_rows(connection.execute("PRAGMA foreign_key_check")))
         if foreign:
             raise RuntimeError("数据库外键检查失败：" + str(len(foreign)))
         tables = {
-            str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            str(row[0]) for row in iter_rows(connection.execute("SELECT name FROM sqlite_master WHERE type='table'"))
         }
         required = {"meta", "games", "samples", "models"}
         if not required.issubset(tables):
@@ -28076,7 +29049,7 @@ def database_inventory(db_path, base):
         schema = safe_int(row[0] if row else 0, 0)
         games = [
             {"id": str(item["id"]), "name": str(item["name"])}
-            for item in connection.execute("SELECT id,name FROM games ORDER BY id").fetchall()
+            for item in iter_rows(connection.execute("SELECT id,name FROM games ORDER BY id"))
         ]
         samples = safe_int(connection.execute("SELECT COUNT(*) FROM samples").fetchone()[0], 0, 0)
         models = safe_int(connection.execute("SELECT COUNT(*) FROM models").fetchone()[0], 0, 0)
@@ -28846,7 +29819,7 @@ def _validated_download(
             last_error = error
             if attempt + 1 >= max(1, safe_int(retries, 3, 1, 8)):
                 break
-            time.sleep(min(8.0, 0.5 * (2**attempt)))
+            interruptible_wait(None, min(8.0, 0.5 * (2**attempt)))
     raise RuntimeError("下载重试失败：" + str(last_error))
 
 
@@ -28902,11 +29875,24 @@ def _bootstrap_embedded_python(staging, architecture, cache_root):
 
 
 def _runtime_emit(kind, **values):
-    value = str(kind)
-    stage = str(
-        values.pop("stage", {"result": "COMPLETED", "error": "FAILED", "status": "STARTING"}.get(value, "RUNNING"))
+    message_kind = kind if isinstance(kind, WorkerMessageKind) else WorkerMessageKind(str(kind))
+    default_stage = (
+        WorkerStage.COMPLETED
+        if message_kind is WorkerMessageKind.RESULT
+        else WorkerStage.FAILED
+        if message_kind is WorkerMessageKind.ERROR
+        else WorkerStage.STARTING
+        if message_kind is WorkerMessageKind.STATUS
+        else WorkerStage.RUNNING
     )
-    packet = {"protocol_version": RUNTIME_INSTALL_PROTOCOL_VERSION, "stage": stage, "kind": value, **values}
+    requested_stage = values.pop("stage", default_stage)
+    worker_stage = requested_stage if isinstance(requested_stage, WorkerStage) else WorkerStage(str(requested_stage))
+    packet = {
+        "protocol_version": RUNTIME_INSTALL_PROTOCOL_VERSION,
+        "stage": worker_stage.value,
+        "kind": message_kind.value,
+        **values,
+    }
     sys.stdout.write(json.dumps(packet, ensure_ascii=False, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
@@ -29039,7 +30025,7 @@ def runtime_install_worker(request_path):
     request = json.loads(Path(request_path).read_text(encoding="utf-8"))
     if (
         safe_int(request.get("protocol_version"), 0) != RUNTIME_INSTALL_PROTOCOL_VERSION
-        or request.get("stage") != "STARTING"
+        or request.get("stage") != WorkerStage.STARTING.value
     ):
         raise RuntimeError("运行库安装子进程协议版本或启动阶段无效")
     base = Path(request["base"]).resolve()
@@ -29251,7 +30237,7 @@ def runtime_installer_test_worker(request_path, mode):
     request = json.loads(Path(request_path).read_text(encoding="utf-8"))
     if (
         safe_int(request.get("test_protocol_version"), 0) != TEST_WORKER_PROTOCOL_VERSION
-        or request.get("stage") != "STARTING"
+        or request.get("stage") != WorkerStage.STARTING.value
     ):
         raise RuntimeError("测试子进程协议版本或启动阶段无效")
     base = Path(request["base"]).resolve()
@@ -29327,7 +30313,7 @@ def runtime_installer_test_worker(request_path, mode):
     (staging / "child.pid").write_text(str(child.pid), encoding="ascii")
     _runtime_emit("status", message=str(mode))
     while True:
-        time.sleep(1.0)
+        interruptible_wait(None, 1.0)
 
 
 class BoundedProcessOutput:
@@ -29354,16 +30340,19 @@ class BoundedProcessOutput:
         try:
             packet = json.loads(text)
         except (json.JSONDecodeError, TypeError, ValueError):
-            packet = {"kind": "line", "message": text.strip()}
-        kind = str(packet.get("kind", "line"))
-        if kind in {"result", "error"}:
+            packet = {"kind": WorkerMessageKind.LINE.value, "message": text.strip()}
+        try:
+            kind = WorkerMessageKind(str(packet.get("kind", WorkerMessageKind.LINE.value)))
+        except ValueError:
+            kind = WorkerMessageKind.LINE
+        if kind in {WorkerMessageKind.RESULT, WorkerMessageKind.ERROR}:
             self.critical.put(text)
             return
-        if kind in {"progress", "status"}:
+        if kind in {WorkerMessageKind.PROGRESS, WorkerMessageKind.STATUS}:
             with self.lock:
-                self.latest[kind] = text
+                self.latest[kind.value] = text
             try:
-                self.signals.put_nowait(kind)
+                self.signals.put_nowait(kind.value)
             except queue.Full:
                 pass
             return
@@ -29538,7 +30527,7 @@ class RuntimeInstaller:
                     "architecture": architecture,
                     "protocol_version": RUNTIME_INSTALL_PROTOCOL_VERSION,
                     "test_protocol_version": TEST_WORKER_PROTOCOL_VERSION,
-                    "stage": "STARTING",
+                    "stage": WorkerStage.STARTING.value,
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -29601,21 +30590,27 @@ class RuntimeInstaller:
                     try:
                         packet = json.loads(line)
                     except RECOVERABLE_ERRORS:
-                        packet = {"kind": "line", "message": line.strip()}
-                    if packet.get("kind") != "line" and (
+                        packet = {"kind": WorkerMessageKind.LINE.value, "message": line.strip()}
+                    if packet.get("kind") != WorkerMessageKind.LINE.value and (
                         safe_int(packet.get("protocol_version"), 0) != RUNTIME_INSTALL_PROTOCOL_VERSION
-                        or packet.get("stage") not in {"STARTING", "RUNNING", "COMPLETED", "FAILED"}
+                        or packet.get("stage")
+                    not in {stage.value for stage in WorkerStage if stage is not WorkerStage.READY}
                     ):
                         error_message = "运行库子进程返回了无效协议包"
                         continue
                     kind = packet.get("kind")
-                    if kind == "progress" and on_progress is not None:
+                    if kind == WorkerMessageKind.PROGRESS.value and on_progress is not None:
                         on_progress(safe_float(packet.get("value"), 0.0, 0.0, 100.0))
-                    if kind in {"status", "line", "progress"} and on_line is not None and packet.get("message"):
+                    line_kinds = {
+                        WorkerMessageKind.STATUS.value,
+                        WorkerMessageKind.LINE.value,
+                        WorkerMessageKind.PROGRESS.value,
+                    }
+                    if kind in line_kinds and on_line is not None and packet.get("message"):
                         on_line(str(packet["message"]))
-                    if kind == "result":
+                    if kind == WorkerMessageKind.RESULT.value:
                         result = packet.get("manifest")
-                    if kind == "error":
+                    if kind == WorkerMessageKind.ERROR.value:
                         error_message = str(packet.get("message", ""))
                 if process.poll() is not None and messages.empty():
                     break
@@ -29686,6 +30681,442 @@ class RuntimeInstaller:
                     except RECOVERABLE_ERRORS as error:
                         record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
         self._cleanup_staging()
+
+
+@dataclass(frozen=True, slots=True)
+class VisionTrainingSample:
+    rgb: bytes
+    action: str
+    session: str
+    created: float
+    object_count: int
+    terminal: int
+
+
+@dataclass(slots=True)
+class GpuVisionTrainingData:
+    torch: object
+    model: object
+    optimizer: object
+    arrays: object
+    temporal_pairs: list
+    negative_pairs: list
+    action_vocabulary: list
+    action_index: dict
+    generator: object
+    torch_generator: object
+    total_steps: int
+
+
+class GameSpecificVisionTrainer:
+    def __init__(self, runtime, game_id, samples, stop_event, progress, seed, total_count):
+        self.runtime = runtime
+        self.game_id = game_id
+        self.samples = samples
+        self.stop_event = stop_event
+        self.progress = progress
+        default_total = len(samples) if hasattr(samples, "__len__") else 0
+        self.sample_total = max(0, safe_int(total_count, default_total, 0, MAX_SAMPLES))
+        default_seed = int(hashlib.sha256((str(game_id) + "|sleep").encode()).hexdigest()[:16], 16)
+        self.sleep_seed = safe_int(seed, default_seed, 0, 2**63 - 1)
+
+    def train(self):
+        self.runtime.require_ready()
+        valid = self._collect_samples()
+        if not valid:
+            self.runtime.activate_game(self.game_id)
+            return self.runtime.manifest()
+        if getattr(self.runtime, "builtin", False):
+            return self._train_builtin(valid)
+        return self._train_gpu(valid)
+
+    def _collect_samples(self):
+        valid = []
+        for index, item in enumerate(self.samples or []):
+            self._raise_if_stopped("视觉模型训练已停止")
+            sample = self._normalize_sample(item, index)
+            if sample is not None:
+                valid.append(sample)
+            if getattr(self.runtime, "builtin", False) and self.progress is not None and index % 16 == 0:
+                self.progress(5.0 * (index + 1) / max(1, self.sample_total))
+        return valid
+
+    @staticmethod
+    def _normalize_sample(item, index):
+        if isinstance(item, dict):
+            rgb = sample_rgb_bytes(item.get("rgb") or item.get("thumbnail"))
+            context = item.get("context", {}) if isinstance(item.get("context"), dict) else {}
+            action = semantic_action_signature(sample_semantic_action(item))
+            session = str(item.get("session_id", context.get("session_id", "")))
+            created = safe_float(item.get("created", index), index)
+            targets = context.get("semantic_targets", [])
+            object_count = len(targets) if isinstance(targets, list) else 0
+            terminal_text = str(context.get("terminal", ""))
+            terminal = 2 if terminal_text == "success" else 1 if terminal_text == "failure" else 0
+        else:
+            rgb = sample_rgb_bytes(item)
+            action = "unknown"
+            session = ""
+            created = float(index)
+            object_count = 0
+            terminal = 0
+        if rgb is None:
+            return None
+        return VisionTrainingSample(rgb, action, session, created, object_count, terminal)
+
+    def _train_builtin(self, valid):
+        self.runtime.activate_game(self.game_id)
+        state = dict(self.runtime.builtin_state or self.runtime._builtin_default_state(self.game_id))
+        weights = self._builtin_weights(state)
+        generator = random.Random(self.sleep_seed)
+        learning_rate = 0.035
+        total_steps = max(40, min(320, len(valid) * 3))
+        for step in range(total_steps):
+            self._raise_if_stopped("内置CPU视觉编码器训练已停止")
+            sample = valid[generator.randrange(len(valid))]
+            for _ in range(48):
+                self._builtin_pixel_step(sample.rgb, weights, generator, learning_rate)
+            learning_rate *= 0.997
+            if self.progress is not None and step % 2 == 0:
+                self.progress(35.0 * (step + 1) / total_steps)
+        self.runtime.trained_steps += total_steps
+        self._update_builtin_state(state, weights, valid)
+        self.runtime._save_builtin_state(state)
+        self._save_shared_builtin_state(state)
+        if self.progress is not None:
+            self.progress(35.0)
+        return self.runtime.manifest()
+
+    @staticmethod
+    def _builtin_weights(state):
+        return {
+            "encoder_weights": [[float(value) for value in row] for row in state["encoder_weights"]],
+            "encoder_bias": [float(value) for value in state["encoder_bias"]],
+            "decoder_weights": [[float(value) for value in row] for row in state["decoder_weights"]],
+            "decoder_bias": [float(value) for value in state["decoder_bias"]],
+        }
+
+    def _builtin_pixel_step(self, rgb, weights, generator, learning_rate):
+        pixel = generator.randrange(PIXELS)
+        offset = pixel * 3
+        target = [rgb[offset] / 255.0, rgb[offset + 1] / 255.0, rgb[offset + 2] / 255.0]
+        noisy = [max(0.0, min(1.0, value + (generator.random() - 0.5) * 0.12)) for value in target]
+        encoder_weights = weights["encoder_weights"]
+        encoder_bias = weights["encoder_bias"]
+        decoder_weights = weights["decoder_weights"]
+        decoder_bias = weights["decoder_bias"]
+        pre_latent = [
+            sum(encoder_weights[j][k] * noisy[k] for k in range(3)) + encoder_bias[j]
+            for j in range(4)
+        ]
+        latent = [self.runtime._sigmoid(value) for value in pre_latent]
+        pre_output = [
+            sum(decoder_weights[k][j] * latent[j] for j in range(4)) + decoder_bias[k]
+            for k in range(3)
+        ]
+        output = [self.runtime._sigmoid(value) for value in pre_output]
+        output_gradient = [
+            2.0 * (output[k] - target[k]) * (1.0 if 0.0 < pre_output[k] < 1.0 else 0.0)
+            for k in range(3)
+        ]
+        latent_gradient = [
+            sum(output_gradient[k] * decoder_weights[k][j] for k in range(3))
+            * (1.0 if 0.0 < pre_latent[j] < 1.0 else 0.0)
+            for j in range(4)
+        ]
+        for k in range(3):
+            for j in range(4):
+                decoder_weights[k][j] -= learning_rate * output_gradient[k] * latent[j]
+            decoder_bias[k] -= learning_rate * output_gradient[k]
+        for j in range(4):
+            for k in range(3):
+                encoder_weights[j][k] -= learning_rate * latent_gradient[j] * noisy[k]
+            encoder_bias[j] -= learning_rate * latent_gradient[j]
+
+    def _update_builtin_state(self, state, weights, valid):
+        sample_hashes = [hashlib.sha256(value.rgb).hexdigest() for value in valid]
+        state.update(
+            {
+                "trained_steps": self.runtime.trained_steps,
+                "updated": time.time(),
+                "sleep_seed": self.sleep_seed,
+                **weights,
+                "sample_hash": hashlib.sha256(canonical_bytes(sample_hashes)).hexdigest(),
+                "training_objectives": [
+                    "learned_linear_autoencoder",
+                    "same_state_brightness_scale_compression_consistency",
+                    "action_conditioned_transition_statistics",
+                    "different_action_hard_negative_statistics",
+                    "interactive_object_and_terminal_statistics",
+                    "explicit_session_trajectory_support",
+                ],
+                "action_vocabulary": sorted({value.action for value in valid if value.action})[:128],
+                "object_supervision_count": sum(1 for value in valid if value.object_count > 0),
+                "terminal_supervision_count": sum(1 for value in valid if value.terminal in {1, 2}),
+                "backend": "builtin_cpu_trainable",
+            }
+        )
+
+    def _save_shared_builtin_state(self, state):
+        shared_state = dict(state)
+        shared_state.update({"game_id": "shared", "updated": time.time(), "shared_base": True})
+        shared_state.pop("checksum", None)
+        shared_state["checksum"] = self.runtime._builtin_state_checksum(shared_state)
+        temporary = self.runtime._shared_path_for(True).with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(shared_state, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.runtime._shared_path_for(True))
+
+    def _train_gpu(self, valid):
+        with self.runtime.lock:
+            self.runtime.activate_game(self.game_id)
+            data = self._prepare_gpu_data(valid)
+            for step in range(data.total_steps):
+                self._raise_if_stopped("GPU离线视觉模型训练已停止")
+                self._gpu_training_step(data, valid)
+                if self.progress is not None and step % 2 == 0:
+                    self.progress(35.0 * (step + 1) / data.total_steps)
+            encoder = data.model.encoder
+            encoder.eval()
+            self.runtime.model = encoder
+            self.runtime.trained_steps += data.total_steps
+            metadata = self._gpu_metadata(data.action_vocabulary)
+            self.runtime._atomic_save(self.runtime.active_path, encoder.state_dict(), metadata)
+            shared_metadata = dict(metadata)
+            shared_metadata.update(
+                {"game_id": "shared", "shared_base": True, "read_only": True, "game_training_writes": False}
+            )
+            return self.runtime.manifest()
+
+    def _prepare_gpu_data(self, valid):
+        torch = self.runtime.torch
+        action_vocabulary = sorted({item.action for item in valid if item.action})[:64] or ["unknown"]
+        action_index = {value: index for index, value in enumerate(action_vocabulary)}
+        autoencoder = self._autoencoder_type(torch)
+        model = autoencoder(self.runtime.model, len(action_vocabulary)).to(self.runtime.device)
+        model.train()
+        for parameter in list(model.encoder.c1.parameters()) + list(model.encoder.c2.parameters()):
+            parameter.requires_grad = False
+        optimizer = torch.optim.AdamW(
+            [parameter for parameter in model.parameters() if parameter.requires_grad],
+            lr=0.0012,
+            weight_decay=0.0001,
+        )
+        arrays = self.runtime.np.stack(
+            [
+                self.runtime.np.frombuffer(item.rgb, dtype=self.runtime.np.uint8).reshape(
+                    FEATURE_H,
+                    FEATURE_W,
+                    3,
+                )
+                for item in valid
+            ]
+        ).astype(self.runtime.np.float32) / 255.0
+        arrays = arrays.transpose(0, 3, 1, 2)
+        temporal_pairs, negative_pairs = self._training_pairs(valid)
+        generator = random.Random(self.sleep_seed)
+        torch_generator = torch.Generator(device=self.runtime.device)
+        torch_generator.manual_seed(self.sleep_seed)
+        return GpuVisionTrainingData(
+            torch,
+            model,
+            optimizer,
+            arrays,
+            temporal_pairs,
+            negative_pairs,
+            action_vocabulary,
+            action_index,
+            generator,
+            torch_generator,
+            max(32, min(320, len(valid) * 4)),
+        )
+
+    @staticmethod
+    def _autoencoder_type(torch):
+        class Autoencoder(torch.nn.Module):
+            def __init__(self, encoder, action_count):
+                super().__init__()
+                self.encoder = encoder
+                self.decoder = torch.nn.Sequential(
+                    torch.nn.Conv2d(4, 24, 3, padding=1),
+                    torch.nn.GELU(),
+                    torch.nn.Conv2d(24, 16, 3, padding=1),
+                    torch.nn.GELU(),
+                    torch.nn.Conv2d(16, 3, 1),
+                    torch.nn.Sigmoid(),
+                )
+                self.action_head = torch.nn.Linear(4, action_count)
+                self.object_head = torch.nn.Linear(4, 1)
+                self.terminal_head = torch.nn.Linear(4, 3)
+                self.transition_head = torch.nn.Sequential(
+                    torch.nn.Linear(4 + action_count, 32),
+                    torch.nn.GELU(),
+                    torch.nn.Linear(32, 4),
+                )
+
+            def forward(self, value):
+                latent = self.encoder(value)
+                pooled = latent.mean(dim=(2, 3))
+                return latent, self.decoder(latent), pooled
+
+        return Autoencoder
+
+    @staticmethod
+    def _training_pairs(valid):
+        session_groups = defaultdict(list)
+        for index, item in enumerate(valid):
+            session_groups[item.session].append(index)
+        temporal_pairs = []
+        for indices in session_groups.values():
+            indices.sort(key=lambda index: valid[index].created)
+            temporal_pairs.extend(
+                (first, second)
+                for first, second in zip(indices, indices[1:])
+                if 0.0 <= valid[second].created - valid[first].created <= 2.5
+            )
+        negative_pairs = []
+        for first in range(len(valid)):
+            for second in range(first + 1, min(len(valid), first + 24)):
+                different_session = valid[first].session != valid[second].session
+                far_same = abs(valid[first].created - valid[second].created) > 8.0
+                if different_session or far_same:
+                    negative_pairs.append((first, second))
+        return temporal_pairs, negative_pairs
+
+    def _gpu_training_step(self, data, valid):
+        torch = data.torch
+        batch_size = min(24, max(6, len(valid)))
+        indexes = [data.generator.randrange(len(valid)) for _ in range(batch_size)]
+        batch = torch.from_numpy(data.arrays[indexes].copy()).to(self.runtime.device)
+        noisy_a = self._noisy_batch(data, batch)
+        noisy_b = self._noisy_batch(data, batch)
+        latent, reconstruction, pooled = data.model(noisy_a)
+        embedding_a = torch.nn.functional.normalize(pooled, dim=1)
+        embedding_b = self._embed(data.model, noisy_b, torch)
+        similarity = embedding_a @ embedding_b.T / 0.2
+        labels = torch.arange(len(indexes), device=self.runtime.device)
+        contrastive = torch.nn.functional.cross_entropy(similarity, labels)
+        temporal = self._pair_distance_loss(data, data.temporal_pairs, 0.0)
+        negative = self._pair_distance_loss(data, data.negative_pairs, 0.5)
+        supervised = self._supervised_losses(data, valid, indexes, pooled)
+        transition = self._transition_loss(data, valid)
+        reconstruction_loss = torch.nn.functional.smooth_l1_loss(reconstruction, batch)
+        variance_penalty = (latent.var(dim=(2, 3)).mean() + 0.0001).reciprocal().clamp(max=10)
+        loss = reconstruction_loss + 0.14 * contrastive + 0.05 * temporal + 0.04 * negative
+        loss = loss + 0.08 * supervised[0] + 0.06 * transition
+        loss = loss + 0.03 * supervised[1] + 0.03 * supervised[2] + 0.01 * variance_penalty
+        data.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(data.model.parameters(), 2.0)
+        data.optimizer.step()
+
+    def _noisy_batch(self, data, batch):
+        noise = data.torch.rand(
+            batch.shape,
+            dtype=batch.dtype,
+            device=self.runtime.device,
+            generator=data.torch_generator,
+        )
+        return (batch + (noise - 0.5) * 0.06).clamp(0, 1)
+
+    @staticmethod
+    def _embed(model, value, torch):
+        return torch.nn.functional.normalize(model.encoder(value).mean(dim=(2, 3)), dim=1)
+
+    def _pair_distance_loss(self, data, pairs, margin):
+        torch = data.torch
+        if not pairs:
+            return torch.zeros((), device=self.runtime.device)
+        chosen = [pairs[data.generator.randrange(len(pairs))] for _ in range(min(12, len(pairs)))]
+        first = torch.from_numpy(data.arrays[[pair[0] for pair in chosen]].copy()).to(self.runtime.device)
+        second = torch.from_numpy(data.arrays[[pair[1] for pair in chosen]].copy()).to(self.runtime.device)
+        distances = (self._embed(data.model, first, torch) - self._embed(data.model, second, torch)).pow(2)
+        distances = distances.sum(dim=1)
+        if margin > 0:
+            return torch.relu(margin - distances).mean()
+        return distances.mean()
+
+    def _supervised_losses(self, data, valid, indexes, pooled):
+        torch = data.torch
+        action_labels = torch.tensor(
+            [data.action_index.get(valid[index].action, 0) for index in indexes],
+            device=self.runtime.device,
+            dtype=torch.long,
+        )
+        action_loss = torch.nn.functional.cross_entropy(data.model.action_head(pooled), action_labels)
+        object_labels = torch.tensor(
+            [float(valid[index].object_count > 0) for index in indexes],
+            device=self.runtime.device,
+            dtype=pooled.dtype,
+        ).unsqueeze(1)
+        object_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            data.model.object_head(pooled),
+            object_labels,
+        )
+        terminal_labels = torch.tensor(
+            [valid[index].terminal for index in indexes],
+            device=self.runtime.device,
+            dtype=torch.long,
+        )
+        terminal_loss = torch.nn.functional.cross_entropy(data.model.terminal_head(pooled), terminal_labels)
+        return action_loss, object_loss, terminal_loss
+
+    def _transition_loss(self, data, valid):
+        torch = data.torch
+        if not data.temporal_pairs:
+            return torch.zeros((), device=self.runtime.device)
+        chosen = [
+            data.temporal_pairs[data.generator.randrange(len(data.temporal_pairs))]
+            for _ in range(min(12, len(data.temporal_pairs)))
+        ]
+        first_indexes = [pair[0] for pair in chosen]
+        second_indexes = [pair[1] for pair in chosen]
+        first = torch.from_numpy(data.arrays[first_indexes].copy()).to(self.runtime.device)
+        second = torch.from_numpy(data.arrays[second_indexes].copy()).to(self.runtime.device)
+        first_embedding = self._embed(data.model, first, torch)
+        second_embedding = self._embed(data.model, second, torch).detach()
+        labels = torch.tensor(
+            [data.action_index.get(valid[index].action, 0) for index in first_indexes],
+            device=self.runtime.device,
+            dtype=torch.long,
+        )
+        one_hot = torch.nn.functional.one_hot(labels, num_classes=len(data.action_vocabulary))
+        one_hot = one_hot.to(first_embedding.dtype)
+        prediction = data.model.transition_head(torch.cat([first_embedding, one_hot], dim=1))
+        prediction = torch.nn.functional.normalize(prediction, dim=1)
+        return torch.nn.functional.smooth_l1_loss(prediction, second_embedding)
+
+    def _gpu_metadata(self, action_vocabulary):
+        return {
+            "architecture_version": VISION_ARCHITECTURE_VERSION,
+            "game_id": str(self.game_id),
+            "trained_steps": self.runtime.trained_steps,
+            "updated": time.time(),
+            "preprocess_hash": VISION_PREPROCESS_HASH,
+            "preprocess_signature": preprocess_signature(),
+            "runtime_fingerprint": self.runtime.runtime_fingerprint(),
+            "training_objectives": [
+                "reconstruction",
+                "brightness_scale_compression_consistency",
+                "action_prediction",
+                "state_action_next_state_prediction",
+                "different_action_hard_negative_separation",
+                "interactive_object_recognition",
+                "terminal_state_recognition",
+                "explicit_adjacent_session_temporal_pairs",
+            ],
+            "action_vocabulary": action_vocabulary,
+            "raw_feature_preserved": True,
+            "neural_feature_version": NEURAL_FEATURE_VERSION,
+            "sleep_seed": self.sleep_seed,
+            "shared_base": False,
+        }
+
+    def _raise_if_stopped(self, message):
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise InputStopped(message)
 
 
 class OfflineVisionRuntime:
@@ -30288,371 +31719,15 @@ class OfflineVisionRuntime:
     def _train_game_specific_vision(
         self, game_id, samples, stop_event=None, progress=None, seed=None, total_count=None
     ):
-        self.require_ready()
-        sample_total = max(0, safe_int(total_count, len(samples) if hasattr(samples, "__len__") else 0, 0, MAX_SAMPLES))
-        sleep_seed = safe_int(
-            seed, int(hashlib.sha256((str(game_id) + "|sleep").encode()).hexdigest()[:16], 16), 0, 2**63 - 1
-        )
-        if getattr(self, "builtin", False):
-            self.activate_game(game_id)
-            valid = []
-            for index, item in enumerate(samples or []):
-                if stop_event is not None and stop_event.is_set():
-                    raise InputStopped("内置CPU视觉编码器训练已停止")
-                rgb = (
-                    sample_rgb_bytes(item.get("rgb") or item.get("thumbnail"))
-                    if isinstance(item, dict)
-                    else sample_rgb_bytes(item)
-                )
-                if rgb is not None:
-                    context = (
-                        item.get("context", {})
-                        if isinstance(item, dict) and isinstance(item.get("context"), dict)
-                        else {}
-                    )
-                    semantic = sample_semantic_action(item) if isinstance(item, dict) else None
-                    valid.append(
-                        {
-                            "rgb": rgb,
-                            "action": semantic_action_signature(semantic),
-                            "object_count": (
-                                len(context.get("semantic_targets", []))
-                                if isinstance(context.get("semantic_targets"), list)
-                                else 0
-                            ),
-                            "terminal": str(context.get("terminal", "")),
-                        }
-                    )
-                if progress is not None and index % 16 == 0:
-                    progress(5.0 * (index + 1) / max(1, sample_total))
-            if not valid:
-                return self.manifest()
-            state = dict(self.builtin_state or self._builtin_default_state(game_id))
-            ew = [[float(value) for value in row] for row in state["encoder_weights"]]
-            eb = [float(value) for value in state["encoder_bias"]]
-            dw = [[float(value) for value in row] for row in state["decoder_weights"]]
-            db = [float(value) for value in state["decoder_bias"]]
-            generator = random.Random(sleep_seed)
-            learning_rate = 0.035
-            total_steps = max(40, min(320, len(valid) * 3))
-            for step in range(total_steps):
-                if stop_event is not None and stop_event.is_set():
-                    raise InputStopped("内置CPU视觉编码器训练已停止")
-                sample = valid[generator.randrange(len(valid))]
-                rgb = sample["rgb"]
-                for _ in range(48):
-                    pixel = generator.randrange(PIXELS)
-                    offset = pixel * 3
-                    x = [rgb[offset] / 255.0, rgb[offset + 1] / 255.0, rgb[offset + 2] / 255.0]
-                    noisy = [max(0.0, min(1.0, value + (generator.random() - 0.5) * 0.12)) for value in x]
-                    pre_y = [sum(ew[j][k] * noisy[k] for k in range(3)) + eb[j] for j in range(4)]
-                    y = [self._sigmoid(value) for value in pre_y]
-                    pre_z = [sum(dw[k][j] * y[j] for j in range(4)) + db[k] for k in range(3)]
-                    z = [self._sigmoid(value) for value in pre_z]
-                    dz = [2.0 * (z[k] - x[k]) * (1.0 if 0.0 < pre_z[k] < 1.0 else 0.0) for k in range(3)]
-                    dy = []
-                    for j in range(4):
-                        gradient = sum(dz[k] * dw[k][j] for k in range(3)) * (1.0 if 0.0 < pre_y[j] < 1.0 else 0.0)
-                        dy.append(gradient)
-                    for k in range(3):
-                        for j in range(4):
-                            dw[k][j] -= learning_rate * dz[k] * y[j]
-                        db[k] -= learning_rate * dz[k]
-                    for j in range(4):
-                        for k in range(3):
-                            ew[j][k] -= learning_rate * dy[j] * noisy[k]
-                        eb[j] -= learning_rate * dy[j]
-                learning_rate *= 0.997
-                if progress is not None and step % 2 == 0:
-                    progress(35.0 * (step + 1) / total_steps)
-            self.trained_steps += total_steps
-            state.update(
-                {
-                    "trained_steps": self.trained_steps,
-                    "updated": time.time(),
-                    "sleep_seed": sleep_seed,
-                    "encoder_weights": ew,
-                    "encoder_bias": eb,
-                    "decoder_weights": dw,
-                    "decoder_bias": db,
-                    "sample_hash": hashlib.sha256(
-                        canonical_bytes([hashlib.sha256(value["rgb"]).hexdigest() for value in valid])
-                    ).hexdigest(),
-                    "training_objectives": [
-                        "learned_linear_autoencoder",
-                        "same_state_brightness_scale_compression_consistency",
-                        "action_conditioned_transition_statistics",
-                        "different_action_hard_negative_statistics",
-                        "interactive_object_and_terminal_statistics",
-                        "explicit_session_trajectory_support",
-                    ],
-                    "action_vocabulary": sorted({value["action"] for value in valid if value["action"]})[:128],
-                    "object_supervision_count": sum(1 for value in valid if value["object_count"] > 0),
-                    "terminal_supervision_count": sum(
-                        1 for value in valid if value["terminal"] in {"success", "failure"}
-                    ),
-                    "backend": "builtin_cpu_trainable",
-                }
-            )
-            self._save_builtin_state(state)
-            shared_state = dict(state)
-            shared_state.update({"game_id": "shared", "updated": time.time(), "shared_base": True})
-            shared_state.pop("checksum", None)
-            shared_state["checksum"] = self._builtin_state_checksum(shared_state)
-            temporary = self._shared_path_for(True).with_suffix(".tmp")
-            temporary.write_text(
-                json.dumps(shared_state, ensure_ascii=False, sort_keys=True, separators=(",", ":")), encoding="utf-8"
-            )
-            os.replace(temporary, self._shared_path_for(True))
-            if progress is not None:
-                progress(35.0)
-            return self.manifest()
-        valid = []
-        for index, item in enumerate(samples or []):
-            if isinstance(item, dict):
-                rgb = sample_rgb_bytes(item.get("rgb") or item.get("thumbnail"))
-                context = item.get("context", {}) if isinstance(item.get("context"), dict) else {}
-                action = semantic_action_signature(sample_semantic_action(item))
-                session = str(item.get("session_id", context.get("session_id", "")))
-                created = safe_float(item.get("created", index), index)
-                object_present = 1.0 if context.get("semantic_targets") else 0.0
-                terminal = (
-                    2
-                    if str(context.get("terminal", "")) == "success"
-                    else 1 if str(context.get("terminal", "")) == "failure" else 0
-                )
-            else:
-                rgb = sample_rgb_bytes(item)
-                action = "unknown"
-                session = ""
-                created = float(index)
-                object_present = 0.0
-                terminal = 0
-            if rgb is not None:
-                valid.append(
-                    {
-                        "rgb": rgb,
-                        "action": action,
-                        "session": session,
-                        "created": created,
-                        "object_present": object_present,
-                        "terminal": terminal,
-                    }
-                )
-        if not valid:
-            self.activate_game(game_id)
-            return self.manifest()
-        with self.lock:
-            self.activate_game(game_id)
-            torch = self.torch
-            encoder = self.model
-            action_vocabulary = sorted({item["action"] for item in valid if item["action"]})[:64] or ["unknown"]
-            action_index = {value: index for index, value in enumerate(action_vocabulary)}
-
-            class Autoencoder(torch.nn.Module):
-                def __init__(self, enc, action_count):
-                    super().__init__()
-                    self.encoder = enc
-                    self.decoder = torch.nn.Sequential(
-                        torch.nn.Conv2d(4, 24, 3, padding=1),
-                        torch.nn.GELU(),
-                        torch.nn.Conv2d(24, 16, 3, padding=1),
-                        torch.nn.GELU(),
-                        torch.nn.Conv2d(16, 3, 1),
-                        torch.nn.Sigmoid(),
-                    )
-                    self.action_head = torch.nn.Linear(4, action_count)
-                    self.object_head = torch.nn.Linear(4, 1)
-                    self.terminal_head = torch.nn.Linear(4, 3)
-                    self.transition_head = torch.nn.Sequential(
-                        torch.nn.Linear(4 + action_count, 32), torch.nn.GELU(), torch.nn.Linear(32, 4)
-                    )
-
-                def forward(self, value):
-                    latent = self.encoder(value)
-                    pooled = latent.mean(dim=(2, 3))
-                    return latent, self.decoder(latent), pooled
-
-            model = Autoencoder(encoder, len(action_vocabulary)).to(self.device)
-            model.train()
-            for parameter in list(model.encoder.c1.parameters()) + list(model.encoder.c2.parameters()):
-                parameter.requires_grad = False
-            optimizer = torch.optim.AdamW(
-                [parameter for parameter in model.parameters() if parameter.requires_grad],
-                lr=0.0012,
-                weight_decay=0.0001,
-            )
-            arrays = (
-                self.np.stack(
-                    [
-                        self.np.frombuffer(item["rgb"], dtype=self.np.uint8).reshape(FEATURE_H, FEATURE_W, 3)
-                        for item in valid
-                    ]
-                ).astype(self.np.float32)
-                / 255.0
-            )
-            arrays = arrays.transpose(0, 3, 1, 2)
-            session_groups = defaultdict(list)
-            for index, item in enumerate(valid):
-                session_groups[item["session"]].append(index)
-            temporal_pairs = []
-            for _, indices in session_groups.items():
-                indices.sort(key=lambda index: valid[index]["created"])
-                temporal_pairs.extend(
-                    (first, second)
-                    for first, second in zip(indices, indices[1:])
-                    if 0.0 <= valid[second]["created"] - valid[first]["created"] <= 2.5
-                )
-            negative_pairs = []
-            for first in range(len(valid)):
-                for second in range(first + 1, min(len(valid), first + 24)):
-                    different_session = valid[first]["session"] != valid[second]["session"]
-                    far_same = abs(valid[first]["created"] - valid[second]["created"]) > 8.0
-                    if different_session or far_same:
-                        negative_pairs.append((first, second))
-            total_steps = max(32, min(320, len(valid) * 4))
-            generator = random.Random(sleep_seed)
-            torch_generator = torch.Generator(device=self.device)
-            torch_generator.manual_seed(sleep_seed)
-
-            def embed(value):
-                return torch.nn.functional.normalize(model.encoder(value).mean(dim=(2, 3)), dim=1)
-
-            for step in range(total_steps):
-                if stop_event is not None and stop_event.is_set():
-                    raise InputStopped("GPU离线视觉模型训练已停止")
-                indexes = [generator.randrange(len(valid)) for _ in range(min(24, max(6, len(valid))))]
-                batch = torch.from_numpy(arrays[indexes].copy()).to(self.device)
-                noisy_a = (
-                    batch
-                    + (torch.rand(batch.shape, dtype=batch.dtype, device=self.device, generator=torch_generator) - 0.5)
-                    * 0.06
-                ).clamp(0, 1)
-                noisy_b = (
-                    batch
-                    + (torch.rand(batch.shape, dtype=batch.dtype, device=self.device, generator=torch_generator) - 0.5)
-                    * 0.06
-                ).clamp(0, 1)
-                latent, reconstruction, pooled = model(noisy_a)
-                embedding_a = torch.nn.functional.normalize(pooled, dim=1)
-                embedding_b = embed(noisy_b)
-                similarity = embedding_a @ embedding_b.T / 0.2
-                labels = torch.arange(len(indexes), device=self.device)
-                contrastive = torch.nn.functional.cross_entropy(similarity, labels)
-                temporal = torch.zeros((), device=self.device)
-                if temporal_pairs:
-                    chosen = [
-                        temporal_pairs[generator.randrange(len(temporal_pairs))]
-                        for _ in range(min(12, len(temporal_pairs)))
-                    ]
-                    first = torch.from_numpy(arrays[[pair[0] for pair in chosen]].copy()).to(self.device)
-                    second = torch.from_numpy(arrays[[pair[1] for pair in chosen]].copy()).to(self.device)
-                    temporal = (embed(first) - embed(second)).pow(2).sum(dim=1).mean()
-                negative = torch.zeros((), device=self.device)
-                if negative_pairs:
-                    chosen = [
-                        negative_pairs[generator.randrange(len(negative_pairs))]
-                        for _ in range(min(12, len(negative_pairs)))
-                    ]
-                    first = torch.from_numpy(arrays[[pair[0] for pair in chosen]].copy()).to(self.device)
-                    second = torch.from_numpy(arrays[[pair[1] for pair in chosen]].copy()).to(self.device)
-                    distances = (embed(first) - embed(second)).pow(2).sum(dim=1)
-                    negative = torch.relu(0.5 - distances).mean()
-                reconstruction_loss = torch.nn.functional.smooth_l1_loss(reconstruction, batch)
-                action_labels = torch.tensor(
-                    [action_index.get(valid[index]["action"], 0) for index in indexes],
-                    device=self.device,
-                    dtype=torch.long,
-                )
-                action_loss = torch.nn.functional.cross_entropy(model.action_head(pooled), action_labels)
-                object_labels = torch.tensor(
-                    [valid[index]["object_present"] for index in indexes], device=self.device, dtype=batch.dtype
-                ).unsqueeze(1)
-                object_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                    model.object_head(pooled), object_labels
-                )
-                terminal_labels = torch.tensor(
-                    [valid[index]["terminal"] for index in indexes], device=self.device, dtype=torch.long
-                )
-                terminal_loss = torch.nn.functional.cross_entropy(model.terminal_head(pooled), terminal_labels)
-                transition_loss = torch.zeros((), device=self.device)
-                if temporal_pairs:
-                    chosen = [
-                        temporal_pairs[generator.randrange(len(temporal_pairs))]
-                        for _ in range(min(12, len(temporal_pairs)))
-                    ]
-                    first_indexes = [pair[0] for pair in chosen]
-                    second_indexes = [pair[1] for pair in chosen]
-                    first = torch.from_numpy(arrays[first_indexes].copy()).to(self.device)
-                    second = torch.from_numpy(arrays[second_indexes].copy()).to(self.device)
-                    first_embedding = embed(first)
-                    second_embedding = embed(second).detach()
-                    labels_tensor = torch.tensor(
-                        [action_index.get(valid[index]["action"], 0) for index in first_indexes],
-                        device=self.device,
-                        dtype=torch.long,
-                    )
-                    one_hot = torch.nn.functional.one_hot(labels_tensor, num_classes=len(action_vocabulary)).to(
-                        first_embedding.dtype
-                    )
-                    transition_loss = torch.nn.functional.smooth_l1_loss(
-                        torch.nn.functional.normalize(
-                            model.transition_head(torch.cat([first_embedding, one_hot], dim=1)), dim=1
-                        ),
-                        second_embedding,
-                    )
-                variance_penalty = (latent.var(dim=(2, 3)).mean() + 0.0001).reciprocal().clamp(max=10)
-                loss = (
-                    reconstruction_loss
-                    + 0.14 * contrastive
-                    + 0.05 * temporal
-                    + 0.04 * negative
-                    + 0.08 * action_loss
-                    + 0.06 * transition_loss
-                    + 0.03 * object_loss
-                    + 0.03 * terminal_loss
-                    + 0.01 * variance_penalty
-                )
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
-                optimizer.step()
-                if progress is not None and step % 2 == 0:
-                    progress(35.0 * (step + 1) / total_steps)
-            encoder = model.encoder
-            encoder.eval()
-            self.model = encoder
-            self.trained_steps += total_steps
-            metadata = {
-                "architecture_version": VISION_ARCHITECTURE_VERSION,
-                "game_id": str(game_id),
-                "trained_steps": self.trained_steps,
-                "updated": time.time(),
-                "preprocess_hash": VISION_PREPROCESS_HASH,
-                "preprocess_signature": preprocess_signature(),
-                "runtime_fingerprint": self.runtime_fingerprint(),
-                "training_objectives": [
-                    "reconstruction",
-                    "brightness_scale_compression_consistency",
-                    "action_prediction",
-                    "state_action_next_state_prediction",
-                    "different_action_hard_negative_separation",
-                    "interactive_object_recognition",
-                    "terminal_state_recognition",
-                    "explicit_adjacent_session_temporal_pairs",
-                ],
-                "action_vocabulary": action_vocabulary,
-                "raw_feature_preserved": True,
-                "neural_feature_version": NEURAL_FEATURE_VERSION,
-                "sleep_seed": sleep_seed,
-                "shared_base": False,
-            }
-            self._atomic_save(self.active_path, encoder.state_dict(), metadata)
-            shared_metadata = dict(metadata)
-            shared_metadata.update(
-                {"game_id": "shared", "shared_base": True, "read_only": True, "game_training_writes": False}
-            )
-            return self.manifest()
+        return GameSpecificVisionTrainer(
+            self,
+            game_id,
+            samples,
+            stop_event,
+            progress,
+            seed,
+            total_count,
+        ).train()
 
     def train(self, game_id, samples, stop_event=None, progress=None, seed=None, total_count=None):
         result = self._train_game_specific_vision(game_id, samples, stop_event, progress, seed, total_count)
@@ -31120,7 +32195,7 @@ class FileStopEvent:
     def wait(self, timeout=0.0):
         deadline = time.monotonic() + max(0.0, float(timeout))
         while not self.is_set() and time.monotonic() < deadline:
-            time.sleep(min(0.02, max(0.001, deadline - time.monotonic())))
+            interruptible_wait(None, min(0.02, max(0.001, deadline - time.monotonic())))
         return self.is_set()
 
 
@@ -31189,9 +32264,9 @@ def ai_worker_main(base, address, auth_text, family, protocol_version=None):
 
         connection.send(
             {
-                "kind": "ready",
+                "kind": WorkerMessageKind.READY.value,
                 "protocol_version": AI_WORKER_PROTOCOL_VERSION,
-                "stage": "READY",
+                "stage": WorkerStage.READY.value,
                 "status": status_value(),
             }
         )
@@ -31206,7 +32281,7 @@ def ai_worker_main(base, address, auth_text, family, protocol_version=None):
             payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
             try:
                 if operation == "shutdown":
-                    connection.send({"kind": "result", "id": request_id, "value": True})
+                    connection.send({"kind": WorkerMessageKind.RESULT.value, "id": request_id, "value": True})
                     break
                 if operation == "status":
                     value = status_value()
@@ -31229,7 +32304,13 @@ def ai_worker_main(base, address, auth_text, family, protocol_version=None):
                     snapshot_rows = open_training_snapshot(base, snapshot_descriptor)
 
                     def progress(amount):
-                        connection.send({"kind": "progress", "id": request_id, "value": float(amount)})
+                        connection.send(
+                            {
+                                "kind": WorkerMessageKind.PROGRESS.value,
+                                "id": request_id,
+                                "value": float(amount),
+                            }
+                        )
 
                     value = vision.train(
                         str(payload.get("game_id", "")),
@@ -31277,13 +32358,13 @@ def ai_worker_main(base, address, auth_text, family, protocol_version=None):
                     value = ocr.recognize_region(dict(payload.get("frame", {})), payload.get("norm"))
                 else:
                     raise RuntimeError("未知AI工作进程操作：" + operation)
-                connection.send({"kind": "result", "id": request_id, "value": value})
+                connection.send({"kind": WorkerMessageKind.RESULT.value, "id": request_id, "value": value})
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception as error:
                 connection.send(
                     {
-                        "kind": "error",
+                        "kind": WorkerMessageKind.ERROR.value,
                         "id": request_id,
                         "message": str(error),
                         "traceback": traceback.format_exc()[-10000:],
@@ -31407,9 +32488,9 @@ class AIWorkerClient:
         hello = self.connection.recv()
         if (
             not isinstance(hello, dict)
-            or hello.get("kind") != "ready"
+            or hello.get("kind") != WorkerMessageKind.READY.value
             or safe_int(hello.get("protocol_version"), 0) != AI_WORKER_PROTOCOL_VERSION
-            or hello.get("stage") != "READY"
+            or hello.get("stage") != WorkerStage.READY.value
         ):
             self.close(0.2)
             raise RuntimeError("AI工作进程初始化协议无效；启动日志：" + self._startup_log_tail())
@@ -31475,7 +32556,7 @@ class AIWorkerClient:
                 self.connection.send(
                     {
                         "protocol_version": AI_WORKER_PROTOCOL_VERSION,
-                        "stage": "RUNNING",
+                        "stage": WorkerStage.RUNNING.value,
                         "id": request_id,
                         "operation": str(operation),
                         "payload": data,
@@ -31493,15 +32574,15 @@ class AIWorkerClient:
                     packet = self.connection.recv()
                     if not isinstance(packet, dict) or str(packet.get("id", "")) != request_id:
                         continue
-                    if packet.get("kind") == "progress":
+                    if packet.get("kind") == WorkerMessageKind.PROGRESS.value:
                         if progress is not None:
                             progress(packet.get("value", 0.0))
                         continue
-                    if packet.get("kind") == "error":
+                    if packet.get("kind") == WorkerMessageKind.ERROR.value:
                         raise RuntimeError(
                             str(packet.get("message", "AI工作进程失败")) + "\n" + str(packet.get("traceback", ""))
                         )
-                    if packet.get("kind") == "result":
+                    if packet.get("kind") == WorkerMessageKind.RESULT.value:
                         return packet.get("value")
             except RECOVERABLE_ERRORS as error:
                 self._failed(error)
@@ -32521,15 +33602,17 @@ def logic_contract_suite():
     numpy_second = _optional_numpy()
     record(
         "optional_numpy_probe_cached",
-        _NUMPY_CHECKED and numpy_first is numpy_second,
-        {"checked": _NUMPY_CHECKED, "available": numpy_first is not None},
+        FEATURE_ENGINE.numpy_checked and numpy_first is numpy_second,
+        {"checked": FEATURE_ENGINE.numpy_checked, "available": numpy_first is not None},
     )
     first_build_hash = current_build_hash()
     second_build_hash = current_build_hash()
     record(
         "source_build_hash_cached",
-        bool(first_build_hash) and first_build_hash == second_build_hash and _BUILD_HASH == first_build_hash,
-        {"hash": first_build_hash, "key": _BUILD_HASH_KEY},
+        bool(first_build_hash)
+        and first_build_hash == second_build_hash
+        and RUNTIME_REPOSITORY.build_hash == first_build_hash,
+        {"hash": first_build_hash, "key": RUNTIME_REPOSITORY.build_hash_key},
     )
     with tempfile.TemporaryDirectory() as folder:
         database = ThreadLocalSQLite(Path(folder) / "logic.db")
@@ -32790,7 +33873,7 @@ def fault_injection_contract_suite():
         ManagedShutdownResource("stubborn", lambda: True, lambda: state["alive"], lambda timeout_value: False, force, 0)
     )
     coordinator.poll()
-    time.sleep(0.12)
+    interruptible_wait(None, 0.12)
     shutdown = coordinator.poll()
     record(
         "unresponsive_resource_force_close",
@@ -32995,7 +34078,11 @@ def run_static_contract_tests(path=None):
     )
     for index in range(POOL_BOUNDARIES_MAX + 40):
         _pool_boundaries(640 + index, 360, 64, 36)
-    check("pool_boundaries_is_bounded", len(POOL_BOUNDARIES) <= POOL_BOUNDARIES_MAX, len(POOL_BOUNDARIES))
+    check(
+        "pool_boundaries_is_bounded",
+        len(FEATURE_ENGINE.pool_boundaries) <= POOL_BOUNDARIES_MAX,
+        len(FEATURE_ENGINE.pool_boundaries),
+    )
     sqlite_ok = False
     with tempfile.TemporaryDirectory(prefix="ugai ?#% ") as folder:
         database_path = Path(folder) / "data ?#%.db"
@@ -33052,6 +34139,120 @@ def run_static_contract_tests(path=None):
         "explicit_service_attributes",
         required_service_attributes.issubset(service_attributes),
         sorted(service_attributes.intersection(required_service_attributes)),
+    )
+    app_dynamic_forwarders = (
+        [node.name for node in app_node.body if isinstance(node, ast.FunctionDef) and node.name == "__getattr__"]
+        if app_node is not None
+        else ["missing"]
+    )
+    check("app_has_no_dynamic_service_forwarding", not app_dynamic_forwarders, app_dynamic_forwarders)
+    parent_map = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent_map[child] = node
+
+    def function_name(node):
+        names = []
+        current = node
+        while current is not None:
+            if isinstance(current, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.append(current.name)
+            current = parent_map.get(current)
+        return ".".join(reversed(names))
+
+    target_functions = {
+        "WindowSelectionDialog.open",
+        "build_offline_policy_models",
+        "AppModeService._rank_action_candidates_base",
+        "run_windows_smoke_test",
+        "OfflineVisionRuntime._train_game_specific_vision",
+        "ReviewController.build_experiences",
+    }
+    target_lengths = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = function_name(node)
+            if name in target_functions:
+                target_lengths[name] = safe_int(node.end_lineno, node.lineno) - node.lineno + 1
+    check(
+        "priority_functions_are_split",
+        set(target_lengths) == target_functions and max(target_lengths.values(), default=1000) <= 100,
+        target_lengths,
+    )
+    raw_sleeps = []
+    fetch_all_calls = []
+    success_modal_calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if isinstance(node.func.value, ast.Name) and node.func.value.id == "time" and node.func.attr == "sleep":
+            raw_sleeps.append((node.lineno, function_name(node)))
+        if node.func.attr == "fetchall":
+            fetch_all_calls.append(node.lineno)
+        if node.func.attr == "show_info":
+            call_site = function_name(node)
+            if call_site not in {"AppUiService.show_info", "App.show_info"}:
+                success_modal_calls.append((node.lineno, call_site))
+    check(
+        "runtime_waits_are_interruptible",
+        raw_sleeps == [(raw_sleeps[0][0], "interruptible_wait")] if raw_sleeps else False,
+        raw_sleeps,
+    )
+    check("unbounded_fetchall_removed", not fetch_all_calls, fetch_all_calls)
+    check("success_messages_do_not_use_modal_dialogs", not success_modal_calls, success_modal_calls)
+    check(
+        "visual_hash_is_persisted_and_indexed",
+        DATABASE_SCHEMA_VERSION >= 13
+        and "visual_hash TEXT NOT NULL" in source
+        and "idx_samples_game_visual_hash" in source
+        and "GROUP BY visual_hash" in source,
+    )
+    immutable_protocol_types = {
+        "CandidateScores",
+        "CapturedFrame",
+        "ModeResult",
+        "VisionTrainingSample",
+        "FrameComputationKey",
+    }
+    check(
+        "core_protocols_use_slotted_data_classes",
+        immutable_protocol_types.issubset(classes)
+        and all("__slots__" in globals()[name].__dict__ for name in immutable_protocol_types),
+        sorted(immutable_protocol_types.intersection(classes)),
+    )
+    check(
+        "worker_protocol_uses_enums",
+        {item.value for item in WorkerMessageKind}
+        == {"ready", "progress", "status", "line", "result", "error"}
+        and {item.value for item in WorkerStage}
+        == {"READY", "STARTING", "RUNNING", "COMPLETED", "FAILED"},
+    )
+    mutable_cache_names = {
+        "POOL_BOUNDARIES",
+        "FEATURE_DISTANCE_WEIGHTS_ARRAY",
+        "OFFLINE_POLICY_TRAINING_CACHE",
+        "_RUNTIME_LOCK_MANIFEST_CACHE",
+        "_BUILD_HASH",
+    }
+    module_assignments = set()
+    for node in tree.body:
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+        module_assignments.update(target.id for target in targets if isinstance(target, ast.Name))
+    remaining_mutable_caches = mutable_cache_names.intersection(module_assignments)
+    check(
+        "mutable_runtime_caches_have_lifecycle_owners",
+        not remaining_mutable_caches
+        and isinstance(RUNTIME_REPOSITORY, RuntimeRepository)
+        and isinstance(FEATURE_ENGINE, FeatureEngine)
+        and isinstance(POLICY_TRAINING_CACHE, TrainingCache),
+        sorted(remaining_mutable_caches),
+    )
+    frame_key_fields = tuple(FrameComputationKey.__dataclass_fields__)
+    check(
+        "frame_cache_uses_complete_bounded_key",
+        frame_key_fields == ("session_id", "window_identity", "frame_timestamp", "feature_version")
+        and FEATURE_ENGINE.frame_cache.maximum > 0,
+        {"fields": frame_key_fields, "capacity": FEATURE_ENGINE.frame_cache.maximum},
     )
     parents = {}
     for node in ast.walk(tree):
@@ -33141,7 +34342,7 @@ def run_static_contract_tests(path=None):
     expiring_token = lease_book.acquire("keys", (0x11, 65), 0.05)
     expiry_deadline = time.monotonic() + 0.50
     while not released_leases and time.monotonic() < expiry_deadline:
-        time.sleep(0.01)
+        interruptible_wait(None, 0.01)
     renewed_token = lease_book.acquire("gamepad", ("a",), 0.08)
     renewed = lease_book.renew(renewed_token, 0.20)
     released = lease_book.release(renewed_token)
@@ -33636,9 +34837,7 @@ def clear_runtime_isolation(key=None, prefix=None):
                 tokens = [token for token in memory.memories if token.startswith(str(prefix))]
             for token in tokens:
                 memory.clear(token)
-    cache = globals().get("FRAME_COMPUTATION_CACHE")
-    if cache is not None:
-        cache.clear()
+    FEATURE_ENGINE.clear_frames()
     return True
 
 
@@ -34337,6 +35536,32 @@ def build_hybrid_visual_state(frame, history=None):
     }
 
 
+@dataclass(frozen=True, slots=True)
+class FrameComputationKey:
+    session_id: str
+    window_identity: str
+    frame_timestamp: object
+    feature_version: int
+
+
+def frame_computation_key(frame):
+    item = frame if isinstance(frame, dict) else {}
+    session_id = str(item.get("session_id") or item.get("mode_session_id") or "offline")
+    try:
+        window_identity = frame_isolation_key(item)
+    except ValueError:
+        window_identity = "offline|" + frame_digest(item)[:32]
+    timestamp = item.get("frame_timestamp", item.get("time", item.get("timestamp")))
+    if timestamp in (None, ""):
+        timestamp = frame_digest(item)
+    feature_version = safe_int(
+        item.get("feature_version", item.get("feature_algorithm_version", FEATURE_ALGORITHM_VERSION)),
+        FEATURE_ALGORITHM_VERSION,
+        1,
+    )
+    return FrameComputationKey(session_id, window_identity, timestamp, feature_version)
+
+
 class FrameComputationCache:
     def __init__(self, maximum=256):
         self.maximum = max(32, int(maximum))
@@ -34359,12 +35584,35 @@ class FrameComputationCache:
             while len(self.values) > self.maximum:
                 self.values.popitem(last=False)
 
+    def get_component(self, key, component):
+        with self.lock:
+            token = str(key)
+            value = self.values.pop(token, None)
+            if value is None:
+                return None
+            self.values[token] = value
+            component_value = value.get(str(component)) if isinstance(value, dict) else None
+            if component_value is None:
+                return None
+            return json.loads(json.dumps(component_value, ensure_ascii=False))
+
+    def put_component(self, key, component, value):
+        with self.lock:
+            token = str(key)
+            payload = self.values.pop(token, {})
+            if not isinstance(payload, dict):
+                payload = {}
+            payload[str(component)] = json.loads(json.dumps(value, ensure_ascii=False))
+            self.values[token] = payload
+            while len(self.values) > self.maximum:
+                self.values.popitem(last=False)
+
     def clear(self):
         with self.lock:
             self.values.clear()
 
 
-FRAME_COMPUTATION_CACHE = FrameComputationCache()
+FEATURE_ENGINE.frame_cache = FrameComputationCache()
 
 
 def frame_digest(frame):
@@ -34403,9 +35651,9 @@ def detect_semantic_targets(frame, maximum=32, version="object_centric_v2"):
     detector = SEMANTIC_DETECTORS.get(detector_version)
     if detector is None:
         raise ValueError("未知语义检测器版本：" + detector_version)
-    digest = frame_digest(item)
-    cache_key = detector_version + "|" + str(max(1, int(maximum))) + "|" + digest
-    cached = FRAME_COMPUTATION_CACHE.get(cache_key)
+    cache_key = frame_computation_key(item)
+    component = "semantic:" + detector_version + ":" + str(max(1, int(maximum)))
+    cached = FEATURE_ENGINE.frame_cache.get_component(cache_key, component)
     if isinstance(cached, dict):
         targets = cached.get("targets", [])
         scene_graph = cached.get("scene_graph", {})
@@ -34413,7 +35661,8 @@ def detect_semantic_targets(frame, maximum=32, version="object_centric_v2"):
     else:
         targets = detector.detect_frame(item, maximum)
         scene_graph = build_scene_graph(targets)
-        FRAME_COMPUTATION_CACHE.put(cache_key, {"targets": targets, "scene_graph": scene_graph})
+        payload = {"targets": targets, "scene_graph": scene_graph}
+        FEATURE_ENGINE.frame_cache.put_component(cache_key, component, payload)
         RUNTIME_METRICS.increment("semantic_cache_miss")
     item["scene_graph"] = scene_graph
     item["semantic_detector_version"] = detector_version
