@@ -18,6 +18,7 @@ import zlib
 import base64
 import array
 import io
+import gc
 import tokenize
 import re
 import unicodedata
@@ -27,7 +28,7 @@ import shutil
 import subprocess
 import urllib.request
 import urllib.parse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -1032,6 +1033,7 @@ AUTHORITATIVE_DATA_PATHS = (
     "universal_game_ai.db",
     "models/vision",
     "models/ocr",
+    "models/tensors",
     "runtime.current",
     "backups",
     "quarantine",
@@ -1041,6 +1043,16 @@ AUTHORITATIVE_DATA_PATHS = (
 RUNTIME_PYPI_INDEX = "https://pypi.org/simple"
 RUNTIME_TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 RUNTIME_TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu130"
+RUNTIME_BACKEND_FAMILIES = (
+    "windows-x64-cpu",
+    "windows-x64-nvidia-cu130",
+    "windows-x64-directml",
+)
+RUNTIME_BACKEND_LOCK_KEYS = {
+    "windows-x64-cpu": RUNTIME_ARCH_X64 + "|builtin_cpu",
+    "windows-x64-nvidia-cu130": RUNTIME_ARCH_X64 + "|nvidia-cu130",
+    "windows-x64-directml": RUNTIME_ARCH_X64 + "|directml",
+}
 VISION_PREPROCESS_SIGNATURE = {
     "version": 2,
     "color_space": "RGB",
@@ -1099,6 +1111,434 @@ class RuntimeMetrics:
 
 
 RUNTIME_METRICS = RuntimeMetrics()
+
+
+class ResourceState(str, Enum):
+    NORMAL = "NORMAL"
+    YELLOW = "YELLOW"
+    RED = "RED"
+
+
+@dataclass(frozen=True, slots=True)
+class HardwareSnapshot:
+    cpu_percent: float
+    process_cpu_percent: float
+    available_ram: int
+    process_rss: int
+    gpu_backend: str
+    gpu_utilization: float | None
+    free_vram: int | None
+    capture_p95_ms: float
+    queue_ratio: float
+    queue_oldest_ms: float
+    disk_write_p95_ms: float
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimePlan:
+    capture_fps: int
+    semantic_frame_interval: int
+    ocr_frame_interval: int
+    training_batch_size: int
+    torch_threads: int
+    prototype_limit: int
+    backend: str
+
+
+class ResourceGovernor:
+    def __init__(self, window_seconds=30):
+        self.window_seconds = max(10, min(30, int(window_seconds)))
+        self.lock = threading.RLock()
+        self.history = deque(maxlen=self.window_seconds)
+        self.state = ResourceState.NORMAL
+        self.plan = RuntimePlan(30, 4, 6, 24, max(1, min(4, os.cpu_count() or 1)), MAX_PROTOTYPES, "windows-x64-cpu")
+        self.recovery_since = None
+        self.thread = None
+        self.stop_event = threading.Event()
+        self.queue_reports = {}
+        self.disk_writes = deque(maxlen=256)
+        self._system_cpu_previous = None
+        self._process_cpu_previous = (time.monotonic(), time.process_time())
+        self._gpu_cache = (0.0, None, None)
+        self._last_snapshot = HardwareSnapshot(0.0, 0.0, 0, 0, "windows-x64-cpu", None, None, 0.0, 0.0, 0.0, 0.0)
+
+    def ensure_started(self):
+        with self.lock:
+            if self.thread is not None and self.thread.is_alive():
+                return self
+            self.stop_event.clear()
+            self.thread = threading.Thread(target=self._run, name="UniversalGameAI-ResourceGovernor", daemon=True)
+            self.thread.start()
+        return self
+
+    def stop(self, timeout=1.5):
+        self.stop_event.set()
+        thread = self.thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(max(0.0, float(timeout)))
+        return not bool(thread and thread.is_alive())
+
+    def report_queue(self, name, depth, capacity, oldest_ms=0.0):
+        maximum = max(1, int(capacity))
+        ratio = max(0.0, min(1.5, float(depth) / maximum))
+        with self.lock:
+            self.queue_reports[str(name)] = (ratio, max(0.0, float(oldest_ms)), time.monotonic())
+        RUNTIME_METRICS.observe("queue_ratio", ratio)
+        RUNTIME_METRICS.observe("queue_oldest_ms", max(0.0, float(oldest_ms)))
+        return ratio
+
+    def report_disk_write(self, milliseconds):
+        value = max(0.0, float(milliseconds))
+        with self.lock:
+            self.disk_writes.append((time.monotonic(), value))
+        RUNTIME_METRICS.observe("disk_write_ms", value)
+
+    @staticmethod
+    def _filetime_value(value):
+        return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
+
+    def _cpu_values(self):
+        now = time.monotonic()
+        process_now = time.process_time()
+        old_wall, old_process = self._process_cpu_previous
+        self._process_cpu_previous = (now, process_now)
+        process_percent = 100.0 * max(0.0, process_now - old_process) / max(1e-6, now - old_wall)
+        process_percent /= max(1, os.cpu_count() or 1)
+        if os.name != "nt":
+            try:
+                load = os.getloadavg()[0]
+                total = 100.0 * load / max(1, os.cpu_count() or 1)
+            except (AttributeError, OSError):
+                total = process_percent
+            return max(0.0, min(100.0, total)), max(0.0, min(100.0, process_percent))
+        try:
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            idle = wintypes.FILETIME()
+            kernel_time = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not kernel.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel_time), ctypes.byref(user)):
+                raise OSError(ctypes.get_last_error())
+            current = (self._filetime_value(idle), self._filetime_value(kernel_time), self._filetime_value(user))
+            previous = self._system_cpu_previous
+            self._system_cpu_previous = current
+            if previous is None:
+                total = process_percent
+            else:
+                idle_delta = current[0] - previous[0]
+                total_delta = current[1] - previous[1] + current[2] - previous[2]
+                total = 100.0 * max(0, total_delta - idle_delta) / max(1, total_delta)
+            return max(0.0, min(100.0, total)), max(0.0, min(100.0, process_percent))
+        except (OSError, AttributeError, ValueError):
+            return max(0.0, min(100.0, process_percent)), max(0.0, min(100.0, process_percent))
+
+    @staticmethod
+    def _memory_values():
+        if os.name == "nt":
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", wintypes.DWORD),
+                    ("dwMemoryLoad", wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+            try:
+                status = MEMORYSTATUSEX()
+                status.dwLength = ctypes.sizeof(status)
+                kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                if not kernel.GlobalMemoryStatusEx(ctypes.byref(status)):
+                    raise OSError(ctypes.get_last_error())
+                counters = PROCESS_MEMORY_COUNTERS()
+                counters.cb = ctypes.sizeof(counters)
+                psapi = ctypes.WinDLL("psapi", use_last_error=True)
+                handle = kernel.GetCurrentProcess()
+                if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+                    raise OSError(ctypes.get_last_error())
+                return int(status.ullAvailPhys), int(counters.WorkingSetSize)
+            except (OSError, AttributeError, ValueError):
+                return 0, 0
+        try:
+            page = int(os.sysconf("SC_PAGE_SIZE"))
+            available = int(os.sysconf("SC_AVPHYS_PAGES")) * page
+        except (AttributeError, OSError, ValueError):
+            available = 0
+        try:
+            import resource
+            rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            rss = rss if sys.platform == "darwin" else rss * 1024
+        except (ImportError, AttributeError, ValueError):
+            rss = 0
+        return available, rss
+
+    @staticmethod
+    def _manifest_backend():
+        runtime = APP_CONTEXT.vision_runtime
+        try:
+            if runtime is not None:
+                status = getattr(getattr(runtime, "worker", None), "status", {})
+                manifest = status.get("runtime_manifest", {}) if isinstance(status, dict) else {}
+                if isinstance(manifest, dict) and manifest.get("runtime_family"):
+                    return str(manifest["runtime_family"])
+                value = runtime.manifest() if getattr(runtime, "active_game", "") else {}
+                fingerprint = value.get("runtime_fingerprint", {}) if isinstance(value, dict) else {}
+                backend = str(fingerprint.get("gpu_backend", ""))
+                if backend:
+                    return backend
+        except (RuntimeError, ValueError, TypeError, AttributeError):
+            pass
+        return "windows-x64-cpu"
+
+    def _gpu_values(self, backend):
+        if "nvidia" not in str(backend).casefold():
+            return None, None
+        now = time.monotonic()
+        cached_at, utilization, free_vram = self._gpu_cache
+        if now - cached_at < 5.0:
+            return utilization, free_vram
+        try:
+            creationflags = 0x08000000 if os.name == "nt" else 0
+            output = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.free", "--format=csv,noheader,nounits"],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=3,
+                creationflags=creationflags,
+                stderr=subprocess.DEVNULL,
+            )
+            first = output.strip().splitlines()[0].split(",")
+            utilization = max(0.0, min(100.0, float(first[0].strip())))
+            free_vram = max(0, int(float(first[1].strip()) * 1024 * 1024))
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            utilization, free_vram = None, None
+        self._gpu_cache = (now, utilization, free_vram)
+        return utilization, free_vram
+
+    @staticmethod
+    def _series_p95(name):
+        values = RUNTIME_METRICS.snapshot().get("series", {}).get(str(name), {})
+        return max(0.0, float(values.get("p95", 0.0))) if isinstance(values, dict) else 0.0
+
+    def _queue_values(self):
+        now = time.monotonic()
+        with self.lock:
+            stale = [name for name, value in self.queue_reports.items() if now - value[2] > 3.0]
+            for name in stale:
+                self.queue_reports.pop(name, None)
+            values = list(self.queue_reports.values())
+        if not values:
+            return 0.0, 0.0
+        return max(value[0] for value in values), max(value[1] for value in values)
+
+    def _disk_p95(self):
+        now = time.monotonic()
+        with self.lock:
+            while self.disk_writes and now - self.disk_writes[0][0] > self.window_seconds:
+                self.disk_writes.popleft()
+            values = sorted(value for _, value in self.disk_writes)
+        if not values:
+            return self._series_p95("disk_write_ms")
+        return values[min(len(values) - 1, int(round((len(values) - 1) * 0.95)))]
+
+    def sample_once(self):
+        cpu, process_cpu = self._cpu_values()
+        available_ram, process_rss = self._memory_values()
+        backend = self._manifest_backend()
+        gpu_utilization, free_vram = self._gpu_values(backend)
+        queue_ratio, queue_oldest = self._queue_values()
+        snapshot = HardwareSnapshot(
+            round(cpu, 3),
+            round(process_cpu, 3),
+            int(available_ram),
+            int(process_rss),
+            backend,
+            gpu_utilization,
+            free_vram,
+            round(self._series_p95("capture_latency_ms"), 3),
+            round(queue_ratio, 5),
+            round(queue_oldest, 3),
+            round(self._disk_p95(), 3),
+        )
+        with self.lock:
+            self.history.append(snapshot)
+            self._last_snapshot = snapshot
+            self._update_state_locked(time.monotonic())
+        return snapshot
+
+    def _update_state_locked(self, now):
+        recent = list(self.history)
+        current = recent[-1]
+        last_five = recent[-5:]
+        queue_yellow = len(last_five) >= 5 and all(item.queue_ratio > 0.70 for item in last_five)
+        queue_red = len(recent) >= 2 and all(item.queue_ratio > 0.90 for item in recent[-2:])
+        severe = bool(
+            queue_red
+            or 0 < current.available_ram < 1536 * 1024 * 1024
+            or current.capture_p95_ms > 70.0
+            or current.disk_write_p95_ms > 180.0
+            or current.cpu_percent > 97.0
+            or current.gpu_utilization is not None and current.gpu_utilization > 98.0
+            or current.free_vram is not None and current.free_vram < 384 * 1024 * 1024
+        )
+        warning = bool(
+            severe
+            or queue_yellow
+            or current.capture_p95_ms > REALTIME_BUDGET_MS["capture_p95"]
+            or 0 < current.available_ram < 2560 * 1024 * 1024
+            or current.disk_write_p95_ms > 80.0
+            or current.cpu_percent > 88.0
+            or current.process_cpu_percent > 85.0
+            or current.gpu_utilization is not None and current.gpu_utilization > 94.0
+            or current.free_vram is not None and current.free_vram < 768 * 1024 * 1024
+        )
+        desired = ResourceState.RED if severe else ResourceState.YELLOW if warning else ResourceState.NORMAL
+        rank = {ResourceState.NORMAL: 0, ResourceState.YELLOW: 1, ResourceState.RED: 2}
+        if rank[desired] > rank[self.state]:
+            self.state = desired
+            self.recovery_since = None
+        elif rank[desired] < rank[self.state]:
+            if self.recovery_since is None:
+                self.recovery_since = now
+            elif now - self.recovery_since >= 30.0:
+                self.state = desired
+                self.recovery_since = None
+        else:
+            self.recovery_since = None
+        self.plan = self._plan_for_state(self.state, current.gpu_backend)
+        if self.state is ResourceState.RED and 0 < current.available_ram < 1536 * 1024 * 1024:
+            FEATURE_ENGINE.clear_frames()
+            cache = globals().get("POLICY_TRAINING_CACHE")
+            if cache is not None:
+                cache.clear()
+            gc.collect()
+
+    @staticmethod
+    def _plan_for_state(state, backend):
+        threads = max(1, min(4, os.cpu_count() or 1))
+        if state is ResourceState.RED:
+            return RuntimePlan(10, 16, 24, 0, min(2, threads), 160, str(backend))
+        if state is ResourceState.YELLOW:
+            return RuntimePlan(20, 7, 12, 12, min(3, threads), 240, str(backend))
+        return RuntimePlan(30, 4, 6, 24, threads, MAX_PROTOTYPES, str(backend))
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            started = time.monotonic()
+            try:
+                self.sample_once()
+            except RECOVERABLE_ERRORS as error:
+                record_cleanup_error("RESOURCE_GOVERNOR_SAMPLE_FAILED", error)
+            self.stop_event.wait(max(0.05, 1.0 - (time.monotonic() - started)))
+
+    def current_plan(self):
+        self.ensure_started()
+        with self.lock:
+            return self.plan
+
+    def current_snapshot(self):
+        self.ensure_started()
+        with self.lock:
+            return self._last_snapshot
+
+    def status(self):
+        self.ensure_started()
+        with self.lock:
+            return {"state": self.state.value, "plan": self.plan, "snapshot": self._last_snapshot}
+
+    def sample_production_allowed(self):
+        snapshot = self.current_snapshot()
+        return snapshot.queue_ratio <= 0.90 and self.current_plan().training_batch_size > 0
+
+
+RESOURCE_GOVERNOR = ResourceGovernor(30)
+_TORCH_INTEROP_CONFIGURED = False
+
+
+def configure_torch_runtime(torch_module, plan=None):
+    global _TORCH_INTEROP_CONFIGURED
+    value = plan or RESOURCE_GOVERNOR.current_plan()
+    try:
+        torch_module.set_num_threads(max(1, min(4, int(value.torch_threads))))
+    except (RuntimeError, AttributeError, TypeError, ValueError):
+        pass
+    if not _TORCH_INTEROP_CONFIGURED:
+        try:
+            torch_module.set_num_interop_threads(1)
+            _TORCH_INTEROP_CONFIGURED = True
+        except (RuntimeError, AttributeError, TypeError, ValueError):
+            pass
+    return value
+
+
+def wait_for_runtime_training_plan(stop_event=None):
+    RESOURCE_GOVERNOR.start()
+    while True:
+        plan = RESOURCE_GOVERNOR.current_plan()
+        if plan.training_batch_size > 0:
+            return plan
+        FEATURE_ENGINE.clear_frames()
+        cache = globals().get("POLICY_TRAINING_CACHE")
+        if cache is not None:
+            cache.clear()
+        gc.collect()
+        if stop_event is not None:
+            if stop_event.wait(1.0):
+                raise InputStopped("资源不足，训练已停止")
+        else:
+            interruptible_wait(None, 1.0)
+
+
+def torch_training_device(torch_module):
+    runtime = APP_CONTEXT.vision_runtime
+    if runtime is not None and getattr(runtime, "ready", False) and not getattr(runtime, "builtin", True):
+        device = getattr(runtime, "device", None)
+        if device is not None:
+            return device
+    return torch_module.device("cpu")
+
+
+def torch_device_is_cuda(torch_module, device):
+    try:
+        return str(getattr(device, "type", device)).casefold() == "cuda" and bool(torch_module.cuda.is_available())
+    except RECOVERABLE_ERRORS:
+        return False
+
+
+def torch_grad_scaler(torch_module, enabled):
+    if not enabled:
+        return None
+    try:
+        return torch_module.amp.GradScaler("cuda", enabled=True)
+    except (AttributeError, TypeError):
+        return torch_module.cuda.amp.GradScaler(enabled=True)
+
+
+def release_torch_training_resources(torch_module):
+    try:
+        if bool(torch_module.cuda.is_available()):
+            torch_module.cuda.empty_cache()
+            torch_module.cuda.ipc_collect()
+    except RECOVERABLE_ERRORS:
+        pass
+    gc.collect()
+
 
 EMERGENCY_CLEANUP_ERRORS = deque(maxlen=256)
 
@@ -1258,6 +1698,118 @@ def embedded_runtime_lock(architecture=None):
     if not runtime_lock_is_complete(entries):
         raise RuntimeError("内嵌运行库wheel锁不完整")
     return entries, hashlib.sha256(canonical_bytes(entries)).hexdigest(), key
+
+
+def runtime_family_lock_key(architecture, family):
+    arch = str(architecture or native_windows_architecture())
+    value = str(family or "windows-x64-cpu")
+    if arch != RUNTIME_ARCH_X64:
+        return ""
+    return str(RUNTIME_BACKEND_LOCK_KEYS.get(value, ""))
+
+
+def runtime_backend_lock_entries(architecture, family):
+    key = runtime_family_lock_key(architecture, family)
+    source = runtime_lock_manifest().get("locks", {}).get(key)
+    if not key or not isinstance(source, list) or not source:
+        return None
+    entries = [dict(item) for item in source]
+    required = ("name", "version", "filename", "url", "sha256", "size", "python_abi", "architecture", "backend")
+    seen = set()
+    for entry in entries:
+        if any(field not in entry for field in required):
+            raise RuntimeError("后端wheel锁字段不完整：" + str(family))
+        parsed = urllib.parse.urlsplit(str(entry["url"]))
+        name = str(entry["name"]).strip().lower().replace("_", "-")
+        digest = str(entry["sha256"]).lower()
+        if (
+            parsed.scheme.lower() != "https"
+            or parsed.hostname not in RUNTIME_ALLOWED_DOWNLOAD_HOSTS
+            or name in seen
+            or len(digest) != 64
+            or any(value not in "0123456789abcdef" for value in digest)
+            or safe_int(entry.get("size"), 0, 1, 1024 * 1024 * 1024) <= 0
+            or str(entry.get("python_abi")) != "cp312"
+            or str(entry.get("architecture")) != str(architecture)
+        ):
+            raise RuntimeError("后端wheel锁无效：" + str(family))
+        seen.add(name)
+    entries.sort(key=lambda item: (str(item["name"]).casefold(), str(item["filename"])))
+    if not runtime_backend_lock_is_complete(entries):
+        raise RuntimeError("后端wheel锁依赖闭包不完整：" + str(family))
+    return entries
+
+
+def runtime_backend_lock_is_complete(entries):
+    if not isinstance(entries, list) or not entries:
+        return False
+    names = {}
+    for item in entries:
+        if not isinstance(item, dict):
+            return False
+        name = str(item.get("name", "")).strip().lower().replace("_", "-")
+        version = str(item.get("version", "")).strip()
+        if not name or not version or name in names:
+            return False
+        names[name] = version
+    if not runtime_required_projects().issubset(set(names)):
+        return False
+    for project, contract in runtime_dependency_contracts().items():
+        if project not in names:
+            return False
+        for dependency in contract.get("requires", set()):
+            provider = runtime_dependency_providers().get(dependency, dependency)
+            if provider not in names:
+                return False
+    return True
+
+
+def runtime_lock_matches_key(entries, lock_key):
+    source = runtime_lock_manifest().get("locks", {}).get(str(lock_key), [])
+    return bool(source and list(entries or []) == list(source) and runtime_backend_lock_is_complete(entries))
+
+
+def runtime_backend_candidates(architecture, hardware=None):
+    adapters = list((hardware or {}).get("adapters", [])) if isinstance(hardware, dict) else []
+    usable = []
+    for item in adapters:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        status = str(item.get("status", "")).strip().casefold()
+        lowered = name.casefold()
+        software = any(
+            marker in lowered
+            for marker in ("microsoft basic render", "remote display", "虚拟显示", "basic display")
+        )
+        if name and not software and status in {"", "ok", "正常"}:
+            usable.append(item)
+    names = " ".join(str(item.get("name", "")) for item in usable).casefold()
+    result = []
+    for family in RUNTIME_BACKEND_FAMILIES:
+        hardware_eligible = family == "windows-x64-cpu"
+        hardware_reason = ""
+        if family == "windows-x64-nvidia-cu130":
+            hardware_eligible = "nvidia" in names
+            if not hardware_eligible:
+                hardware_reason = "未检测到状态正常且可用于CUDA实测的NVIDIA适配器"
+        elif family == "windows-x64-directml":
+            hardware_eligible = bool(usable)
+            if not hardware_eligible:
+                hardware_reason = "未检测到状态正常且可用于DirectML实测的硬件适配器"
+        lock = runtime_backend_lock_entries(architecture, family)
+        lock_reason = "" if lock is not None else "当前main.py未内嵌该后端的完整SHA-256 wheel锁"
+        reason = "；".join(value for value in (hardware_reason, lock_reason) if value)
+        result.append(
+            {
+                "family": family,
+                "lock_key": runtime_family_lock_key(architecture, family),
+                "lock_available": lock is not None,
+                "hardware_eligible": hardware_eligible,
+                "reason": reason,
+            }
+        )
+    return result
 
 
 def normalized_project_name(value):
@@ -10377,6 +10929,87 @@ class AudioEventMonitor:
         return bool(self.thread and self.thread.is_alive())
 
 
+def changed_roi_regions(previous_rgb, current_rgb, width, height, columns=16, rows=9, threshold=18.0):
+    previous = preview_rgb_bytes(previous_rgb)
+    current = preview_rgb_bytes(current_rgb)
+    width = safe_int(width, 0, 1, 8192)
+    height = safe_int(height, 0, 1, 8192)
+    if previous is None or current is None or len(previous) != len(current) or len(current) != width * height * 3:
+        return [[0.0, 0.0, 1.0, 1.0]]
+    active = set()
+    for gy in range(rows):
+        top = gy * height // rows
+        bottom = max(top + 1, (gy + 1) * height // rows)
+        for gx in range(columns):
+            left = gx * width // columns
+            right = max(left + 1, (gx + 1) * width // columns)
+            total = 0
+            count = 0
+            step = 2 if (right - left) * (bottom - top) > 64 else 1
+            for y in range(top, bottom, step):
+                for x in range(left, right, step):
+                    offset = (y * width + x) * 3
+                    total += abs(current[offset] - previous[offset])
+                    total += abs(current[offset + 1] - previous[offset + 1])
+                    total += abs(current[offset + 2] - previous[offset + 2])
+                    count += 3
+            if total / max(1, count) >= float(threshold):
+                active.add((gx, gy))
+    if not active:
+        return []
+    if len(active) >= columns * rows * 0.35:
+        return [[0.0, 0.0, 1.0, 1.0]]
+    regions = []
+    while active:
+        seed = active.pop()
+        stack = [seed]
+        component = [seed]
+        while stack:
+            gx, gy = stack.pop()
+            for neighbor in ((gx - 1, gy), (gx + 1, gy), (gx, gy - 1), (gx, gy + 1)):
+                if neighbor in active:
+                    active.remove(neighbor)
+                    stack.append(neighbor)
+                    component.append(neighbor)
+        xs = [value[0] for value in component]
+        ys = [value[1] for value in component]
+        left = max(0, min(xs) - 1) / columns
+        top = max(0, min(ys) - 1) / rows
+        right = min(columns, max(xs) + 2) / columns
+        bottom = min(rows, max(ys) + 2) / rows
+        regions.append([round(left, 6), round(top, 6), round(right - left, 6), round(bottom - top, 6)])
+    return sorted(regions, key=lambda value: value[2] * value[3], reverse=True)[:8]
+
+
+def merge_semantic_targets_by_roi(previous, current, changed_regions, maximum=48):
+    old_values = [dict(value) for value in previous or [] if isinstance(value, dict)]
+    new_values = [dict(value) for value in current or [] if isinstance(value, dict)]
+    regions = [value for value in changed_regions or [] if isinstance(value, (list, tuple)) and len(value) >= 4]
+    if not regions or any(float(value[2]) * float(value[3]) >= 0.90 for value in regions):
+        return new_values[:maximum]
+    retained = []
+    for item in old_values:
+        bbox = item.get("bbox", [])
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            continue
+        if any(_rect_iou(bbox, region) > 0.02 for region in regions):
+            continue
+        retained.append(item)
+    merged = retained + new_values
+    unique = []
+    for item in sorted(merged, key=lambda value: safe_float(value.get("confidence"), 0.0), reverse=True):
+        if any(
+            str(item.get("class")) == str(old.get("class"))
+            and _rect_iou(item.get("bbox", []), old.get("bbox", [])) > 0.70
+            for old in unique
+        ):
+            continue
+        unique.append(item)
+        if len(unique) >= int(maximum):
+            break
+    return unique
+
+
 class FrameBuffer:
     def __init__(self, bridge, target, hz=20.0, seconds=2.0, motion_interval=0.1, purpose=None, on_geometry=None):
         self.bridge = bridge
@@ -10386,7 +11019,8 @@ class FrameBuffer:
         self.window_generation = safe_int(self.target.get("window_generation"), 0, 0)
         self.isolation_key = runtime_isolation_key(self.game_id, self.session_id, self.target, self.window_generation)
         self.target["window_key"] = self.isolation_key
-        self.base_interval = 1.0 / max(5.0, float(hz))
+        self.requested_hz = max(5.0, float(hz))
+        self.base_interval = 1.0 / self.requested_hz
         self.interval = self.base_interval
         self.motion_interval = max(0.05, min(0.25, float(motion_interval)))
         self.purpose = str(purpose or "")
@@ -10411,6 +11045,10 @@ class FrameBuffer:
         self.geometry_since = 0.0
         self.resume_confirmations = 0
         self.last_metric_frame_stamp = 0.0
+        self.frame_counter = 0
+        self.last_visual_pyramid = {}
+        self.last_scene_graph = {}
+        self.last_plan = RESOURCE_GOVERNOR.current_plan()
 
     def set_preview_active(self, active):
         if active:
@@ -10419,6 +11057,7 @@ class FrameBuffer:
             self.preview_active.clear()
 
     def start(self):
+        RESOURCE_GOVERNOR.ensure_started()
         clear_runtime_isolation(key=self.isolation_key)
         self.bridge.reset_frame_history(self.target.get("hwnd"))
         self.stop_event.clear()
@@ -10488,6 +11127,9 @@ class FrameBuffer:
         try:
             while not self.stop_event.is_set():
                 try:
+                    plan = RESOURCE_GOVERNOR.current_plan()
+                    self.last_plan = plan
+                    self.base_interval = 1.0 / max(5, int(plan.capture_fps))
                     if not self._geometry_ready():
                         self.stop_event.wait(0.05)
                         continue
@@ -10517,12 +11159,19 @@ class FrameBuffer:
                     with self.lock:
                         previous = None
                         previous_feature = None
+                        previous_preview = None
+                        previous_frame = self.frames[-1] if self.frames else None
+                        if previous_frame is not None:
+                            previous_preview = previous_frame.get("preview_rgb")
                         for old_frame in reversed(self.frames):
                             if previous_feature is None:
                                 previous_feature = old_frame.get("f")
                             if old_frame["time"] <= stamp - self.motion_interval:
                                 previous = old_frame["rgb"]
                                 break
+                        queue_depth = len(self.frames)
+                        queue_oldest = max(0.0, (stamp - self.frames[0]["time"]) * 1000.0) if self.frames else 0.0
+                    RESOURCE_GOVERNOR.report_queue("frame_buffer", queue_depth, self.frames.maxlen, queue_oldest)
                     vision_started = time.monotonic()
                     feature = self.bridge.feature_from_rgb(rgb, previous)
                     neural_feature = None
@@ -10590,11 +11239,32 @@ class FrameBuffer:
                         "frozen_backend": bool(captured.get("frozen_backend")),
                         "backend_changed": bool(captured.get("backend_changed")),
                     }
+                    self.frame_counter += 1
+                    frame["resource_state"] = RESOURCE_GOVERNOR.status()["state"]
+                    frame["runtime_plan"] = plan
+                    frame["changed_regions"] = changed_roi_regions(
+                        previous_preview,
+                        frame.get("preview_rgb"),
+                        frame.get("preview_width", PREVIEW_W),
+                        frame.get("preview_height", PREVIEW_H),
+                    ) if frame.get("preview_rgb") is not None else []
+                    frame["scene_changed"] = bool(
+                        previous_feature is None
+                        or visual_distance(previous_feature, feature)
+                        > safe_float(self.bridge.calibration_for(self.target).get("significant_change"), 24.0)
+                    )
+                    frame["ocr_allowed"] = bool(
+                        frame["changed_regions"]
+                        and self.frame_counter % max(1, int(plan.ocr_frame_interval)) == 0
+                    )
+                    frame["semantic_refresh"] = False
                     frame["frame_digest"] = frame_digest(frame)
+                    semantic_cadence_due = self.frame_counter % max(1, int(plan.semantic_frame_interval)) == 0
                     if (
                         self.need_preview
                         and frame.get("preview_rgb") is not None
-                        and SEMANTIC_EVENT_TRIGGER.should_process(frame, self.semantic_interval, 1.2)
+                        and semantic_cadence_due
+                        and SEMANTIC_EVENT_TRIGGER.should_process(frame, self.semantic_interval, 8.0)
                     ):
                         try:
                             if (
@@ -10614,21 +11284,41 @@ class FrameBuffer:
                                     frame["semantic_backbone_quantized"] = bool(semantic_payload.get("quantized"))
                                     frame["semantic_backbone_device"] = semantic_payload.get("device", "")
                                     frame["semantic_backbone_checksum"] = semantic_payload.get("checksum", "")
-                            self.semantic_targets = detect_semantic_targets(
+                            detected_targets = detect_semantic_targets(
                                 frame, 24, DEFAULT_SEMANTIC_DETECTOR_VERSION
                             )
+                            previous_classes = {
+                                str(value.get("class", "")) for value in self.semantic_targets if isinstance(value, dict)
+                            }
+                            self.semantic_targets = merge_semantic_targets_by_roi(
+                                self.semantic_targets, detected_targets, frame.get("changed_regions", []), 48
+                            )
+                            current_classes = {
+                                str(value.get("class", "")) for value in self.semantic_targets if isinstance(value, dict)
+                            }
+                            if current_classes.intersection({"dialog", "menu"}) - previous_classes:
+                                SEMANTIC_EVENT_TRIGGER.request(frame_isolation_key(frame), "new_popup")
+                            frame["semantic_refresh"] = True
                             self.semantic_last_time = stamp
                         except (RuntimeError, ValueError, TypeError, CaptureUnavailable) as error:
                             self.last_error = str(error)
                     frame["semantic_targets"] = [dict(value) for value in self.semantic_targets]
-                    frame["scene_graph"] = (
-                        build_scene_graph(frame["semantic_targets"]) if "build_scene_graph" in globals() else {}
-                    )
-                    frame["visual_pyramid"] = (
-                        build_hybrid_visual_state(frame, list(self.frames)[-7:])
-                        if "build_hybrid_visual_state" in globals()
-                        else {}
-                    )
+                    if frame.get("semantic_refresh"):
+                        self.last_scene_graph = (
+                            build_scene_graph(frame["semantic_targets"]) if "build_scene_graph" in globals() else {}
+                        )
+                        self.last_visual_pyramid = (
+                            build_hybrid_visual_state(frame, list(self.frames)[-7:])
+                            if "build_hybrid_visual_state" in globals()
+                            else {}
+                        )
+                    frame["scene_graph"] = dict(self.last_scene_graph)
+                    frame["visual_pyramid"] = dict(self.last_visual_pyramid)
+                    frame["visual_tiers"] = {
+                        "base": "64x36_every_frame",
+                        "semantic": "event_and_every_" + str(plan.semantic_frame_interval) + "_frames",
+                        "ocr": "changed_roi_every_" + str(plan.ocr_frame_interval) + "_frames",
+                    }
                     RUNTIME_METRICS.observe("base_vision_ms", (time.monotonic() - vision_started) * 1000.0)
                     frame["object_signature"] = (
                         hashlib.sha256(
@@ -11275,7 +11965,9 @@ def prototype_collection_checksum(prototypes):
 
 
 def build_candidate_runtime_index(prototypes, require_numpy=False):
-    values = list(prototypes) if isinstance(prototypes, (list, tuple)) else []
+    all_values = list(prototypes) if isinstance(prototypes, (list, tuple)) else []
+    plan = RESOURCE_GOVERNOR.current_plan()
+    values = all_values[: max(1, min(MAX_PROTOTYPES, int(plan.prototype_limit)))]
     np = _optional_numpy()
     if require_numpy and np is None:
         raise RuntimeError("独立AI工作进程缺少NumPy候选匹配能力")
@@ -11284,6 +11976,7 @@ def build_candidate_runtime_index(prototypes, require_numpy=False):
     cluster_indices = defaultdict(list)
     coarse_rows = []
     feature_rows = []
+    threshold_rows = []
     identifiers = []
     cluster_ids = []
     authorized = []
@@ -11306,27 +11999,35 @@ def build_candidate_runtime_index(prototypes, require_numpy=False):
         buckets.append(bucket)
         coarse_rows.append(bytes(coarse))
         feature_rows.append(feature_bytes(proto["f"]))
+        threshold_rows.append(max(0.0, safe_float(proto.get("threshold", 0.0), 0.0)))
         cluster_indices[cluster_id].append(index)
         for backend in method_set:
             backend_indices[backend].append(index)
             bucket_indices[(backend, bucket)].append(index)
     if np is not None and values:
-        coarse_matrix = np.frombuffer(b"".join(coarse_rows), dtype=np.uint8).reshape(len(values), COARSE_LEN)
-        feature_matrix = np.frombuffer(b"".join(feature_rows), dtype=np.uint8).reshape(
-            len(values), FEATURE_CHANNELS, PIXELS
+        prototype_coarse = np.ascontiguousarray(
+            np.frombuffer(b"".join(coarse_rows), dtype=np.uint8).reshape(len(values), COARSE_LEN)
         )
-        weights = np.asarray(FEATURE_DISTANCE_WEIGHTS, dtype=np.float64)
-        authorized_mask = np.asarray(authorized, dtype=np.bool_)
+        prototype_features = np.ascontiguousarray(
+            np.frombuffer(b"".join(feature_rows), dtype=np.uint8).reshape(len(values), FEATURE_LEN)
+        )
+        prototype_thresholds = np.ascontiguousarray(np.asarray(threshold_rows, dtype=np.float32))
+        weights = np.ascontiguousarray(np.asarray(FEATURE_DISTANCE_WEIGHTS, dtype=np.float64))
+        authorized_mask = np.ascontiguousarray(np.asarray(authorized, dtype=np.bool_))
     else:
-        coarse_matrix = tuple(coarse_rows)
-        feature_matrix = tuple(feature_rows)
+        prototype_coarse = tuple(coarse_rows)
+        prototype_features = tuple(feature_rows)
+        prototype_thresholds = tuple(threshold_rows)
         weights = FEATURE_DISTANCE_WEIGHTS
         authorized_mask = tuple(authorized)
     return {
-        "token": prototype_collection_checksum(values),
+        "token": prototype_collection_checksum(all_values),
         "prototypes": values,
-        "coarse_matrix": coarse_matrix,
-        "feature_matrix": feature_matrix,
+        "prototype_features": prototype_features,
+        "prototype_coarse": prototype_coarse,
+        "prototype_thresholds": prototype_thresholds,
+        "feature_matrix": prototype_features,
+        "coarse_matrix": prototype_coarse,
         "weights": weights,
         "backend_indices": dict(backend_indices),
         "cluster_indices": dict(cluster_indices),
@@ -11337,6 +12038,8 @@ def build_candidate_runtime_index(prototypes, require_numpy=False):
         "methods": tuple(methods),
         "buckets": tuple(buckets),
         "numpy": np is not None,
+        "prototype_limit": len(values),
+        "prototype_total": len(all_values),
     }
 
 
@@ -11365,7 +12068,7 @@ def candidate_visual_matches(runtime_index, feature, query_coarse, backend, full
     np = _optional_numpy() if runtime_index.get("numpy") else None
     if np is not None:
         eligible_array = np.asarray(eligible, dtype=np.intp)
-        coarse_matrix = runtime_index["coarse_matrix"]
+        coarse_matrix = runtime_index["prototype_coarse"]
         query = np.frombuffer(bytes(query_coarse), dtype=np.uint8).astype(np.int16)
         difference = coarse_matrix[eligible_array].astype(np.int16) - query[None, :]
         coarse_scores = np.mean(np.square(difference, dtype=np.int32), axis=1, dtype=np.float64)
@@ -11375,7 +12078,9 @@ def candidate_visual_matches(runtime_index, feature, query_coarse, backend, full
         query_feature = (
             np.frombuffer(feature_bytes(feature), dtype=np.uint8).reshape(FEATURE_CHANNELS, PIXELS).astype(np.int16)
         )
-        feature_matrix = runtime_index["feature_matrix"][selected].astype(np.int16)
+        feature_matrix = runtime_index["prototype_features"][selected].reshape(
+            len(selected), FEATURE_CHANNELS, PIXELS
+        ).astype(np.int16)
         feature_difference = feature_matrix - query_feature[None, :, :]
         channel_means = np.mean(np.square(feature_difference, dtype=np.int32), axis=2, dtype=np.float64)
         exact_scores = np.dot(channel_means, runtime_index["weights"])
@@ -11384,13 +12089,16 @@ def candidate_visual_matches(runtime_index, feature, query_coarse, backend, full
             {"index": int(index), "coarse_score": float(coarse_score), "exact_score": float(score)}
             for index, coarse_score, score in zip(selected.tolist(), selected_coarse.tolist(), exact_scores.tolist())
         ]
-    coarse_matrix = runtime_index.get("coarse_matrix", ())
+    coarse_matrix = runtime_index.get("prototype_coarse", ())
     ranked = []
     for index in eligible:
         score = coarse_distance(query_coarse, coarse_matrix[index])
         ranked.append((0 if index in bucket_set else 1, score, index))
     selected = [index for _, _, index in sorted(ranked, key=lambda item: (item[0], item[1], item[2]))[:exact_limit]]
-    exact = batch_feature_distances(feature, [runtime_index["feature_matrix"][index] for index in selected])
+    exact = batch_feature_distances(
+        feature,
+        [runtime_index["prototype_features"][index] for index in selected],
+    )
     coarse_lookup = {index: score for _, score, index in ranked}
     return [
         {"index": int(index), "coarse_score": float(coarse_lookup[index]), "exact_score": float(score)}
@@ -14282,7 +14990,8 @@ class OfflinePolicyModelBuilder:
         try:
             import torch
 
-            torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
+            plan = wait_for_runtime_training_plan()
+            configure_torch_runtime(torch, plan)
             torch.manual_seed(self.config.seed % (2**63 - 1))
             dense_type = self._dense_network_type(torch)
             tensors = self._prepare_tensors(torch)
@@ -14351,7 +15060,7 @@ class OfflinePolicyModelBuilder:
         train_indices = [index for index, game in enumerate(rows["games"]) if game in train_games]
         if not train_indices:
             train_indices = list(range(len(filtered)))
-        device = torch.device("cpu")
+        device = torch_training_device(torch)
         tensor = lambda values, dtype: torch.tensor(values, dtype=dtype, device=device)
         return PolicyTrainingTensors(
             filtered=filtered,
@@ -14372,17 +15081,17 @@ class OfflinePolicyModelBuilder:
         )
 
     @staticmethod
-    def _create_networks(dense_type):
+    def _create_networks(dense_type, device):
         pair_size = POLICY_INPUT_SIZE + LATENT_ACTION_SIZE
-        q1 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE)
-        q2 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE)
-        value = dense_type(POLICY_INPUT_SIZE, 1, POLICY_HIDDEN_SIZE)
-        policy = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE)
-        risk = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE)
-        outcome = dense_type(pair_size, 3, POLICY_HIDDEN_SIZE)
-        dynamics = dense_type(pair_size, POLICY_INPUT_SIZE, POLICY_HIDDEN_SIZE)
-        target_q1 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE)
-        target_q2 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE)
+        q1 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
+        q2 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
+        value = dense_type(POLICY_INPUT_SIZE, 1, POLICY_HIDDEN_SIZE).to(device)
+        policy = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
+        risk = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
+        outcome = dense_type(pair_size, 3, POLICY_HIDDEN_SIZE).to(device)
+        dynamics = dense_type(pair_size, POLICY_INPUT_SIZE, POLICY_HIDDEN_SIZE).to(device)
+        target_q1 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
+        target_q2 = dense_type(pair_size, 1, POLICY_HIDDEN_SIZE).to(device)
         target_q1.load_state_dict(q1.state_dict())
         target_q2.load_state_dict(q2.state_dict())
         parameters = []
@@ -14407,7 +15116,7 @@ class OfflinePolicyModelBuilder:
         for member_index in range(POLICY_ENSEMBLE_SIZE):
             member_seed = (self.config.seed + member_index * 104729) % (2**63 - 1)
             torch.manual_seed(member_seed)
-            networks = self._create_networks(dense_type)
+            networks = self._create_networks(dense_type, tensors.device)
             optimizer = torch.optim.AdamW(networks.parameters, lr=0.0015, weight_decay=0.0001)
             rng = random.Random(member_seed)
             bootstrap = [
@@ -14415,16 +15124,47 @@ class OfflinePolicyModelBuilder:
                 for _ in range(max(32, len(tensors.train_indices)))
             ]
             steps = max(36, min(180, len(tensors.train_indices) * 2))
-            batch_size = min(32, max(12, len(bootstrap)))
-            for _ in range(steps):
+            plan = wait_for_runtime_training_plan()
+            batch_size = max(1, min(32, plan.training_batch_size, len(bootstrap)))
+            amp_enabled = torch_device_is_cuda(torch, tensors.device)
+            scaler = torch_grad_scaler(torch, amp_enabled)
+            completed = 0
+            while completed < steps:
+                plan = wait_for_runtime_training_plan()
+                configure_torch_runtime(torch, plan)
+                batch_size = max(1, min(batch_size, plan.training_batch_size, len(bootstrap)))
                 indexes = [bootstrap[rng.randrange(len(bootstrap))] for _ in range(batch_size)]
-                losses = self._training_step(torch, networks, optimizer, tensors, indexes)
+                try:
+                    losses = self._training_step(
+                        torch, networks, optimizer, tensors, indexes, scaler, amp_enabled
+                    )
+                    completed += 1
+                except RuntimeError as error:
+                    message = str(error).casefold()
+                    if ("out of memory" not in message and "allocation" not in message) or batch_size <= 1:
+                        raise
+                    batch_size = max(1, batch_size // 2)
+                    optimizer.zero_grad(set_to_none=True)
+                    release_torch_training_resources(torch)
+                    continue
                 for name, value in losses.items():
                     history[name].append(float(value))
+            optimizer.zero_grad(set_to_none=True)
+            scaler = None
             ensemble.append(self._serialize_member(networks, member_seed, len(bootstrap)))
+            release_torch_training_resources(torch)
         return ensemble, history
 
-    def _training_step(self, torch, networks, optimizer, tensors, indexes):
+    def _training_step(self, torch, networks, optimizer, tensors, indexes, scaler=None, amp_enabled=False):
+        autocast = (
+            torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+            if amp_enabled
+            else nullcontext()
+        )
+        with autocast:
+            return self._training_step_impl(torch, networks, optimizer, tensors, indexes, scaler)
+
+    def _training_step_impl(self, torch, networks, optimizer, tensors, indexes, scaler=None):
         idx = torch.tensor(indexes, dtype=torch.long, device=tensors.device)
         state = tensors.state[idx]
         action = tensors.action[idx]
@@ -14489,7 +15229,7 @@ class OfflinePolicyModelBuilder:
         consistency_loss = (sample_weight * consistency_error).mean()
         total = q1_loss + q2_loss + value_loss + self.config.cql_alpha * cql_loss + policy_loss
         total = total + 0.35 * support_loss + 0.75 * risk_loss + 0.45 * outcome_loss + 0.25 * consistency_loss
-        self._optimize(torch, networks, optimizer, total)
+        self._optimize(torch, networks, optimizer, total, scaler)
         return {
             "q1_loss": q1_loss.item(),
             "q2_loss": q2_loss.item(),
@@ -14503,11 +15243,18 @@ class OfflinePolicyModelBuilder:
         }
 
     @staticmethod
-    def _optimize(torch, networks, optimizer, total):
+    def _optimize(torch, networks, optimizer, total, scaler=None):
         optimizer.zero_grad(set_to_none=True)
-        total.backward()
-        torch.nn.utils.clip_grad_norm_(networks.parameters, 5.0)
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(total).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(networks.parameters, 5.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            total.backward()
+            torch.nn.utils.clip_grad_norm_(networks.parameters, 5.0)
+            optimizer.step()
         with torch.no_grad():
             for target, source in zip(networks.target_q1.parameters(), networks.q1.parameters()):
                 target.mul_(0.99).add_(source, alpha=0.01)
@@ -18956,10 +19703,18 @@ class DataStoreSampleMixin:
     def sample_queue_pressure(self, gid):
         with self.pending_lock:
             count = int(self.pending_counts_by_game.get(str(gid), {}).get("total", 0))
-        return min(1.0, count / 192.0)
+            oldest = min(
+                (safe_float(item.get("created"), time.time()) for item in self.pending_samples),
+                default=time.time(),
+            )
+        ratio = RESOURCE_GOVERNOR.report_queue(
+            "sample_writer", count, MAX_PENDING_SAMPLES, max(0.0, (time.time() - oldest) * 1000.0) if count else 0.0
+        )
+        return min(1.0, ratio)
 
     def _flush_pending(self, connection):
         self._ensure_writable()
+        disk_started = time.monotonic()
         with self.pending_lock:
             if not self.pending_samples:
                 self.pending_event.clear()
@@ -19025,6 +19780,16 @@ class DataStoreSampleMixin:
                         else "未知写入错误"
                     )
                 self.writer_condition.notify_all()
+            RESOURCE_GOVERNOR.report_queue(
+                "sample_writer",
+                len(self.pending_samples),
+                MAX_PENDING_SAMPLES,
+                max(
+                    0.0,
+                    (time.time() - min((safe_float(item.get("created"), time.time()) for item in self.pending_samples), default=time.time())) * 1000.0,
+                ) if self.pending_samples else 0.0,
+            )
+        RESOURCE_GOVERNOR.report_disk_write((time.monotonic() - disk_started) * 1000.0)
         if success:
             if recovered:
                 self._notify_writer_error(None)
@@ -19484,6 +20249,23 @@ class DataStoreSampleMixin:
             if (game_id, fingerprint) in self.pending_fingerprints:
                 return False
             queued_total = sum(safe_int(counts.get("total"), 0, 0) for counts in self.pending_counts_by_game.values())
+            oldest_created = min(
+                (safe_float(value.get("created"), time.time()) for value in self.pending_samples),
+                default=time.time(),
+            )
+            queue_ratio = RESOURCE_GOVERNOR.report_queue(
+                "sample_writer",
+                queued_total,
+                MAX_PENDING_SAMPLES,
+                max(0.0, (time.time() - oldest_created) * 1000.0) if queued_total else 0.0,
+            )
+            if queue_ratio > 0.90 or not RESOURCE_GOVERNOR.sample_production_allowed():
+                self.pending_event.set()
+                self.logger.write(
+                    "RESOURCE_GOVERNOR_SAMPLE_PRODUCTION_BLOCKED",
+                    details={"game_id": game_id, "queue_depth": queued_total, "queue_ratio": queue_ratio},
+                )
+                return False
             if queued_total >= MAX_PENDING_SAMPLES:
                 drop_index = next(
                     (index for index, value in enumerate(self.pending_samples) if value.get("kind") == "no_op"), None
@@ -20618,6 +21400,134 @@ class DataStoreSampleMixin:
         self._invalidate_sample_caches(gid)
 
 
+MODEL_TENSOR_REFERENCE_KEY = "__safetensors_tensor__"
+MODEL_TENSOR_BUNDLE_SCHEMA_VERSION = 1
+
+
+def _model_tensor_numpy(base):
+    site = runtime_site_packages(base)
+    if site.exists() and str(site) not in sys.path:
+        sys.path.insert(0, str(site))
+    import importlib
+
+    importlib.invalidate_caches()
+    return importlib.import_module("numpy"), importlib.import_module("safetensors.numpy")
+
+
+def _model_tensor_candidate(value, path, np):
+    if not isinstance(value, (list, tuple)) or len(value) < 1:
+        return None
+    leaf = str(path[-1]).casefold() if path else ""
+    eligible = (
+        "weight" in leaf
+        or "bias" in leaf
+        or leaf in {"kernel", "embedding_matrix", "projection_matrix"}
+    )
+    if not eligible:
+        return None
+    try:
+        array_value = np.asarray(value)
+    except (TypeError, ValueError):
+        return None
+    if array_value.dtype.kind not in {"f", "i", "u"} or array_value.dtype.kind == "O" or array_value.size < 16:
+        return None
+    if array_value.dtype.kind == "f":
+        array_value = array_value.astype(np.float32, copy=False)
+    elif array_value.dtype.kind == "u":
+        array_value = array_value.astype(np.int64, copy=False)
+    else:
+        array_value = array_value.astype(np.int64, copy=False)
+    return np.ascontiguousarray(array_value)
+
+
+def externalize_model_tensors(base, model):
+    value = dict(model) if isinstance(model, dict) else {}
+    value.pop("tensor_bundle", None)
+    np, safetensors_numpy = _model_tensor_numpy(base)
+    tensors = {}
+    schemas = {}
+    counter = [0]
+
+    def visit(item, path=()):
+        candidate = _model_tensor_candidate(item, path, np)
+        if candidate is not None:
+            counter[0] += 1
+            name = "tensor_" + str(counter[0]).zfill(6)
+            tensors[name] = candidate
+            schemas[name] = {"shape": list(candidate.shape), "dtype": str(candidate.dtype)}
+            return {MODEL_TENSOR_REFERENCE_KEY: name}
+        if isinstance(item, dict):
+            return {str(key): visit(child, path + (str(key),)) for key, child in item.items()}
+        if isinstance(item, list):
+            return [visit(child, path + (str(index),)) for index, child in enumerate(item)]
+        if isinstance(item, tuple):
+            return [visit(child, path + (str(index),)) for index, child in enumerate(item)]
+        return item
+
+    packed = visit(value)
+    if not tensors:
+        return packed
+    root = Path(base).resolve() / "models" / "tensors"
+    root.mkdir(parents=True, exist_ok=True)
+    temporary = root / ("pending_" + uuid.uuid4().hex + ".safetensors")
+    safetensors_numpy.save_file(tensors, str(temporary))
+    digest = sha256_file(temporary, MODEL_MAX_BYTES)
+    final = root / (digest + ".safetensors")
+    if final.exists():
+        if sha256_file(final, MODEL_MAX_BYTES) != digest:
+            temporary.unlink(missing_ok=True)
+            raise RuntimeError("已存在神经权重文件的SHA-256不匹配")
+        temporary.unlink(missing_ok=True)
+    else:
+        os.replace(temporary, final)
+    packed["tensor_bundle"] = {
+        "schema_version": MODEL_TENSOR_BUNDLE_SCHEMA_VERSION,
+        "relative_path": final.relative_to(Path(base).resolve()).as_posix(),
+        "sha256": digest,
+        "tensors": schemas,
+    }
+    return packed
+
+
+def hydrate_model_tensors(base, model):
+    value = dict(model) if isinstance(model, dict) else {}
+    descriptor = value.get("tensor_bundle") if isinstance(value.get("tensor_bundle"), dict) else None
+    if descriptor is None:
+        return value
+    if safe_int(descriptor.get("schema_version"), 0) != MODEL_TENSOR_BUNDLE_SCHEMA_VERSION:
+        raise RuntimeError("神经权重清单版本无效")
+    root = Path(base).resolve()
+    path = (root / str(descriptor.get("relative_path", ""))).resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        raise RuntimeError("神经权重文件路径无效")
+    expected = str(descriptor.get("sha256", ""))
+    if len(expected) != 64 or sha256_file(path, MODEL_MAX_BYTES) != expected:
+        raise RuntimeError("神经权重文件SHA-256校验失败")
+    np, safetensors_numpy = _model_tensor_numpy(base)
+    tensors = safetensors_numpy.load_file(str(path))
+    schemas = descriptor.get("tensors", {}) if isinstance(descriptor.get("tensors"), dict) else {}
+    if set(tensors) != set(schemas):
+        raise RuntimeError("神经权重张量名称与清单不一致")
+    for name, tensor in tensors.items():
+        schema = schemas.get(name, {}) if isinstance(schemas.get(name), dict) else {}
+        if list(tensor.shape) != list(schema.get("shape", [])) or str(tensor.dtype) != str(schema.get("dtype", "")):
+            raise RuntimeError("神经权重张量shape或dtype不一致：" + name)
+
+    def visit(item):
+        if isinstance(item, dict):
+            if set(item) == {MODEL_TENSOR_REFERENCE_KEY}:
+                name = str(item[MODEL_TENSOR_REFERENCE_KEY])
+                if name not in tensors:
+                    raise RuntimeError("神经权重引用不存在：" + name)
+                return tensors[name].tolist()
+            return {str(key): visit(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [visit(child) for child in item]
+        return item
+
+    return visit(value)
+
+
 class DataStoreWindowModelMixin:
     def save_window_descriptor(self, target):
         self._ensure_writable()
@@ -20748,7 +21658,7 @@ class DataStoreWindowModelMixin:
         return None
 
     def _pack_model(self, model):
-        item = dict(model)
+        item = externalize_model_tensors(self.base, model)
         packed = []
         for proto in item.get("prototypes", []):
             entry = dict(proto)
@@ -20772,7 +21682,7 @@ class DataStoreWindowModelMixin:
             entry["coarse"] = base64.b64decode(entry.pop("coarse_blob"), validate=True)
             unpacked.append(entry)
         item["prototypes"] = unpacked
-        return item
+        return hydrate_model_tensors(self.base, item)
 
     def _upgrade_model(self, item, gid, complete):
         try:
@@ -21073,8 +21983,6 @@ class DataStoreWindowModelMixin:
             runtime = action_runtime_metadata(entry.get("a"))
             entry["a"] = runtime["action"]
             entry["action_family"] = runtime["family"]
-            entry["feature_view"] = memoryview(entry["f"]).toreadonly()
-            entry["channel_offsets"] = (0, PIXELS, PIXELS * 2, PIXELS * 3, PIXELS * 4)
             entry["dangerous"] = runtime["dangerous"]
             entry["strictness"] = runtime["strictness"]
             entry["cooldown"] = runtime["cooldown"]
@@ -22761,7 +23669,7 @@ class AppServiceBase:
 class AppUiService(AppServiceBase):
     def _build(self):
         self.root.title("通用游戏AI")
-        fit_window(self.root, 860, 780, 720, 680)
+        fit_window(self.root, 880, 860, 740, 720)
         self.root.option_add("*Font", ("Microsoft YaHei UI", 10))
         style = ttk.Style(self.root)
         if "vista" in style.theme_names():
@@ -22859,6 +23767,12 @@ class AppUiService(AppServiceBase):
             )
         info.columnconfigure(1, weight=1)
         info.columnconfigure(3, weight=1)
+
+        capability = ttk.LabelFrame(outer, text="真实能力", style="Card.TLabelframe")
+        capability.pack(fill="x", pady=(0, 12))
+        ttk.Label(capability, textvariable=self.capability_text, wraplength=790, justify="left").pack(
+            anchor="w", fill="x"
+        )
 
         self.advanced_visible = tk.BooleanVar(value=False)
         self.advanced_frame = ttk.Frame(outer)
@@ -26771,6 +27685,30 @@ class AppStorageService(AppServiceBase):
     def _update_runtime_status(self):
         vision = self.vision_runtime
         ocr = self.ocr_runtime
+        worker_status = dict(getattr(self.ai_worker, "status", {}) or {})
+        runtime_manifest = (
+            dict(worker_status.get("runtime_manifest", {}))
+            if isinstance(worker_status.get("runtime_manifest"), dict)
+            else {}
+        )
+        plan = RESOURCE_GOVERNOR.current_plan()
+        snapshot = RESOURCE_GOVERNOR.current_snapshot()
+        family = str(
+            runtime_manifest.get("runtime_family")
+            or runtime_manifest.get("gpu_backend")
+            or plan.backend
+        )
+        fallback = (
+            dict(runtime_manifest.get("backend_fallback", {}))
+            if isinstance(runtime_manifest.get("backend_fallback"), dict)
+            else {}
+        )
+        fallback_reason = str(
+            fallback.get("reason")
+            or runtime_manifest.get("gpu_fallback_reason")
+            or runtime_manifest.get("fallback_reason")
+            or ("尚未执行后端实测" if not runtime_manifest else "无")
+        )
         if vision is not None and vision.ready and ocr is not None and ocr.ready:
             manifest = (
                 vision.manifest()
@@ -26780,9 +27718,19 @@ class AppStorageService(AppServiceBase):
                     "trained_steps": 0,
                     "backend": vision.backend,
                     "serialization": vision.serialization,
+                    "capabilities": dict(getattr(vision, "capabilities", {})),
                 }
             )
+            capabilities = manifest.get("capabilities", {}) if isinstance(manifest.get("capabilities"), dict) else {}
             vision_backend = str(manifest.get("backend", getattr(vision, "backend", "builtin_cpu")))
+            if bool(capabilities.get("cpu_quantized_onnx")):
+                visual_panel = "ONNX INT8 CPU（语义）+ 64×36基础视觉"
+            elif bool(capabilities.get("gpu_full_visual_model")):
+                visual_panel = "PyTorch " + ("CUDA" if family.startswith("windows-x64-nvidia") else "DirectML")
+            elif vision_backend == "torch":
+                visual_panel = "PyTorch CPU"
+            else:
+                visual_panel = "内置CPU可训练编码器"
             vision_text = "PyTorch" if vision_backend == "torch" else "内置CPU可训练编码器"
             ocr_backend = str(getattr(ocr, "backend", "none"))
             ocr_text = (
@@ -26803,15 +27751,62 @@ class AppStorageService(AppServiceBase):
                 + "；模型格式："
                 + serialization
             )
-        elif self.store is None:
-            self.confidence_text.set("离线AI运行库：请先选择文件夹")
         else:
-            self.confidence_text.set(
-                "离线AI运行库未就绪，请点击“检查文件完整性”；视觉="
-                + str(getattr(vision, "error", "未初始化"))
-                + "；OCR="
-                + str(getattr(ocr, "error", "未初始化"))
+            visual_panel = "未就绪"
+            if self.store is None:
+                self.confidence_text.set("离线AI运行库：请先选择文件夹")
+            else:
+                self.confidence_text.set(
+                    "离线AI运行库未就绪，请点击“检查文件完整性”；视觉="
+                    + str(getattr(vision, "error", "未初始化"))
+                    + "；OCR="
+                    + str(getattr(ocr, "error", "未初始化"))
+                )
+        runtime_ready = bool(vision is not None and vision.ready and ocr is not None and ocr.ready)
+        policy_backend = (
+            "PyTorch CUDA"
+            if runtime_ready and family.startswith("windows-x64-nvidia")
+            else "PyTorch DirectML"
+            if runtime_ready and family == "windows-x64-directml"
+            else "PyTorch CPU" if runtime_ready else "未就绪"
+        )
+        scope = "单游戏模型"
+        active = self.active_model_runtime if isinstance(self.active_model_runtime, dict) else {}
+        validation = active.get("validation", {}) if isinstance(active.get("validation"), dict) else {}
+        if str(active.get("model_scope") or validation.get("model_scope")) == "general_model":
+            scope = "通用模型（真实Level 3/4已验证）"
+        benchmark = "未安装"
+        if self.data_directory is not None:
+            manifest_path = (
+                FixedGeneralizationBenchmark.root(self.data_directory)
+                / FixedGeneralizationBenchmark.manifest_name
             )
+            if manifest_path.is_file():
+                benchmark = "已安装，需以真实结果门禁为准"
+        self.capability_text.set(
+            "视觉后端："
+            + visual_panel
+            + "；策略后端："
+            + policy_backend
+            + "；线程："
+            + str(plan.torch_threads)
+            + "；当前截图："
+            + str(plan.capture_fps)
+            + " FPS；语义分析：每"
+            + str(plan.semantic_frame_interval)
+            + "帧或事件触发；OCR：每"
+            + str(plan.ocr_frame_interval)
+            + "帧且仅变化ROI；队列占用："
+            + str(int(round(snapshot.queue_ratio * 100.0)))
+            + "%\n模型范围："
+            + scope
+            + "；泛化基准："
+            + benchmark
+            + "；资源状态："
+            + RESOURCE_GOVERNOR.status()["state"]
+            + "；GPU回退原因："
+            + fallback_reason
+        )
 
     def require_ai_runtime(self):
         if not self.lifecycle.runtime_ready or self.vision_runtime is None or self.ocr_runtime is None:
@@ -27211,6 +28206,10 @@ class App:
         self.sample_text = tk.StringVar(value="样本：有效0  废弃0  数据0 KB")
         self.model_text = tk.StringVar(value="单游戏模型：无  需要睡眠：否")
         self.confidence_text = tk.StringVar(value="离线AI运行库：未检查")
+        self.capability_text = tk.StringVar(
+            value="视觉后端：未检查；策略后端：未检查；线程：-；当前截图：- FPS；语义分析：-；队列占用：0%\n"
+            "模型范围：单游戏模型；泛化基准：未安装；GPU回退原因：尚未执行后端基准测试"
+        )
         self.input_text = tk.StringVar(value="自动输入：已锁定")
         self.capture_options = CaptureOptions()
         self.capture_mouse_var = tk.BooleanVar(value=True)
@@ -27652,7 +28651,7 @@ class App:
             embedded = (
                 runtime.get("resolution_source") == "embedded"
                 and bool(runtime.get("embedded_lock_checksum"))
-                and bool(runtime.get("lock_complete", runtime_lock_is_complete(runtime.get("resolved_wheels", []))))
+                and bool(runtime.get("lock_complete", runtime_lock_matches_key(runtime.get("resolved_wheels", []), runtime.get("lock_key"))))
             )
             if status == "completed":
                 self.record_acceptance_case("文件完整性", "normal_complete", "passed", runtime)
@@ -28339,7 +29338,7 @@ class WindowsSmokeTest:
         embedded = bool(
             manifest.get("resolution_source") == "embedded"
             and manifest.get("embedded_lock_checksum")
-            and manifest.get("lock_complete", runtime_lock_is_complete(manifest.get("resolved_wheels", [])))
+            and manifest.get("lock_complete", runtime_lock_matches_key(manifest.get("resolved_wheels", []), manifest.get("lock_key")))
         )
         acceptance.record_case(
             "独立运行时", "embedded_wheel_lock", "passed" if embedded else "failed", {"resolution_source": manifest.get("resolution_source", "dynamic")}
@@ -29298,7 +30297,8 @@ def _runtime_tree_manifest(root, verify_files=True):
             or hashlib.sha256(canonical_bytes(wheels)).hexdigest() != wheel_checksum
         ):
             return None
-        if value.get("lock_complete") is not True or not runtime_lock_is_complete(wheels):
+        lock_key = str(value.get("lock_key") or value.get("runtime_lock_key") or (RUNTIME_ARCH_X64 + "|builtin_cpu"))
+        if value.get("lock_complete") is not True or not runtime_lock_matches_key(wheels, lock_key):
             return None
         for wheel in wheels:
             if (
@@ -29375,11 +30375,13 @@ def validate_runtime_manifest(base, verify_files=False, verify_lock=False):
     ):
         raise RuntimeError("运行库未使用内嵌wheel锁")
     if verify_lock:
-        expected, expected_checksum, _ = embedded_runtime_lock(architecture)
+        lock_key = str(value.get("lock_key") or value.get("runtime_lock_key") or (architecture + "|builtin_cpu"))
+        expected = runtime_lock_manifest().get("locks", {}).get(lock_key, [])
+        expected_checksum = hashlib.sha256(canonical_bytes(expected)).hexdigest() if expected else ""
         if wheels != expected or embedded_checksum != expected_checksum:
-            raise RuntimeError("运行库wheel锁与当前程序内嵌锁不一致")
-        if value.get("lock_complete") is not True or not runtime_lock_is_complete(wheels):
-            raise RuntimeError("内嵌运行库wheel锁不完整")
+            raise RuntimeError("运行库wheel锁与当前程序内嵌后端锁不一致")
+        if value.get("lock_complete") is not True or not runtime_lock_matches_key(wheels, lock_key):
+            raise RuntimeError("内嵌后端运行库wheel锁不完整")
         expected_contracts = {
             key: {field: sorted(values) for field, values in contract.items()}
             for key, contract in runtime_dependency_contracts().items()
@@ -29401,9 +30403,12 @@ def validate_runtime_manifest(base, verify_files=False, verify_lock=False):
             name, version = text.split("==", 1)
             frozen[normalized_project_name(name)] = version.strip()
     if verify_lock:
-        for name, version in runtime_lock_project_versions().items():
+        expected_versions = {
+            normalized_project_name(item.get("name")): str(item.get("version", "")) for item in wheels
+        }
+        for name, version in expected_versions.items():
             if frozen.get(name) != version:
-                raise RuntimeError("pip freeze与内嵌wheel锁不一致：" + name)
+                raise RuntimeError("pip freeze与所选后端wheel锁不一致：" + name)
     return value
 
 
@@ -30013,12 +31018,208 @@ def _runtime_download_locked_wheels(entries, wheelhouse, env, cache_root):
 
 
 def _runtime_write_require_hashes_lock(path, entries, wheelhouse):
-    if not runtime_lock_is_complete(entries):
-        raise RuntimeError("内嵌运行库wheel锁不完整")
+    if not runtime_backend_lock_is_complete(entries):
+        raise RuntimeError("内嵌后端运行库wheel锁不完整")
     lines = ["--no-index", "--no-deps", "--find-links " + Path(wheelhouse).resolve().as_uri()]
     for entry in sorted(entries, key=lambda item: item["name"].casefold()):
         lines.append(entry["name"] + "==" + entry["version"] + " --hash=sha256:" + entry["sha256"])
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _runtime_backend_validation(python, env, family):
+    source = """
+import gc,hashlib,json,math,statistics,sys,tempfile,time
+import numpy as np
+from PIL import Image,ImageDraw
+import cv2
+import torch
+import torchvision
+import setuptools
+from omegaconf import OmegaConf
+from safetensors.torch import save_file,load_file
+from rapidocr import RapidOCR
+family=__FAMILY__
+if family.startswith('windows-x64-nvidia'):
+    if not torch.cuda.is_available():
+        raise RuntimeError('CUDA运行库已安装但torch.cuda.is_available为False')
+    device=torch.device('cuda')
+    device_name=str(torch.cuda.get_device_name(0))
+    device_type='cuda'
+elif family=='windows-x64-directml':
+    import torch_directml
+    device=torch_directml.device()
+    device_name=str(device)
+    device_type='privateuseone'
+else:
+    device=torch.device('cpu')
+    device_name='CPU'
+    device_type='cpu'
+def sync():
+    if family.startswith('windows-x64-nvidia'):
+        torch.cuda.synchronize()
+a=np.asarray([[1,2],[3,4]],dtype=np.float32)
+assert float(a.sum())==10.0
+image=Image.new('RGB',(180,64),'white')
+ImageDraw.Draw(image).text((12,18),'12345',fill='black')
+array=np.asarray(image)
+assert cv2.resize(array,(90,32)).shape==(32,90,3)
+x=torch.tensor([[1.0,2.0]],device=device,requires_grad=True)
+y=(x@torch.tensor([[2.0],[3.0]],device=device)).sum()
+y.backward()
+sync()
+assert abs(float(y.detach().to('cpu'))-8.0)<1e-4 and x.grad is not None
+with tempfile.TemporaryDirectory() as folder:
+    path=folder+'/probe.safetensors'
+    save_file({'x':x.detach().to('cpu')},path)
+    assert tuple(load_file(path)['x'].shape)==(1,2)
+engine=RapidOCR()
+ocr_result=engine(array)
+ocr_text=''
+if ocr_result is not None:
+    ocr_text=str(getattr(ocr_result,'txts','') or getattr(ocr_result,'texts','') or ocr_result)
+assert isinstance(ocr_text,str)
+assert OmegaConf.create({'strict':True}).strict is True
+conv=torch.nn.Conv2d(3,24,3,padding=1).to(device).eval()
+conv_input=torch.randn(1,3,128,128,device=device)
+mat_a=torch.randn(384,384,device=device)
+mat_b=torch.randn(384,384,device=device)
+for _ in range(3):
+    with torch.inference_mode():
+        conv(conv_input); mat_a@mat_b
+    sync()
+def measure(call):
+    values=[]
+    for _ in range(9):
+        started=time.perf_counter()
+        with torch.inference_mode(): call()
+        sync()
+        values.append((time.perf_counter()-started)*1000.0)
+    values.sort()
+    return {
+        'p50_ms':values[len(values)//2],
+        'p95_ms':values[min(len(values)-1,round((len(values)-1)*0.95))],
+        'max_ms':values[-1],
+    }
+conv_metric=measure(lambda:conv(conv_input))
+matmul_metric=measure(lambda:mat_a@mat_b)
+stress=torch.empty(16*1024*1024,dtype=torch.float32,device=device)
+stress.fill_(1.0)
+sync()
+stress_checksum=float(stress[:1024].sum().detach().to('cpu'))
+del stress,conv_input,mat_a,mat_b,conv
+gc.collect()
+if family.startswith('windows-x64-nvidia'):
+    torch.cuda.empty_cache()
+score=float(conv_metric['p95_ms']+matmul_metric['p95_ms'])
+stable=all(math.isfinite(float(value)) for value in (score,stress_checksum)) and score<5000.0
+payload=b'UniversalGameAI strict runtime backend benchmark'
+print(json.dumps({
+    'python':sys.version,'family':family,'backend':'torch','device':device_name,'device_type':device_type,
+    'numpy':np.__version__,'pillow':getattr(Image,'__version__','loaded'),'opencv':cv2.__version__,
+    'torch':torch.__version__,'torchvision':torchvision.__version__,'rapidocr':'functional',
+    'safetensors':'functional','omegaconf':'functional','setuptools':setuptools.__version__,
+    'conv':conv_metric,'matmul':matmul_metric,'memory_stress_bytes':16*1024*1024*4,
+    'memory_stress_checksum':stress_checksum,'score_ms':score,'stable':stable,
+    'self_test_sha256':hashlib.sha256(payload).hexdigest()
+},ensure_ascii=False))
+""".replace("__FAMILY__", repr(str(family)))
+    output = subprocess.check_output(
+        [str(python), "-c", source],
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stderr=subprocess.STDOUT,
+        timeout=180,
+    )
+    value = json.loads(output.strip().splitlines()[-1])
+    if value.get("stable") is not True or str(value.get("family")) != str(family):
+        raise RuntimeError("后端卷积、矩阵乘法或显存压力测试未稳定通过：" + str(family))
+    return value
+
+
+def _runtime_candidate_environment(root):
+    staging = Path(root)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHONNOUSERSITE": "1",
+            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+            "PIP_NO_INPUT": "1",
+            "PIP_NO_INDEX": "1",
+            "PIP_CACHE_DIR": str(staging / "pip_cache"),
+            "XDG_CACHE_HOME": str(staging / "cache"),
+            "PYTHONPYCACHEPREFIX": str(staging / "cache" / "pycache"),
+            "TMP": str(staging / "temp"),
+            "TEMP": str(staging / "temp"),
+        }
+    )
+    return env
+
+
+def _runtime_install_backend_candidate(base, family, architecture, cache_root):
+    entries = runtime_backend_lock_entries(architecture, family)
+    if entries is None:
+        raise RuntimeError("候选后端缺少完整wheel锁：" + str(family))
+    root = Path(base) / ("runtime.candidate." + uuid.uuid4().hex)
+    root.mkdir(parents=True, exist_ok=False)
+    try:
+        python_path, bootstrap_artifacts = _bootstrap_embedded_python(root, architecture, cache_root)
+        python = str(python_path)
+        env = _runtime_candidate_environment(root)
+        for name in ("models/vision", "models/ocr", "models/tensors", "cache", "cache/pycache", "temp"):
+            (root / name).mkdir(parents=True, exist_ok=True)
+        wheelhouse = root / "wheelhouse"
+        wheelhouse.mkdir()
+        downloaded, evidence = _runtime_download_locked_wheels(entries, wheelhouse, env, cache_root)
+        if downloaded != entries:
+            raise RuntimeError("候选后端下载wheel与锁不一致")
+        checksum = hashlib.sha256(canonical_bytes(entries)).hexdigest()
+        lock_key = runtime_family_lock_key(architecture, family)
+        (root / "wheel_lock.json").write_text(
+            json.dumps(
+                {"lock_key": lock_key, "wheels": entries, "checksum": checksum, "resolution_source": "embedded"},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        requirements = root / "requirements.lock"
+        _runtime_write_require_hashes_lock(requirements, entries, wheelhouse)
+        _runtime_worker_command(
+            [python, "-m", "pip", "install", "--no-deps", "--require-hashes", "-r", str(requirements)],
+            env,
+            "安装候选后端 " + str(family),
+        )
+        validation = _runtime_backend_validation(python, env, family)
+        freeze = subprocess.check_output(
+            [python, "-m", "pip", "freeze", "--all"],
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        ).splitlines()
+        shutil.rmtree(wheelhouse, ignore_errors=True)
+        shutil.rmtree(root / "pip_cache", ignore_errors=True)
+        return {
+            "family": family,
+            "root": root,
+            "python_path": python_path,
+            "python_artifacts": bootstrap_artifacts,
+            "wheels": entries,
+            "lock_checksum": checksum,
+            "lock_key": lock_key,
+            "download_evidence": evidence,
+            "validation": validation,
+            "freeze": freeze,
+            "stable": True,
+            "score_ms": safe_float(validation.get("score_ms"), float("inf")),
+        }
+    except RECOVERABLE_ERRORS:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
 
 
 def runtime_install_worker(request_path):
@@ -30030,6 +31231,7 @@ def runtime_install_worker(request_path):
         raise RuntimeError("运行库安装子进程协议版本或启动阶段无效")
     base = Path(request["base"]).resolve()
     staging = Path(request["staging"]).resolve()
+    hardware = request.get("hardware", {}) if isinstance(request.get("hardware"), dict) else {}
     vendor = str(request.get("vendor", "unknown"))
     architecture = str(request.get("architecture") or native_windows_architecture())
     if os.name != "nt":
@@ -30068,7 +31270,7 @@ def runtime_install_worker(request_path):
                 "TEMP": str(staging / "temp"),
             }
         )
-        for name in ("models/vision", "models/ocr", "cache", "cache/pycache", "temp"):
+        for name in ("models/vision", "models/ocr", "models/tensors", "cache", "cache/pycache", "temp"):
             (staging / name).mkdir(parents=True, exist_ok=True)
         _runtime_emit("progress", value=10.0, message="读取内嵌wheel锁，禁止首次动态依赖解析")
         if not runtime_lock_is_complete(wheels):
@@ -30100,36 +31302,8 @@ def runtime_install_worker(request_path):
             env,
             "按内嵌SHA-256锁安装wheel",
         )
-        _runtime_emit("progress", value=82.0, message="执行内置CPU后端离线预热验证")
-        validation = (
-            "import hashlib,json,sys,tempfile\nimport numpy as np\nfrom PIL import Image,ImageDraw\nimport cv2\nimport torch\n"
-            "import torchvision\nimport setuptools\nfrom omegaconf import OmegaConf\nfrom safetensors.torch import save_file,load_file\n"
-            "from rapidocr import RapidOCR\na=np.asarray([[1,2],[3,4]],dtype=np.float32)\nassert float(a.sum())==10.0\n"
-            'image=Image.new("RGB",(180,64),"white")\nImageDraw.Draw(image).text((12,18),"12345",fill="black")\n'
-            "array=np.asarray(image)\nassert cv2.resize(array,(90,32)).shape==(32,90,3)\n"
-            "x=torch.tensor([[1.0,2.0]],requires_grad=True)\ny=(x@torch.tensor([[2.0],[3.0]])).sum()\ny.backward()\n"
-            "assert float(y)==8.0 and x.grad is not None\nwith tempfile.TemporaryDirectory() as folder:\n"
-            ' p=folder+"/probe.safetensors"\n save_file({"x":x.detach()},p)\n assert tuple(load_file(p)["x"].shape)==(1,2)\n'
-            'engine=RapidOCR()\nresult=engine(array)\ntext=""\nif result is not None:\n'
-            ' text=str(getattr(result,"txts","") or getattr(result,"texts","") or result)\nassert isinstance(text,str)\n'
-            'assert OmegaConf.create({"strict":True}).strict is True\nassert str(setuptools.__version__)\n'
-            'payload=b"UniversalGameAI strict runtime"\n'
-            'print(json.dumps({"python":sys.version,"backend":"torch_cpu","device":"CPU","numpy":np.__version__,"pillow":Image.__vers'
-            'ion__ if hasattr(Image,"__version__") else "loaded","opencv":cv2.__version__,"torch":torch.__version__,"torchvision":tor'
-            'chvision.__version__,"rapidocr":"functional","safetensors":"functional","omegaconf":str(OmegaConf.__version__) if hasatt'
-            'r(OmegaConf,"__version__") else "functional","setuptools":setuptools.__version__,"self_test_sha256":hashlib.sha256(paylo'
-            "ad).hexdigest()}))"
-        )
-        output = subprocess.check_output(
-            [python, "-c", validation],
-            env=env,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stderr=subprocess.STDOUT,
-            timeout=120,
-        )
-        validation_result = json.loads(output.strip().splitlines()[-1])
+        _runtime_emit("progress", value=82.0, message="执行CPU候选后端卷积、矩阵乘法与内存压力实测")
+        validation_result = _runtime_backend_validation(python, env, "windows-x64-cpu")
         freeze = subprocess.check_output(
             [python, "-m", "pip", "freeze", "--all"],
             env=env,
@@ -30140,13 +31314,97 @@ def runtime_install_worker(request_path):
         ).splitlines()
         shutil.rmtree(wheelhouse, ignore_errors=True)
         shutil.rmtree(staging / "pip_cache", ignore_errors=True)
+        candidate_records = [
+            {
+                "family": "windows-x64-cpu",
+                "root": staging,
+                "python_path": python_path,
+                "python_artifacts": bootstrap_artifacts,
+                "wheels": wheels,
+                "lock_checksum": wheel_lock_checksum,
+                "lock_key": lock_key,
+                "download_evidence": download_evidence,
+                "validation": validation_result,
+                "freeze": freeze,
+                "stable": True,
+                "score_ms": safe_float(validation_result.get("score_ms"), float("inf")),
+            }
+        ]
+        candidate_evidence = []
+        for descriptor in runtime_backend_candidates(architecture, hardware):
+            family = str(descriptor.get("family", ""))
+            if family == "windows-x64-cpu":
+                candidate_evidence.append(
+                    {**descriptor, "installed": True, "stable": True, "benchmark": validation_result}
+                )
+                continue
+            if not descriptor.get("lock_available") or not descriptor.get("hardware_eligible"):
+                candidate_evidence.append({**descriptor, "installed": False, "stable": False})
+                continue
+            try:
+                _runtime_emit("line", message="安装并实测候选后端 " + family)
+                candidate = _runtime_install_backend_candidate(base, family, architecture, cache_root)
+                candidate_records.append(candidate)
+                candidate_evidence.append(
+                    {**descriptor, "installed": True, "stable": True, "benchmark": candidate["validation"]}
+                )
+            except Exception as error:
+                candidate_evidence.append(
+                    {
+                        **descriptor,
+                        "installed": False,
+                        "stable": False,
+                        "reason": type(error).__name__ + ":" + str(error),
+                    }
+                )
+        selected = min(
+            (item for item in candidate_records if item.get("stable")),
+            key=lambda item: safe_float(item.get("score_ms"), float("inf")),
+        )
+        for item in candidate_records:
+            root = Path(item["root"])
+            if item is selected:
+                continue
+            if root != staging:
+                shutil.rmtree(root, ignore_errors=True)
+        if Path(selected["root"]) != staging:
+            shutil.rmtree(staging, ignore_errors=True)
+            os.replace(Path(selected["root"]), staging)
+        selected_backend = str(selected["family"])
+        python_path = staging / "python" / "python.exe"
+        bootstrap_artifacts = selected["python_artifacts"]
+        wheels = selected["wheels"]
+        wheel_lock_checksum = selected["lock_checksum"]
+        embedded_lock_checksum = selected["lock_checksum"]
+        lock_key = selected["lock_key"]
+        download_evidence = selected["download_evidence"]
+        validation_result = selected["validation"]
+        freeze = selected["freeze"]
         critical = {str(python_path.relative_to(staging)): sha256_file(python_path)}
-        selected_backend = "builtin_cpu"
+        requested_gpu = any(
+            value.get("family") != "windows-x64-cpu" and value.get("hardware_eligible")
+            for value in candidate_evidence
+        )
+        rejected = []
+        for value in candidate_evidence:
+            family = str(value.get("family", ""))
+            if family == "windows-x64-cpu" or family == selected_backend:
+                continue
+            reason = str(value.get("reason", "")).strip()
+            if not reason and value.get("installed") and value.get("stable"):
+                reason = "真实延迟不如所选后端"
+            rejected.append(family + "：" + (reason or "安装或压力测试未通过"))
+        if selected_backend == "windows-x64-cpu" and not requested_gpu:
+            fallback_reason = "未检测到可实测GPU；使用CPU锁定运行库"
+        elif selected_backend == "windows-x64-cpu":
+            fallback_reason = "；".join(rejected) or "GPU候选未通过真实延迟或稳定性门禁，原子回退CPU"
+        else:
+            fallback_reason = "按卷积、矩阵乘法和显存压力测试的真实延迟选择" + selected_backend
         fallback = {
-            "requested": "nvidia" if vendor == "nvidia" else "cpu",
+            "requested": "measured_gpu_candidates" if requested_gpu else "cpu",
             "selected": selected_backend,
-            "applied": vendor == "nvidia",
-            "reason": "严格锁当前仅支持经锁定的Windows 11 x64 CPU运行时",
+            "applied": requested_gpu and selected_backend == "windows-x64-cpu",
+            "reason": fallback_reason,
         }
         manifest = {
             "layout_version": RUNTIME_LAYOUT_VERSION,
@@ -30159,6 +31417,10 @@ def runtime_install_worker(request_path):
             "python_artifact": bootstrap_artifacts["python"],
             "pip_artifact": bootstrap_artifacts["pip"],
             "vendor": vendor,
+            "hardware_probe": hardware,
+            "runtime_family": selected_backend,
+            "lock_key": lock_key,
+            "backend_candidates": candidate_evidence,
             "allowed_download_hosts": sorted(RUNTIME_ALLOWED_DOWNLOAD_HOSTS),
             "index_urls": [],
             "top_level_pins": [
@@ -30177,15 +31439,22 @@ def runtime_install_worker(request_path):
                 "ocr_recognize": True,
                 "safe_serialization": "safetensors",
                 "safetensors": True,
-                "torch_cpu": True,
+                "torch_cpu": selected_backend == "windows-x64-cpu",
+                "torch_cuda": selected_backend.startswith("windows-x64-nvidia"),
+                "torch_directml": selected_backend == "windows-x64-directml",
                 "rapidocr": True,
             },
-            "vision_backend": "torch_cpu",
+            "vision_backend": (
+                "torch_cuda" if selected_backend.startswith("windows-x64-nvidia")
+                else "torch_directml" if selected_backend == "windows-x64-directml"
+                else "torch_cpu"
+            ),
             "vision_serialization": "safetensors",
             "ocr_backend": "rapidocr",
             "ocr_self_test": True,
             "gpu_backend": selected_backend,
-            "gpu_device": "CPU",
+            "gpu_device": str(validation_result.get("device", "CPU")),
+            "backend_benchmark": validation_result,
             "backend_fallback": fallback,
             "download_evidence": download_evidence,
             "preprocess_hash": VISION_PREPROCESS_HASH,
@@ -30197,12 +31466,15 @@ def runtime_install_worker(request_path):
                 key: {field: sorted(value) for field, value in contract.items()}
                 for key, contract in runtime_dependency_contracts().items()
             },
-            "reproducibility": "formal download reads the embedded architecture-specific wheel lock and performs no dependency resolution",
+            "reproducibility": (
+                "each eligible backend uses an embedded architecture-specific SHA-256 wheel lock, "
+                "is installed in isolation, benchmarked, and atomically selected without dependency resolution"
+            ),
         }
-        if manifest.get("lock_complete") is not True or not runtime_lock_is_complete(
-            manifest.get("resolved_wheels", [])
+        if manifest.get("lock_complete") is not True or not runtime_lock_matches_key(
+            manifest.get("resolved_wheels", []), manifest.get("lock_key")
         ):
-            raise RuntimeError("内嵌运行库wheel锁不完整")
+            raise RuntimeError("所选后端运行库wheel锁不完整")
         manifest["manifest_checksum"] = hashlib.sha256(canonical_bytes(manifest)).hexdigest()
         (staging / "runtime_manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")), encoding="utf-8"
@@ -30404,32 +31676,54 @@ class RuntimeInstaller:
         self.staging = None
         self.test_mode = str(test_mode) if test_mode is not None else None
 
-    def _gpu_vendor(self):
+    def _hardware_probe(self):
+        result = {"adapters": [], "probe": "unavailable", "created": time.time()}
+        if os.name != "nt":
+            return result
         try:
-            creationflags = 0x08000000 if os.name == "nt" else 0
+            creationflags = 0x08000000
+            command = (
+                "$items=Get-CimInstance Win32_VideoController | "
+                "Select-Object Name,DriverVersion,PNPDeviceID,AdapterRAM,Status;"
+                "$items | ConvertTo-Json -Compress"
+            )
             value = subprocess.check_output(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    "(Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name) -join ';'",
-                ],
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
                 stderr=subprocess.STDOUT,
                 text=True,
-                timeout=12,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
                 creationflags=creationflags,
-            )
-            text = value.lower()
-            if "nvidia" in text:
-                return "nvidia"
-            if "amd" in text or "radeon" in text:
-                return "amd"
-            if "intel" in text:
-                return "intel"
-        except RECOVERABLE_ERRORS as error:
-            record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
+            ).strip()
+            parsed = json.loads(value) if value else []
+            rows = parsed if isinstance(parsed, list) else [parsed]
+            adapters = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                adapters.append(
+                    {
+                        "name": str(row.get("Name", "")),
+                        "driver_version": str(row.get("DriverVersion", "")),
+                        "pnp_device_id": str(row.get("PNPDeviceID", "")),
+                        "adapter_ram": safe_int(row.get("AdapterRAM"), 0, 0),
+                        "status": str(row.get("Status", "")),
+                    }
+                )
+            result.update({"adapters": adapters, "probe": "Win32_VideoController"})
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+            result["error"] = type(error).__name__ + ":" + str(error)
+        return result
+
+    def _gpu_vendor(self):
+        names = " ".join(str(item.get("name", "")) for item in self._hardware_probe().get("adapters", [])).casefold()
+        if "nvidia" in names:
+            return "nvidia"
+        if "amd" in names or "radeon" in names:
+            return "amd"
+        if "intel" in names:
+            return "intel"
         return "unknown"
 
     def _assign_job(self, process):
@@ -30523,6 +31817,7 @@ class RuntimeInstaller:
                 {
                     "base": str(self.base),
                     "staging": str(staging),
+                    "hardware": self._hardware_probe(),
                     "vendor": self._gpu_vendor(),
                     "architecture": architecture,
                     "protocol_version": RUNTIME_INSTALL_PROTOCOL_VERSION,
@@ -30694,7 +31989,7 @@ class VisionTrainingSample:
 
 
 @dataclass(slots=True)
-class GpuVisionTrainingData:
+class TorchVisionTrainingData:
     torch: object
     model: object
     optimizer: object
@@ -30706,6 +32001,9 @@ class GpuVisionTrainingData:
     generator: object
     torch_generator: object
     total_steps: int
+    batch_size: int
+    amp_enabled: bool
+    scaler: object = None
 
 
 class GameSpecificVisionTrainer:
@@ -30722,13 +32020,14 @@ class GameSpecificVisionTrainer:
 
     def train(self):
         self.runtime.require_ready()
+        self._wait_for_training_plan()
         valid = self._collect_samples()
         if not valid:
             self.runtime.activate_game(self.game_id)
             return self.runtime.manifest()
         if getattr(self.runtime, "builtin", False):
             return self._train_builtin(valid)
-        return self._train_gpu(valid)
+        return self._train_torch(valid)
 
     def _collect_samples(self):
         valid = []
@@ -30773,6 +32072,8 @@ class GameSpecificVisionTrainer:
         total_steps = max(40, min(320, len(valid) * 3))
         for step in range(total_steps):
             self._raise_if_stopped("内置CPU视觉编码器训练已停止")
+            if step % 8 == 0:
+                self._wait_for_training_plan()
             sample = valid[generator.randrange(len(valid))]
             for _ in range(48):
                 self._builtin_pixel_step(sample.rgb, weights, generator, learning_rate)
@@ -30869,33 +32170,85 @@ class GameSpecificVisionTrainer:
         )
         os.replace(temporary, self.runtime._shared_path_for(True))
 
-    def _train_gpu(self, valid):
+    def _wait_for_training_plan(self):
+        RESOURCE_GOVERNOR.start()
+        while True:
+            self._raise_if_stopped("资源不足，训练已停止")
+            plan = RESOURCE_GOVERNOR.current_plan()
+            if self.runtime.torch is not None:
+                configure_torch_runtime(self.runtime.torch, plan)
+            if plan.training_batch_size > 0:
+                return plan
+            FEATURE_ENGINE.clear_frames()
+            POLICY_TRAINING_CACHE.clear()
+            gc.collect()
+            if self.stop_event is not None:
+                if self.stop_event.wait(1.0):
+                    raise InputStopped("资源不足，训练已停止")
+            else:
+                interruptible_wait(None, 1.0)
+
+    def _train_torch(self, valid):
+        plan = self._wait_for_training_plan()
         with self.runtime.lock:
             self.runtime.activate_game(self.game_id)
-            data = self._prepare_gpu_data(valid)
-            for step in range(data.total_steps):
-                self._raise_if_stopped("GPU离线视觉模型训练已停止")
-                self._gpu_training_step(data, valid)
-                if self.progress is not None and step % 2 == 0:
-                    self.progress(35.0 * (step + 1) / data.total_steps)
-            encoder = data.model.encoder
-            encoder.eval()
-            self.runtime.model = encoder
-            self.runtime.trained_steps += data.total_steps
-            metadata = self._gpu_metadata(data.action_vocabulary)
-            self.runtime._atomic_save(self.runtime.active_path, encoder.state_dict(), metadata)
-            shared_metadata = dict(metadata)
-            shared_metadata.update(
-                {"game_id": "shared", "shared_base": True, "read_only": True, "game_training_writes": False}
-            )
-            return self.runtime.manifest()
+            data = self._prepare_torch_data(valid, plan)
+        completed_steps = 0
+        try:
+            while completed_steps < data.total_steps:
+                self._raise_if_stopped("PyTorch离线视觉模型训练已停止")
+                plan = self._wait_for_training_plan()
+                data.batch_size = max(1, min(data.batch_size, plan.training_batch_size, len(valid)))
+                try:
+                    self._torch_training_step(data, valid)
+                    completed_steps += 1
+                except RuntimeError as error:
+                    message = str(error).casefold()
+                    if "out of memory" not in message and "allocation" not in message:
+                        raise
+                    if data.batch_size <= 1:
+                        raise RuntimeError("训练设备显存或内存不足，批量已降至1仍无法继续") from error
+                    data.batch_size = max(1, data.batch_size // 2)
+                    data.optimizer.zero_grad(set_to_none=True)
+                    self._release_torch_cache(data.torch)
+                    continue
+                if self.progress is not None and completed_steps % 2 == 0:
+                    self.progress(35.0 * completed_steps / data.total_steps)
+            encoder_state = {
+                str(key): value.detach().to("cpu").contiguous()
+                for key, value in data.model.encoder.state_dict().items()
+            }
+            with self.runtime.lock:
+                inference_encoder = self.runtime._build_model()
+                inference_encoder.load_state_dict(encoder_state, strict=True)
+                inference_encoder.eval()
+                self.runtime.model = inference_encoder
+                self.runtime.trained_steps += completed_steps
+                metadata = self._torch_metadata(data.action_vocabulary, data)
+                self.runtime._atomic_save(self.runtime.active_path, encoder_state, metadata)
+                return self.runtime.manifest()
+        finally:
+            try:
+                data.optimizer.zero_grad(set_to_none=True)
+            except RECOVERABLE_ERRORS:
+                pass
+            data.optimizer = None
+            data.scaler = None
+            self._release_torch_cache(data.torch)
+            gc.collect()
 
-    def _prepare_gpu_data(self, valid):
+    def _prepare_torch_data(self, valid, plan):
         torch = self.runtime.torch
+        configure_torch_runtime(torch, plan)
         action_vocabulary = sorted({item.action for item in valid if item.action})[:64] or ["unknown"]
         action_index = {value: index for index, value in enumerate(action_vocabulary)}
+        training_encoder = self.runtime._build_model()
+        training_encoder.load_state_dict(
+            {str(key): value.detach().to("cpu") for key, value in self.runtime.model.state_dict().items()},
+            strict=True,
+        )
         autoencoder = self._autoencoder_type(torch)
-        model = autoencoder(self.runtime.model, len(action_vocabulary)).to(self.runtime.device)
+        model = autoencoder(training_encoder, len(action_vocabulary)).to(self.runtime.device)
         model.train()
         for parameter in list(model.encoder.c1.parameters()) + list(model.encoder.c2.parameters()):
             parameter.requires_grad = False
@@ -30914,12 +32267,22 @@ class GameSpecificVisionTrainer:
                 for item in valid
             ]
         ).astype(self.runtime.np.float32) / 255.0
-        arrays = arrays.transpose(0, 3, 1, 2)
+        arrays = self.runtime.np.ascontiguousarray(arrays.transpose(0, 3, 1, 2))
         temporal_pairs, negative_pairs = self._training_pairs(valid)
         generator = random.Random(self.sleep_seed)
-        torch_generator = torch.Generator(device=self.runtime.device)
-        torch_generator.manual_seed(self.sleep_seed)
-        return GpuVisionTrainingData(
+        family = str((self.runtime.runtime_manifest or {}).get("runtime_family", "windows-x64-cpu"))
+        amp_enabled = bool(family.startswith("windows-x64-nvidia") and torch.cuda.is_available())
+        torch_generator = None
+        if family != "windows-x64-directml":
+            torch_generator = torch.Generator(device="cuda" if amp_enabled else "cpu")
+            torch_generator.manual_seed(self.sleep_seed)
+        scaler = None
+        if amp_enabled:
+            try:
+                scaler = torch.amp.GradScaler("cuda", enabled=True)
+            except (AttributeError, TypeError):
+                scaler = torch.cuda.amp.GradScaler(enabled=True)
+        return TorchVisionTrainingData(
             torch,
             model,
             optimizer,
@@ -30931,7 +32294,19 @@ class GameSpecificVisionTrainer:
             generator,
             torch_generator,
             max(32, min(320, len(valid) * 4)),
+            max(1, min(plan.training_batch_size, len(valid))),
+            amp_enabled,
+            scaler,
         )
+
+    @staticmethod
+    def _release_torch_cache(torch):
+        try:
+            if bool(torch.cuda.is_available()):
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except RECOVERABLE_ERRORS:
+            pass
 
     @staticmethod
     def _autoencoder_type(torch):
@@ -30985,40 +32360,56 @@ class GameSpecificVisionTrainer:
                     negative_pairs.append((first, second))
         return temporal_pairs, negative_pairs
 
-    def _gpu_training_step(self, data, valid):
+    def _torch_training_step(self, data, valid):
         torch = data.torch
-        batch_size = min(24, max(6, len(valid)))
+        batch_size = max(1, min(data.batch_size, len(valid)))
         indexes = [data.generator.randrange(len(valid)) for _ in range(batch_size)]
         batch = torch.from_numpy(data.arrays[indexes].copy()).to(self.runtime.device)
         noisy_a = self._noisy_batch(data, batch)
         noisy_b = self._noisy_batch(data, batch)
-        latent, reconstruction, pooled = data.model(noisy_a)
-        embedding_a = torch.nn.functional.normalize(pooled, dim=1)
-        embedding_b = self._embed(data.model, noisy_b, torch)
-        similarity = embedding_a @ embedding_b.T / 0.2
-        labels = torch.arange(len(indexes), device=self.runtime.device)
-        contrastive = torch.nn.functional.cross_entropy(similarity, labels)
-        temporal = self._pair_distance_loss(data, data.temporal_pairs, 0.0)
-        negative = self._pair_distance_loss(data, data.negative_pairs, 0.5)
-        supervised = self._supervised_losses(data, valid, indexes, pooled)
-        transition = self._transition_loss(data, valid)
-        reconstruction_loss = torch.nn.functional.smooth_l1_loss(reconstruction, batch)
-        variance_penalty = (latent.var(dim=(2, 3)).mean() + 0.0001).reciprocal().clamp(max=10)
-        loss = reconstruction_loss + 0.14 * contrastive + 0.05 * temporal + 0.04 * negative
-        loss = loss + 0.08 * supervised[0] + 0.06 * transition
-        loss = loss + 0.03 * supervised[1] + 0.03 * supervised[2] + 0.01 * variance_penalty
+        autocast = (
+            torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+            if data.amp_enabled
+            else nullcontext()
+        )
+        with autocast:
+            latent, reconstruction, pooled = data.model(noisy_a)
+            embedding_a = torch.nn.functional.normalize(pooled, dim=1)
+            embedding_b = self._embed(data.model, noisy_b, torch)
+            similarity = embedding_a @ embedding_b.T / 0.2
+            labels = torch.arange(len(indexes), device=self.runtime.device)
+            contrastive = torch.nn.functional.cross_entropy(similarity, labels)
+            temporal = self._pair_distance_loss(data, data.temporal_pairs, 0.0)
+            negative = self._pair_distance_loss(data, data.negative_pairs, 0.5)
+            supervised = self._supervised_losses(data, valid, indexes, pooled)
+            transition = self._transition_loss(data, valid)
+            reconstruction_loss = torch.nn.functional.smooth_l1_loss(reconstruction, batch)
+            variance_penalty = (latent.var(dim=(2, 3)).mean() + 0.0001).reciprocal().clamp(max=10)
+            loss = reconstruction_loss + 0.14 * contrastive + 0.05 * temporal + 0.04 * negative
+            loss = loss + 0.08 * supervised[0] + 0.06 * transition
+            loss = loss + 0.03 * supervised[1] + 0.03 * supervised[2] + 0.01 * variance_penalty
         data.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(data.model.parameters(), 2.0)
-        data.optimizer.step()
+        if data.scaler is not None:
+            data.scaler.scale(loss).backward()
+            data.scaler.unscale_(data.optimizer)
+            torch.nn.utils.clip_grad_norm_(data.model.parameters(), 2.0)
+            data.scaler.step(data.optimizer)
+            data.scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(data.model.parameters(), 2.0)
+            data.optimizer.step()
 
     def _noisy_batch(self, data, batch):
-        noise = data.torch.rand(
-            batch.shape,
-            dtype=batch.dtype,
-            device=self.runtime.device,
-            generator=data.torch_generator,
-        )
+        if data.torch_generator is not None:
+            noise = data.torch.rand(
+                batch.shape,
+                dtype=batch.dtype,
+                device=self.runtime.device,
+                generator=data.torch_generator,
+            )
+        else:
+            noise = data.torch.rand(batch.shape, dtype=batch.dtype, device=self.runtime.device)
         return (batch + (noise - 0.5) * 0.06).clamp(0, 1)
 
     @staticmethod
@@ -31029,7 +32420,10 @@ class GameSpecificVisionTrainer:
         torch = data.torch
         if not pairs:
             return torch.zeros((), device=self.runtime.device)
-        chosen = [pairs[data.generator.randrange(len(pairs))] for _ in range(min(12, len(pairs)))]
+        chosen = [
+            pairs[data.generator.randrange(len(pairs))]
+            for _ in range(min(max(1, data.batch_size), 12, len(pairs)))
+        ]
         first = torch.from_numpy(data.arrays[[pair[0] for pair in chosen]].copy()).to(self.runtime.device)
         second = torch.from_numpy(data.arrays[[pair[1] for pair in chosen]].copy()).to(self.runtime.device)
         distances = (self._embed(data.model, first, torch) - self._embed(data.model, second, torch)).pow(2)
@@ -31069,7 +32463,7 @@ class GameSpecificVisionTrainer:
             return torch.zeros((), device=self.runtime.device)
         chosen = [
             data.temporal_pairs[data.generator.randrange(len(data.temporal_pairs))]
-            for _ in range(min(12, len(data.temporal_pairs)))
+            for _ in range(min(max(1, data.batch_size), 12, len(data.temporal_pairs)))
         ]
         first_indexes = [pair[0] for pair in chosen]
         second_indexes = [pair[1] for pair in chosen]
@@ -31088,7 +32482,7 @@ class GameSpecificVisionTrainer:
         prediction = torch.nn.functional.normalize(prediction, dim=1)
         return torch.nn.functional.smooth_l1_loss(prediction, second_embedding)
 
-    def _gpu_metadata(self, action_vocabulary):
+    def _torch_metadata(self, action_vocabulary, data):
         return {
             "architecture_version": VISION_ARCHITECTURE_VERSION,
             "game_id": str(self.game_id),
@@ -31112,6 +32506,10 @@ class GameSpecificVisionTrainer:
             "neural_feature_version": NEURAL_FEATURE_VERSION,
             "sleep_seed": self.sleep_seed,
             "shared_base": False,
+            "training_backend": str(self.runtime.device_name),
+            "automatic_mixed_precision": bool(data.amp_enabled),
+            "final_batch_size": int(data.batch_size),
+            "torch_threads": int(RESOURCE_GOVERNOR.current_plan().torch_threads),
         }
 
     def _raise_if_stopped(self, message):
@@ -31150,6 +32548,11 @@ class OfflineVisionRuntime:
             self.runtime_manifest = validate_runtime_manifest(self.base, True, True)
             if self.runtime_manifest is None:
                 raise RuntimeError("运行库清单不存在")
+            selected_family = str(
+                self.runtime_manifest.get("runtime_family")
+                or self.runtime_manifest.get("gpu_backend")
+                or "windows-x64-cpu"
+            )
             self.builtin = True
             self.device = "cpu"
             self.device_name = "内置CPU可训练编码器"
@@ -31168,19 +32571,30 @@ class OfflineVisionRuntime:
             try:
                 self.torch = importlib.import_module("torch")
                 self.safetensors = importlib.import_module("safetensors.torch")
+                configure_torch_runtime(self.torch)
                 self.builtin = False
-                if bool(self.torch.cuda.is_available()):
+                if selected_family.startswith("windows-x64-nvidia"):
+                    if not bool(self.torch.cuda.is_available()):
+                        raise RuntimeError("运行库清单锁定CUDA，但当前驱动或CUDA运行时不可用")
                     self.device = self.torch.device("cuda")
-                    self.device_name = str(self.torch.cuda.get_device_name(0))
-                else:
+                    self.device_name = "CUDA：" + str(self.torch.cuda.get_device_name(0))
+                elif selected_family == "windows-x64-directml":
+                    torch_directml = importlib.import_module("torch_directml")
+                    self.device = torch_directml.device()
+                    self.device_name = "DirectML：" + str(self.device)
+                elif selected_family == "windows-x64-cpu":
                     self.device = self.torch.device("cpu")
                     self.device_name = "PyTorch CPU"
-            except RECOVERABLE_ERRORS:
+                else:
+                    raise RuntimeError("运行库清单包含未知后端：" + selected_family)
+            except RECOVERABLE_ERRORS as error:
                 self.torch = None
                 self.safetensors = None
                 self.builtin = True
                 self.device = "cpu"
                 self.device_name = "NumPy CPU可训练编码器" if self.np is not None else "内置CPU可训练编码器"
+                if selected_family != "windows-x64-cpu":
+                    raise RuntimeError("所选GPU后端加载失败，拒绝在正式流程中静默切换设备：" + str(error)) from error
         except RECOVERABLE_ERRORS as error:
             self.ready = False
             self.error = str(error)
@@ -31521,7 +32935,11 @@ class OfflineVisionRuntime:
                 "high_resolution_semantic_input": list(HYBRID_GLOBAL_SIZE),
                 "cpu_quantized_onnx": self._semantic_onnx_path().is_file(),
                 "gpu_full_visual_model": bool(
-                    self.torch is not None and str(self.device).casefold().startswith("cuda")
+                    self.torch is not None
+                    and (
+                        str(self.device).casefold().startswith("cuda")
+                        or str((self.runtime_manifest or {}).get("runtime_family", "")) == "windows-x64-directml"
+                    )
                 ),
                 "dynamic_object_rois": True,
                 "cross_frame_tracking": True,
@@ -31577,7 +32995,7 @@ class OfflineVisionRuntime:
             self.torch is not None
             and self.np is not None
             and self.model is not None
-            and str(self.device).casefold().startswith("cuda")
+            and str((self.runtime_manifest or {}).get("runtime_family", "windows-x64-cpu")) != "windows-x64-cpu"
         ):
             array = self.np.frombuffer(source, dtype=self.np.uint8).reshape(source_height, source_width, 3).copy()
             tensor = (
@@ -31601,7 +33019,13 @@ class OfflineVisionRuntime:
                     token.extend(((x + 0.5) / max(1, columns), (y + 0.5) / max(1, rows)))
                     tokens.append([round(value, 6) for value in token])
             return {
-                "backend": "full_cnn_gpu",
+                "backend": (
+                    "full_cnn_cuda"
+                    if str((self.runtime_manifest or {}).get("runtime_family", "")).startswith(
+                        "windows-x64-nvidia"
+                    )
+                    else "full_cnn_directml"
+                ),
                 "learned": True,
                 "quantized": False,
                 "device": self.device_name,
@@ -31901,28 +33325,39 @@ class OfflineOCRRuntime:
         return {"text": text, "confidence": confidence, "items": values}
 
     def candidate_regions(self, frame, maximum=8):
+        if isinstance(frame, dict) and frame.get("ocr_allowed") is False:
+            return []
         preview = preview_rgb_bytes(frame.get("preview_rgb"))
         width = safe_int(frame.get("preview_width", PREVIEW_W), PREVIEW_W, 1, 8192)
         height = safe_int(frame.get("preview_height", PREVIEW_H), PREVIEW_H, 1, 8192)
         if preview is None:
             raise RuntimeError("当前画面没有教学预览")
         regions = []
+        changed = [
+            list(value[:4])
+            for value in (frame.get("changed_regions", []) if isinstance(frame, dict) else [])
+            if isinstance(value, (list, tuple)) and len(value) >= 4
+        ]
+        if not changed:
+            return []
         try:
-            for item in self.recognize(preview, width, height):
-                x, y, w, h = item["box"]
-                margin = max(2, int(min(width, height) * 0.008))
-                x = max(0, x - margin)
-                y = max(0, y - margin)
-                w = min(width - x, w + margin * 2)
-                h = min(height - y, h + margin * 2)
-                if w >= 4 and h >= 4:
-                    regions.append(
-                        {
-                            "norm": [x / width, y / height, w / width, h / height],
-                            "score": 2.0 + item["confidence"],
-                            "text": item["text"],
-                        }
-                    )
+            for roi in changed[:8]:
+                recognized = self.recognize_region(frame, roi).get("items", [])
+                for item in recognized:
+                    x, y, w, h = item["box"]
+                    margin = max(2, int(min(width, height) * 0.008))
+                    x = max(0, x - margin)
+                    y = max(0, y - margin)
+                    w = min(width - x, w + margin * 2)
+                    h = min(height - y, h + margin * 2)
+                    if w >= 4 and h >= 4:
+                        regions.append(
+                            {
+                                "norm": [x / width, y / height, w / width, h / height],
+                                "score": 2.0 + item["confidence"],
+                                "text": item["text"],
+                            }
+                        )
         except RECOVERABLE_ERRORS as error:
             record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
         gray = []
@@ -31933,6 +33368,9 @@ class OfflineOCRRuntime:
         cell_h = max(6, height // 14)
         for y in range(0, height, cell_h):
             for x in range(0, width, cell_w):
+                cell_norm = [x / width, y / height, min(cell_w, width - x) / width, min(cell_h, height - y) / height]
+                if not any(_rect_iou(cell_norm, roi) > 0.0 for roi in changed):
+                    continue
                 values = []
                 for yy in range(y, min(height, y + cell_h)):
                     start = yy * width + x
@@ -32208,10 +33646,11 @@ def ai_worker_main(base, address, auth_text, family, protocol_version=None):
     if (
         manifest is None
         or manifest.get("lock_complete") is not True
-        or not runtime_lock_is_complete(manifest.get("resolved_wheels", []))
+        or not runtime_lock_matches_key(manifest.get("resolved_wheels", []), manifest.get("lock_key"))
     ):
-        raise RuntimeError("AI工作进程启动前运行库wheel锁不完整")
+        raise RuntimeError("AI工作进程启动前所选后端wheel锁不完整")
     install_write_boundary_guard(base)
+    RESOURCE_GOVERNOR.ensure_started()
     auth = base64.urlsafe_b64decode(str(auth_text).encode("ascii"))
     connection = Client(address, family=family, authkey=auth)
     try:
@@ -32260,6 +33699,9 @@ def ai_worker_main(base, address, auth_text, family, protocol_version=None):
                 "manifest": manifest if vision.active_game else None,
                 "offline_network_blocked": bool(offline_evidence.get("blocked")),
                 "offline_network_evidence": offline_evidence,
+                "runtime_manifest": dict(vision.runtime_manifest or {}),
+                "resource_state": RESOURCE_GOVERNOR.status()["state"],
+                "resource_plan": RESOURCE_GOVERNOR.current_plan(),
             }
 
         connection.send(
@@ -32386,9 +33828,9 @@ class AIWorkerClient:
         if (
             manifest is None
             or manifest.get("lock_complete") is not True
-            or not runtime_lock_is_complete(manifest.get("resolved_wheels", []))
+            or not runtime_lock_matches_key(manifest.get("resolved_wheels", []), manifest.get("lock_key"))
         ):
-            raise RuntimeError("AI工作进程启动前运行库wheel锁不完整")
+            raise RuntimeError("AI工作进程启动前所选后端wheel锁不完整")
         self.on_failure = on_failure
         self.lock = threading.RLock()
         self.connection = None
@@ -36240,7 +37682,7 @@ def train_learned_subgoal_planner(experiences, tasks):
     }
     return {
         "schema_version": 2,
-        "algorithm": "goal_predicate_conditioned_subgoal_skill_prior",
+        "algorithm": "rule_generated_goal_planner_with_learned_skill_priors",
         "task_predicates": task_predicates,
         "skill_priors": priors,
         "skill_quality": quality,
@@ -36545,7 +37987,7 @@ class SharedSemanticEncoder:
             vectors[token] = [round(value / norm, 7) for value in vector]
         payload = {
             "schema_version": SEMANTIC_ENCODER_SCHEMA_VERSION,
-            "algorithm": "shared_distributional_contrastive_semantic_encoder",
+            "algorithm": "multilingual_cooccurrence_semantic_encoder",
             "size": size,
             "vectors": vectors,
             "aliases": aliases,
@@ -37582,7 +39024,10 @@ def train_latent_world_model(experiences, semantic_model=None):
     try:
         import torch
 
-        torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
+        plan = wait_for_runtime_training_plan()
+        configure_torch_runtime(torch, plan)
+        device = torch_training_device(torch)
+        amp_enabled = torch_device_is_cuda(torch, device)
         seed = int(
             hashlib.sha256(
                 canonical_bytes(
@@ -37612,75 +39057,138 @@ def train_latent_world_model(experiences, semantic_model=None):
         train_rows = train_rows[:5000]
         ensemble = []
         histories = defaultdict(list)
+        minimum_batch = 1
         for member_index in range(LATENT_WORLD_ENSEMBLE_SIZE):
             member_seed = (seed + member_index * 130363) % (2**63 - 1)
             torch.manual_seed(member_seed)
             rng = random.Random(member_seed)
-            gru = torch.nn.GRUCell(LATENT_ACTION_SIZE, LATENT_STATE_SIZE)
-            auxiliary = DenseNetwork(LATENT_STATE_SIZE, 8, POLICY_HIDDEN_SIZE)
-            optimizer = torch.optim.AdamW(
-                list(gru.parameters()) + list(auxiliary.parameters()), lr=0.0015, weight_decay=0.0001
-            )
+            gru = torch.nn.GRUCell(LATENT_ACTION_SIZE, LATENT_STATE_SIZE).to(device)
+            auxiliary = DenseNetwork(LATENT_STATE_SIZE, 8, POLICY_HIDDEN_SIZE).to(device)
+            parameters = list(gru.parameters()) + list(auxiliary.parameters())
+            optimizer = torch.optim.AdamW(parameters, lr=0.0015, weight_decay=0.0001)
+            scaler = torch_grad_scaler(torch, amp_enabled)
             bootstrap = [train_rows[rng.randrange(len(train_rows))] for _ in range(max(24, len(train_rows)))]
             steps = max(48, min(220, len(train_rows) * 2))
-            batch_size = min(24, max(8, len(bootstrap)))
-            for _ in range(steps):
+            plan = wait_for_runtime_training_plan()
+            batch_size = max(minimum_batch, min(24, plan.training_batch_size, len(bootstrap)))
+            completed = 0
+            while completed < steps:
+                plan = wait_for_runtime_training_plan()
+                configure_torch_runtime(torch, plan)
+                batch_size = max(minimum_batch, min(batch_size, plan.training_batch_size, len(bootstrap)))
                 batch = [bootstrap[rng.randrange(len(bootstrap))] for _ in range(batch_size)]
-                hidden = torch.tensor([row["initial"] for row in batch], dtype=torch.float32)
-                maximum = max(row["length"] for row in batch)
-                state_loss = torch.zeros((), dtype=torch.float32)
-                auxiliary_loss = torch.zeros((), dtype=torch.float32)
-                denominator = 0.0
-                for position in range(maximum):
-                    mask = torch.tensor(
-                        [1.0 if position < row["length"] else 0.0 for row in batch], dtype=torch.float32
-                    ).unsqueeze(1)
-                    action = torch.tensor(
-                        [
-                            row["actions"][position] if position < row["length"] else [0.0] * LATENT_ACTION_SIZE
-                            for row in batch
-                        ],
-                        dtype=torch.float32,
+                try:
+                    autocast = (
+                        torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+                        if amp_enabled
+                        else nullcontext()
                     )
-                    target = torch.tensor(
-                        [row["targets"][position] if position < row["length"] else row["targets"][-1] for row in batch],
-                        dtype=torch.float32,
+                    with autocast:
+                        hidden = torch.tensor(
+                            [row["initial"] for row in batch], dtype=torch.float32, device=device
+                        )
+                        maximum = max(row["length"] for row in batch)
+                        state_loss = torch.zeros((), dtype=torch.float32, device=device)
+                        auxiliary_loss = torch.zeros((), dtype=torch.float32, device=device)
+                        denominator = 0.0
+                        for position in range(maximum):
+                            mask = torch.tensor(
+                                [1.0 if position < row["length"] else 0.0 for row in batch],
+                                dtype=torch.float32,
+                                device=device,
+                            ).unsqueeze(1)
+                            action = torch.tensor(
+                                [
+                                    row["actions"][position]
+                                    if position < row["length"]
+                                    else [0.0] * LATENT_ACTION_SIZE
+                                    for row in batch
+                                ],
+                                dtype=torch.float32,
+                                device=device,
+                            )
+                            target = torch.tensor(
+                                [
+                                    row["targets"][position]
+                                    if position < row["length"]
+                                    else row["targets"][-1]
+                                    for row in batch
+                                ],
+                                dtype=torch.float32,
+                                device=device,
+                            )
+                            aux_target = torch.tensor(
+                                [
+                                    row["auxiliary"][position]
+                                    if position < row["length"]
+                                    else [0.0] * 8
+                                    for row in batch
+                                ],
+                                dtype=torch.float32,
+                                device=device,
+                            )
+                            confidence = torch.tensor(
+                                [
+                                    row["confidences"][position]
+                                    if position < row["length"]
+                                    else 0.0
+                                    for row in batch
+                                ],
+                                dtype=torch.float32,
+                                device=device,
+                            ).unsqueeze(1)
+                            predicted = gru(action, hidden)
+                            active_hidden = mask * predicted + (1.0 - mask) * hidden
+                            probability = torch.sigmoid(auxiliary(active_hidden))
+                            horizon_weight = 1.0 + 0.18 * math.log2(position + 1)
+                            weight = mask * (0.2 + 0.8 * confidence) * horizon_weight
+                            state_loss = state_loss + (
+                                weight * (active_hidden - target).pow(2).mean(dim=1, keepdim=True)
+                            ).sum()
+                            auxiliary_loss = auxiliary_loss + (
+                                weight * (probability - aux_target).pow(2).mean(dim=1, keepdim=True)
+                            ).sum()
+                            denominator += float(weight.detach().sum().to("cpu").item())
+                            hidden = active_hidden
+                        total = (state_loss + 0.75 * auxiliary_loss) / max(1.0, denominator)
+                    optimizer.zero_grad(set_to_none=True)
+                    if scaler is not None:
+                        scaler.scale(total).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(parameters, 5.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        total.backward()
+                        torch.nn.utils.clip_grad_norm_(parameters, 5.0)
+                        optimizer.step()
+                    completed += 1
+                    histories["state_sequence_loss"].append(
+                        float((state_loss.detach() / max(1.0, denominator)).to("cpu").item())
                     )
-                    aux_target = torch.tensor(
-                        [row["auxiliary"][position] if position < row["length"] else [0.0] * 8 for row in batch],
-                        dtype=torch.float32,
+                    histories["auxiliary_sequence_loss"].append(
+                        float((auxiliary_loss.detach() / max(1.0, denominator)).to("cpu").item())
                     )
-                    confidence = torch.tensor(
-                        [row["confidences"][position] if position < row["length"] else 0.0 for row in batch],
-                        dtype=torch.float32,
-                    ).unsqueeze(1)
-                    predicted = gru(action, hidden)
-                    active_hidden = mask * predicted + (1.0 - mask) * hidden
-                    raw_aux = auxiliary(active_hidden)
-                    probability = torch.sigmoid(raw_aux)
-                    horizon_weight = 1.0 + 0.18 * math.log2(position + 1)
-                    weight = mask * (0.2 + 0.8 * confidence) * horizon_weight
-                    state_loss = state_loss + (weight * (active_hidden - target).pow(2).mean(dim=1, keepdim=True)).sum()
-                    auxiliary_loss = (
-                        auxiliary_loss + (weight * (probability - aux_target).pow(2).mean(dim=1, keepdim=True)).sum()
-                    )
-                    denominator += float(weight.sum().item())
-                    hidden = active_hidden
-                total = (state_loss + 0.75 * auxiliary_loss) / max(1.0, denominator)
-                optimizer.zero_grad(set_to_none=True)
-                total.backward()
-                torch.nn.utils.clip_grad_norm_(list(gru.parameters()) + list(auxiliary.parameters()), 5.0)
-                optimizer.step()
-                histories["state_sequence_loss"].append(float((state_loss / max(1.0, denominator)).item()))
-                histories["auxiliary_sequence_loss"].append(float((auxiliary_loss / max(1.0, denominator)).item()))
+                except RuntimeError as error:
+                    message = str(error).casefold()
+                    if ("out of memory" not in message and "allocation" not in message) or batch_size <= 1:
+                        raise
+                    batch_size = max(1, batch_size // 2)
+                    optimizer.zero_grad(set_to_none=True)
+                    release_torch_training_resources(torch)
+                    continue
             ensemble.append(
                 {
                     "gru": _serialize_gru_cell(gru),
                     "auxiliary": _serialize_dense_network(auxiliary),
                     "seed": member_seed,
                     "bootstrap_sequences": len(bootstrap),
+                    "final_batch_size": batch_size,
                 }
             )
+            optimizer.zero_grad(set_to_none=True)
+            scaler = None
+            release_torch_training_resources(torch)
         distilled = {
             "gru": _average_gru_cells([member["gru"] for member in ensemble]),
             "auxiliary": _average_dense_networks([member["auxiliary"] for member in ensemble]),
@@ -37693,6 +39201,10 @@ def train_latent_world_model(experiences, semantic_model=None):
             "training_sequences": len(train_rows),
             "sequence_window": 12,
             "multi_step_horizons": [1, 4, 8],
+            "training_backend": str(device),
+            "automatic_mixed_precision": bool(amp_enabled),
+            "torch_threads": int(RESOURCE_GOVERNOR.current_plan().torch_threads),
+            "dynamic_batch": True,
             "training_losses": {
                 name: statistics.fmean(values[-min(100, len(values)) :]) if values else 0.0
                 for name, values in histories.items()
@@ -37818,8 +39330,14 @@ GENERALIZATION_LEVELS = {
     3: "same_genre_unseen_game",
     4: "cross_genre_transfer",
 }
-GENERALIZATION_BENCHMARK_SCHEMA_VERSION = 2
-GENERALIZATION_REQUIRED_GENRES = ("click_puzzle", "match3", "card", "turn_strategy", "realtime_action")
+GENERALIZATION_BENCHMARK_SCHEMA_VERSION = 3
+GENERALIZATION_REQUIRED_GENRES = (
+    "click_puzzle",
+    "menu_management",
+    "turn_based",
+    "platform_action",
+    "racing_continuous_control",
+)
 GENERALIZATION_REAL_SOURCES = frozenset(
     {"captured_window_session", "captured_video_replay", "external_human_recording"}
 )
@@ -37831,6 +39349,23 @@ GENERALIZATION_REQUIRED_VARIANTS = (
     "frame_rate_group",
     "input_delay_group",
 )
+REAL_GAME_BENCHMARK_REQUIRED_METRICS = (
+    "success",
+    "human_intervention",
+    "actions_to_success",
+    "dangerous_action_false_release",
+    "resolution_performance",
+    "zero_shot_success",
+    "few_shot_success",
+    "inference_latency_p50_ms",
+    "inference_latency_p95_ms",
+    "inference_latency_p99_ms",
+    "peak_cpu_percent",
+    "peak_ram_bytes",
+    "peak_vram_bytes",
+)
+
+
 GENERALIZATION_BENCHMARK_DIMENSIONS = (
     "unseen_training_game",
     "unseen_level_and_video",
@@ -37889,15 +39424,8 @@ class FixedGeneralizationBenchmark:
             "required_genres": list(GENERALIZATION_REQUIRED_GENRES),
             "required_variants": list(GENERALIZATION_REQUIRED_VARIANTS),
             "real_sources": sorted(GENERALIZATION_REAL_SOURCES),
-            "required_episode_metrics": [
-                "success",
-                "human_guidance",
-                "actions",
-                "ood_expected",
-                "ood_rejected",
-                "risk_class",
-                "action_released",
-            ],
+            "required_episode_metrics": list(REAL_GAME_BENCHMARK_REQUIRED_METRICS),
+            "required_safety_metrics": ["ood_expected", "ood_rejected", "risk_class", "action_released"],
             "partition_policy": "immutable_game_and_task_isolation",
             "claim_policy": "level_3_and_4_must_both_pass_before_general_model_label",
         }
@@ -37936,7 +39464,7 @@ class FixedGeneralizationBenchmark:
             "此目录只接受真实窗口采集或真实录像回放产生的固定泛化基准。\n"
             "训练游戏、同游戏未见任务、同类未见游戏和跨类未见游戏必须由manifest.json固定并严格隔离。\n"
             "不得把程序生成、复制训练轨迹、人工伪造结果或缺少录像哈希的数据写入正式基准。\n"
-            "至少覆盖点击解谜、消除、卡牌、回合策略、即时操作五类，并覆盖分辨率、语言、皮肤、弹窗、帧率和输入延迟。\n"
+            "至少覆盖点击解谜、菜单管理、回合制、平台动作、赛车或连续控制五类，并记录成功率、人工介入、成功动作数、危险动作误放行、分辨率下降、零样本、少量样本、P50/P95/P99延迟以及CPU、RAM、显存峰值。\n"
             "没有通过真实Level 3和Level 4时，界面只会显示单游戏模型。\n"
         )
         _atomic_write(readme_path, text)
@@ -38052,6 +39580,23 @@ class FixedGeneralizationBenchmark:
         for key in GENERALIZATION_REQUIRED_VARIANTS:
             if context.get(key, row.get(key)) in (None, ""):
                 errors.append(key + "_missing")
+        benchmark_metrics = (
+            row.get("benchmark_metrics", {})
+            if isinstance(row.get("benchmark_metrics"), dict)
+            else context.get("benchmark_metrics", {}) if isinstance(context.get("benchmark_metrics"), dict) else {}
+        )
+        for key in REAL_GAME_BENCHMARK_REQUIRED_METRICS:
+            if benchmark_metrics.get(key) in (None, ""):
+                errors.append("benchmark_metric_" + key + "_missing")
+        latency_values = [
+            safe_float(benchmark_metrics.get(key), -1.0)
+            for key in ("inference_latency_p50_ms", "inference_latency_p95_ms", "inference_latency_p99_ms")
+        ]
+        if any(value < 0.0 for value in latency_values) or latency_values != sorted(latency_values):
+            errors.append("benchmark_latency_percentiles_invalid")
+        for key in ("peak_cpu_percent", "peak_ram_bytes", "peak_vram_bytes"):
+            if safe_float(benchmark_metrics.get(key), -1.0) < 0.0:
+                errors.append("benchmark_resource_peak_invalid:" + key)
         observation = row.get("observation_t", {}) if isinstance(row.get("observation_t"), dict) else {}
         if not str(
             row.get("frame_digest")
@@ -38166,6 +39711,12 @@ class GeneralizationEvaluator:
         "cross_resolution_performance_drop",
         "zero_shot_gain",
         "few_shot_gain",
+        "inference_latency_p50_ms",
+        "inference_latency_p95_ms",
+        "inference_latency_p99_ms",
+        "peak_cpu_percent",
+        "peak_ram_bytes",
+        "peak_vram_bytes",
         "variant_coverage",
     )
     thresholds = {
@@ -38418,6 +39969,22 @@ class GeneralizationEvaluator:
             )
             for row in values
         )
+        metric_rows = []
+        for row in values:
+            context = cls._context(row)
+            metric = (
+                row.get("benchmark_metrics")
+                if isinstance(row.get("benchmark_metrics"), dict)
+                else context.get("benchmark_metrics")
+            )
+            if isinstance(metric, dict):
+                metric_rows.append(metric)
+        def metric_max(name):
+            numbers = [safe_float(item.get(name), 0.0) for item in metric_rows if item.get(name) is not None]
+            return max(numbers, default=0.0)
+        def metric_mean(name):
+            numbers = [safe_float(item.get(name), 0.0) for item in metric_rows if item.get(name) is not None]
+            return statistics.fmean(numbers) if numbers else 0.0
         return {
             "task_success_rate": successes / max(1, len(episodes)),
             "success_rate_ci95_lower": cls._wilson_lower(successes, len(episodes)),
@@ -38435,6 +40002,12 @@ class GeneralizationEvaluator:
             "few_shot_gain": statistics.fmean(few) if few else 0.0,
             "zero_shot_count": len(zero),
             "few_shot_count": len(few),
+            "inference_latency_p50_ms": metric_mean("inference_latency_p50_ms"),
+            "inference_latency_p95_ms": metric_mean("inference_latency_p95_ms"),
+            "inference_latency_p99_ms": metric_mean("inference_latency_p99_ms"),
+            "peak_cpu_percent": metric_max("peak_cpu_percent"),
+            "peak_ram_bytes": metric_max("peak_ram_bytes"),
+            "peak_vram_bytes": metric_max("peak_vram_bytes"),
             "raw_sample_count": len(values),
             "real_capture_record_count": real_capture,
             "complete_episode_count": len(episodes),
@@ -38469,7 +40042,10 @@ class GeneralizationEvaluator:
         result = {
             "schema_version": GENERALIZATION_SCHEMA_VERSION,
             "benchmark_schema_version": GENERALIZATION_BENCHMARK_SCHEMA_VERSION,
-            "claim_policy": "only a frozen real-capture benchmark may authorize a level; Level 3 and Level 4 are both required for a general-model label",
+            "claim_policy": (
+                "only a frozen real-capture benchmark may authorize a level; "
+                "Level 3 and Level 4 are both required for a general-model label"
+            ),
             "benchmark_verified": benchmark_verified,
             "benchmark_id": str(manifest.get("benchmark_id", "")),
             "benchmark_path": str(validation.get("path", "")),
@@ -39541,6 +41117,16 @@ class SemanticEventTrigger:
         self.maximum = max(8, int(maximum))
         self.lock = threading.RLock()
         self.states = OrderedDict()
+        self.pending = OrderedDict()
+
+    def request(self, key, reason):
+        with self.lock:
+            token = str(key or "global")
+            self.pending.pop(token, None)
+            self.pending[token] = str(reason or "external")
+            while len(self.pending) > self.maximum:
+                self.pending.popitem(last=False)
+        return True
 
     def should_process(self, frame, minimum_interval=0.2, maximum_interval=1.2):
         item = frame if isinstance(frame, dict) else {}
@@ -39548,18 +41134,28 @@ class SemanticEventTrigger:
         now = safe_float(item.get("time"), time.monotonic())
         digest = frame_digest(item)
         feature = item.get("f")
+        force_flags = {
+            "scene_change": bool(item.get("scene_changed")),
+            "candidate_ambiguity": bool(item.get("candidate_ambiguous") or item.get("action_ambiguous")),
+            "ood": safe_float(item.get("ood_score"), 0.0) >= 0.65,
+            "post_action_no_change": bool(item.get("post_action_no_change") or item.get("state_unchanged_after_action")),
+            "terminal_suspected": bool(item.get("terminal_suspected")),
+            "popup": bool(item.get("new_popup")),
+        }
         with self.lock:
+            pending_reason = self.pending.pop(key, "")
+            force = bool(pending_reason or any(force_flags.values()))
             previous = self.states.get(key)
             changed = True
             if previous is not None:
                 elapsed = max(0.0, now - safe_float(previous.get("time"), 0.0))
-                if elapsed < max(0.01, float(minimum_interval)):
+                if elapsed < max(0.01, float(minimum_interval)) and not force:
                     return False
                 changed = digest != str(previous.get("digest", ""))
                 old_feature = previous.get("feature")
                 if changed and feature_valid(feature) and feature_valid(old_feature):
                     changed = visual_distance(feature, old_feature) > 2.0
-                if not changed and elapsed < max(float(maximum_interval), float(minimum_interval)):
+                if not changed and not force:
                     return False
             self.states.pop(key, None)
             self.states[key] = {
@@ -41282,6 +42878,21 @@ def generalization_contract_suite():
         "action_released": True,
         "frame_digest": "b" * 64,
         "model_fingerprint": fingerprint,
+        "benchmark_metrics": {
+            "success": True,
+            "human_intervention": False,
+            "actions_to_success": 1,
+            "dangerous_action_false_release": 0,
+            "resolution_performance": 1.0,
+            "zero_shot_success": True,
+            "few_shot_success": True,
+            "inference_latency_p50_ms": 5.0,
+            "inference_latency_p95_ms": 8.0,
+            "inference_latency_p99_ms": 10.0,
+            "peak_cpu_percent": 20.0,
+            "peak_ram_bytes": 268435456,
+            "peak_vram_bytes": 0,
+        },
         "context": context,
         "provenance": {
             "source_kind": "captured_video_replay",
