@@ -1075,6 +1075,7 @@ class RuntimeMetrics:
         self.lock = threading.RLock()
         self.values = defaultdict(lambda: deque(maxlen=self.maximum))
         self.counters = Counter()
+        self.percentile_cache = OrderedDict()
 
     def observe(self, name, value):
         number = safe_float(value, 0.0) if "safe_float" in globals() else float(value)
@@ -1084,6 +1085,31 @@ class RuntimeMetrics:
     def increment(self, name, amount=1):
         with self.lock:
             self.counters[str(name)] += int(amount)
+
+    def percentile(self, name, q, cache_seconds=0.75):
+        token = str(name)
+        fraction = max(0.0, min(1.0, float(q)))
+        cache_key = (token, round(fraction, 6))
+        now = time.monotonic()
+        ttl = max(0.0, min(1.0, float(cache_seconds)))
+        with self.lock:
+            cached = self.percentile_cache.get(cache_key)
+            if cached is not None and now - cached[0] <= ttl:
+                self.percentile_cache.move_to_end(cache_key)
+                return cached[1]
+            series = list(self.values.get(token, ()))
+        if not series:
+            value = 0.0
+        else:
+            ordered = sorted(series)
+            index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * fraction))))
+            value = ordered[index]
+        with self.lock:
+            self.percentile_cache[cache_key] = (now, value)
+            self.percentile_cache.move_to_end(cache_key)
+            while len(self.percentile_cache) > 256:
+                self.percentile_cache.popitem(last=False)
+        return value
 
     def snapshot(self):
         with self.lock:
@@ -1111,6 +1137,22 @@ class RuntimeMetrics:
 
 
 RUNTIME_METRICS = RuntimeMetrics()
+_GC_CONTROL_LOCK = threading.RLock()
+_GC_LAST_RUN = {}
+
+
+def collect_garbage(reason, cooldown_seconds=30.0, force=False):
+    token = str(reason or "general")
+    now = time.monotonic()
+    cooldown = max(0.0, float(cooldown_seconds))
+    with _GC_CONTROL_LOCK:
+        previous = _GC_LAST_RUN.get(token, 0.0)
+        if not force and now - previous < cooldown:
+            return False
+        _GC_LAST_RUN[token] = now
+    gc.collect()
+    RUNTIME_METRICS.increment("gc_collect:" + token)
+    return True
 
 
 class ResourceState(str, Enum):
@@ -1333,8 +1375,7 @@ class ResourceGovernor:
 
     @staticmethod
     def _series_p95(name):
-        values = RUNTIME_METRICS.snapshot().get("series", {}).get(str(name), {})
-        return max(0.0, float(values.get("p95", 0.0))) if isinstance(values, dict) else 0.0
+        return max(0.0, float(RUNTIME_METRICS.percentile(str(name), 0.95, 0.75)))
 
     def _queue_values(self):
         now = time.monotonic()
@@ -1410,6 +1451,7 @@ class ResourceGovernor:
         )
         desired = ResourceState.RED if severe else ResourceState.YELLOW if warning else ResourceState.NORMAL
         rank = {ResourceState.NORMAL: 0, ResourceState.YELLOW: 1, ResourceState.RED: 2}
+        previous_state = self.state
         if rank[desired] > rank[self.state]:
             self.state = desired
             self.recovery_since = None
@@ -1427,7 +1469,7 @@ class ResourceGovernor:
             cache = globals().get("POLICY_TRAINING_CACHE")
             if cache is not None:
                 cache.clear()
-            gc.collect()
+            collect_garbage("resource_red", 30.0, previous_state is not ResourceState.RED)
 
     @staticmethod
     def _plan_for_state(state, backend):
@@ -1488,7 +1530,7 @@ def configure_torch_runtime(torch_module, plan=None):
 
 
 def wait_for_runtime_training_plan(stop_event=None):
-    RESOURCE_GOVERNOR.start()
+    RESOURCE_GOVERNOR.ensure_started()
     while True:
         plan = RESOURCE_GOVERNOR.current_plan()
         if plan.training_batch_size > 0:
@@ -1497,7 +1539,7 @@ def wait_for_runtime_training_plan(stop_event=None):
         cache = globals().get("POLICY_TRAINING_CACHE")
         if cache is not None:
             cache.clear()
-        gc.collect()
+        collect_garbage("training_plan_wait", 30.0)
         if stop_event is not None:
             if stop_event.wait(1.0):
                 raise InputStopped("资源不足，训练已停止")
@@ -1537,7 +1579,7 @@ def release_torch_training_resources(torch_module):
             torch_module.cuda.ipc_collect()
     except RECOVERABLE_ERRORS:
         pass
-    gc.collect()
+    collect_garbage("torch_training_release", 10.0)
 
 
 EMERGENCY_CLEANUP_ERRORS = deque(maxlen=256)
@@ -6249,6 +6291,25 @@ def _pool_channel(source, offset, src_w, src_h, out_w, out_h):
 
 def coarse_feature(feature):
     source = feature_bytes(feature)
+    np = _optional_numpy()
+    if np is not None:
+        y_bounds, x_bounds = _pool_boundaries(FEATURE_W, FEATURE_H, COARSE_W, COARSE_H)
+        planes = np.frombuffer(source, dtype=np.uint8, count=FEATURE_CHANNELS * PIXELS).reshape(
+            FEATURE_CHANNELS, FEATURE_H, FEATURE_W
+        )
+        integral = np.pad(
+            planes.astype(np.uint64).cumsum(1).cumsum(2),
+            ((0, 0), (1, 0), (1, 0)),
+        )
+        y_edges = np.asarray(y_bounds, dtype=np.int64)
+        x_edges = np.asarray(x_bounds, dtype=np.int64)
+        y0 = y_edges[:-1][:, None]
+        y1 = np.maximum(y0 + 1, y_edges[1:][:, None])
+        x0 = x_edges[:-1][None, :]
+        x1 = np.maximum(x0 + 1, x_edges[1:][None, :])
+        sums = integral[:, y1, x1] - integral[:, y0, x1] - integral[:, y1, x0] + integral[:, y0, x0]
+        counts = np.maximum(1, (y1 - y0) * (x1 - x0))
+        return np.rint(sums / counts).astype(np.uint8).reshape(-1).tobytes()
     result = []
     for channel in range(FEATURE_CHANNELS):
         result.extend(_pool_channel(source, channel * PIXELS, FEATURE_W, FEATURE_H, COARSE_W, COARSE_H))
@@ -15146,6 +15207,7 @@ class OfflinePolicyModelBuilder:
                     batch_size = max(1, batch_size // 2)
                     optimizer.zero_grad(set_to_none=True)
                     release_torch_training_resources(torch)
+                    collect_garbage("policy_training_oom", 0.0, True)
                     continue
                 for name, value in losses.items():
                     history[name].append(float(value))
@@ -29729,6 +29791,189 @@ def _atomic_write(path, data):
     return durable_atomic_write(path, data)
 
 
+WORKER_ENTRY_SCHEMA_VERSION = 1
+_WORKER_SOURCE_CACHE = {}
+_WORKER_FILENAMES = frozenset({"ai_worker.py", "training_worker.py", "runtime_install_worker.py"})
+
+
+def _worker_node_defined_names(node):
+    result = set()
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        result.add(str(node.name))
+        return result
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        for alias in node.names:
+            result.add(str(alias.asname or alias.name.split(".")[0]))
+        return result
+    if isinstance(node, ast.Assign):
+        targets = list(node.targets)
+    elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        targets = [node.target]
+    else:
+        targets = []
+    for target in targets:
+        for item in ast.walk(target):
+            if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store):
+                result.add(str(item.id))
+    if isinstance(node, (ast.If, ast.Try, ast.With)):
+        bodies = [getattr(node, "body", []), getattr(node, "orelse", []), getattr(node, "finalbody", [])]
+        for handler in getattr(node, "handlers", []):
+            bodies.append(getattr(handler, "body", []))
+        for body in bodies:
+            for child in body:
+                result.update(_worker_node_defined_names(child))
+    return result
+
+
+def _worker_node_source(source_lines, node):
+    decorators = getattr(node, "decorator_list", ())
+    start = min([node.lineno, *[item.lineno for item in decorators]])
+    return "".join(source_lines[start - 1 : node.end_lineno]).rstrip()
+
+
+def build_minimal_worker_source(source, root_names, entry_source):
+    source_text = str(source)
+    roots = tuple(str(name) for name in root_names)
+    cache_key = (hashlib.sha256(source_text.encode("utf-8")).hexdigest(), roots, str(entry_source))
+    cached = _WORKER_SOURCE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    tree = ast.parse(source_text)
+    source_lines = source_text.splitlines(keepends=True)
+    name_nodes = defaultdict(list)
+    selected = set()
+    for index, node in enumerate(tree.body):
+        names = _worker_node_defined_names(node)
+        for name in names:
+            name_nodes[name].append(index)
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            selected.add(index)
+    pending = list(roots)
+    visited = set()
+    while pending:
+        name = pending.pop()
+        if name in visited:
+            continue
+        visited.add(name)
+        for index in name_nodes.get(name, ()):
+            if index in selected:
+                continue
+            selected.add(index)
+            node = tree.body[index]
+            for item in ast.walk(node):
+                if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load) and item.id in name_nodes:
+                    pending.append(item.id)
+    missing = [name for name in roots if name not in name_nodes]
+    if missing:
+        raise RuntimeError("工作进程入口依赖不存在：" + "、".join(missing))
+    fragments = [_worker_node_source(source_lines, tree.body[index]) for index in sorted(selected)]
+    result = "\n\n".join(fragment for fragment in fragments if fragment).rstrip() + "\n\n" + str(entry_source).strip() + "\n"
+    compile(result, "<minimal-worker>", "exec")
+    _WORKER_SOURCE_CACHE[cache_key] = result
+    return result
+
+
+def _ai_worker_entry_source():
+    return (
+        "def _worker_entry(argv=None):\n"
+        "    values=list(sys.argv[1:] if argv is None else argv)\n"
+        "    if len(values)!=5: raise SystemExit('AI工作进程参数数量无效')\n"
+        "    base,address_text,auth_text,family,protocol=values\n"
+        "    address=address_text if family=='AF_PIPE' else tuple(json.loads(address_text))\n"
+        "    return ai_worker_main(base,address,auth_text,family,protocol) or 0\n"
+        "if __name__=='__main__':\n"
+        "    raise SystemExit(_worker_entry())"
+    )
+
+
+def _runtime_worker_entry_source():
+    return (
+        "def _worker_entry(argv=None):\n"
+        "    values=list(sys.argv[1:] if argv is None else argv)\n"
+        "    if len(values)==2 and values[0]=='install': return runtime_install_worker(values[1]) or 0\n"
+        "    if len(values)==3 and values[0]=='test': return runtime_installer_test_worker(values[1],values[2]) or 0\n"
+        "    raise SystemExit('运行库工作进程参数无效')\n"
+        "if __name__=='__main__':\n"
+        "    raise SystemExit(_worker_entry())"
+    )
+
+
+def materialize_worker_entrypoints(base, source=None):
+    root = Path(base).resolve() / "project" / "uga" / "workers"
+    source_text = str(source) if source is not None else Path(__file__).read_text(encoding="utf-8")
+    source_hash = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+    manifest_path = root / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+            worker_records = existing.get("workers", {}) if isinstance(existing, dict) else {}
+            valid = (
+                safe_int(existing.get("schema_version"), 0) == WORKER_ENTRY_SCHEMA_VERSION
+                and str(existing.get("source_sha256", "")) == source_hash
+                and set(worker_records) == _WORKER_FILENAMES
+            )
+            if valid:
+                for filename, record in worker_records.items():
+                    candidate = root / filename
+                    if not candidate.is_file() or sha256_file(candidate) != str(record.get("sha256", "")):
+                        valid = False
+                        break
+            if valid:
+                return root
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    ai_source = build_minimal_worker_source(source_text, ("ai_worker_main",), _ai_worker_entry_source())
+    runtime_source = build_minimal_worker_source(
+        source_text,
+        ("runtime_install_worker", "runtime_installer_test_worker"),
+        _runtime_worker_entry_source(),
+    )
+    training_source = (
+        "import os,sys\n"
+        "os.environ['UGAI_WORKER_ROLE']='training'\n"
+        "from ai_worker import _worker_entry\n"
+        "if __name__=='__main__':\n"
+        "    raise SystemExit(_worker_entry())\n"
+    )
+    payloads = {
+        "ai_worker.py": ai_source,
+        "training_worker.py": training_source,
+        "runtime_install_worker.py": runtime_source,
+        "__init__.py": "WORKER_ENTRY_SCHEMA_VERSION=" + str(WORKER_ENTRY_SCHEMA_VERSION) + "\n",
+    }
+    for filename, content in payloads.items():
+        _atomic_write(root / filename, content)
+    manifest = {
+        "schema_version": WORKER_ENTRY_SCHEMA_VERSION,
+        "source_sha256": source_hash,
+        "workers": {
+            filename: {
+                "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "bytes": len(content.encode("utf-8")),
+                "lines": len(content.splitlines()),
+            }
+            for filename, content in payloads.items()
+            if filename.endswith("_worker.py")
+        },
+        "generated": time.time(),
+    }
+    _atomic_write(root / "manifest.json", json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    return root
+
+
+def worker_entry_path(base, filename):
+    name = str(filename)
+    if name not in _WORKER_FILENAMES:
+        raise RuntimeError("未知工作进程入口：" + name)
+    root = Path(base).resolve() / "project" / "uga" / "workers"
+    path = root / name
+    if not path.is_file():
+        materialize_worker_entrypoints(base)
+    if not path.is_file():
+        raise RuntimeError("精简工作进程入口不存在：" + str(path))
+    return path
+
+
 DEVELOPMENT_MODULE_ANCHORS = (
     ("src/bootstrap.py", None),
     ("src/core/metrics.py", "RuntimeMetrics"),
@@ -29812,7 +30057,7 @@ def split_development_modules(source):
     modules = {}
     for index, (relative, line) in enumerate(starts):
         next_line = starts[index + 1][1] if index + 1 < len(starts) else guard_line
-        fragment = "".join(lines[line - 1 : next_line - 1]).rstrip() + "\n"
+        fragment = "".join(lines[line - 1 : next_line - 1])
         if not fragment.strip():
             raise RuntimeError("开发模块为空：" + relative)
         compile(fragment, relative, "exec")
@@ -29822,18 +30067,14 @@ def split_development_modules(source):
 
 def _development_loader_source(order):
     return (
-        "import json\n"
-        "from pathlib import Path\n"
-        "ROOT=Path(__file__).resolve().parent\n"
-        "ORDER=" + repr(list(order)) + "\n"
+        "import runpy,sys\n"
+        "from build_single_file import build\n"
         "def load_runtime():\n"
-        "    namespace={'__name__':'ugai_dev_runtime','__file__':str(ROOT/'dist'/'main.py'),'__package__':None}\n"
-        "    for relative in ORDER:\n"
-        "        path=ROOT/relative\n"
-        "        exec(compile(path.read_text(encoding='utf-8'),str(path),'exec'),namespace,namespace)\n"
-        "    return namespace\n"
+        "    target=build()\n"
+        "    return runpy.run_path(str(target),run_name='ugai_dev_runtime')\n"
         "def main(argv=None):\n"
-        "    return load_runtime()['main'](argv)\n"
+        "    namespace=load_runtime()\n"
+        "    return namespace['main'](argv)\n"
         "if __name__=='__main__':\n"
         "    raise SystemExit(main())\n"
     )
@@ -29847,8 +30088,8 @@ def _single_file_builder_source(order):
         "ORDER=" + repr(list(order)) + "\n"
         "def build(target=None):\n"
         "    output=Path(target).resolve() if target else ROOT/'dist'/'main.py'\n"
-        "    source='\\n'.join((ROOT/item).read_text(encoding='utf-8').rstrip() for item in ORDER)\n"
-        "    source+='\\n\\nif __name__==\"__main__\":\\n    raise SystemExit(main())\\n'\n"
+        "    source=''.join((ROOT/item).read_text(encoding='utf-8') for item in ORDER)\n"
+        "    source+='if __name__ == \"__main__\":\\n    raise SystemExit(main())\\n'\n"
         "    compile(source,str(output),'exec')\n"
         "    output.parent.mkdir(parents=True,exist_ok=True)\n"
         "    temporary=output.with_suffix(output.suffix+'.tmp')\n"
@@ -29864,16 +30105,11 @@ def _project_module_templates_base(source=None):
     source_text = str(source) if source is not None else Path(__file__).read_text(encoding="utf-8")
     modules = split_development_modules(source_text)
     source_order = list(modules)
-    runtime_order = []
-    for relative in source_order:
-        target = "uga/" + relative[4:] if relative.startswith("src/") else relative
-        modules[target] = modules[relative]
-        runtime_order.append(target)
     modules["src/module_order.json"] = json.dumps(source_order, ensure_ascii=False, indent=2) + "\n"
-    modules["uga/module_order.json"] = json.dumps(runtime_order, ensure_ascii=False, indent=2) + "\n"
-    modules["uga/__init__.py"] = "ARCHITECTURE='verified_shared_namespace_modules'\n"
-    modules["dev_main.py"] = _development_loader_source(runtime_order)
-    modules["build_single_file.py"] = _single_file_builder_source(runtime_order)
+    modules["src/__init__.py"] = "SOURCE_OF_TRUTH=True\n"
+    modules["uga/__init__.py"] = "ARCHITECTURE='source_first_single_file_build'\n"
+    modules["dev_main.py"] = _development_loader_source(source_order)
+    modules["build_single_file.py"] = _single_file_builder_source(source_order)
     modules["main.py"] = "from dev_main import main\nif __name__=='__main__':\n    raise SystemExit(main())\n"
     modules["tests/__init__.py"] = ""
     modules["tests/conftest.py"] = (
@@ -29888,6 +30124,8 @@ def _project_module_templates_base(source=None):
         "    assert not list(root.rglob('_legacy_runtime.py'))\n"
         "    assert 'class LearningController' in (root/'src'/'modes'/'learning.py').read_text(encoding='utf-8')\n"
         "    assert 'class TrainingExecution' in (root/'src'/'modes'/'training.py').read_text(encoding='utf-8')\n"
+        "    assert 'exec(compile' not in (root/'dev_main.py').read_text(encoding='utf-8')\n"
+        "    assert (root/'src'/'module_order.json').is_file()\n"
     )
     modules["tests/test_build.py"] = (
         "import subprocess,sys\nfrom pathlib import Path\n"
@@ -29929,7 +30167,6 @@ def project_module_templates(source=None):
     }
     for name, description in packages.items():
         modules["src/" + name + "/__init__.py"] = "PACKAGE_DESCRIPTION=" + repr(description) + "\n"
-        modules["uga/" + name + "/__init__.py"] = "PACKAGE_DESCRIPTION=" + repr(description) + "\n"
     modules["tests/test_upgrade_architecture.py"] = (
         "from pathlib import Path\n"
         "def test_upgrade_architecture():\n"
@@ -29939,9 +30176,9 @@ def project_module_templates(source=None):
         "                  'goal_conditioned_candidate_features','train_latent_world_model','AutomaticSkillDiscovery',\n"
         "                  'low_rank_residual_film','SLEEP_PIPELINE_PHASES'):\n"
         "        assert token in source\n"
-        "    assert (root/'uga'/'perception'/'hybrid.py').is_file()\n"
-        "    assert (root/'uga'/'world_model'/'transition.py').is_file()\n"
-        "    assert (root/'uga'/'benchmark'/'generalization.py').is_file()\n"
+        "    assert (root/'src'/'perception'/'hybrid.py').is_file()\n"
+        "    assert (root/'src'/'world_model'/'transition.py').is_file()\n"
+        "    assert (root/'src'/'benchmark'/'generalization.py').is_file()\n"
     )
     return modules
 
@@ -29955,8 +30192,8 @@ def materialize_project_layout(base):
     _atomic_write(root / "dist/main.py", source)
     files = sorted([*modules, "dist/main.py"])
     manifest = {
-        "format": 3,
-        "architecture": "shared_namespace_source_modules",
+        "format": 4,
+        "architecture": "source_first_single_file_build",
         "legacy_runtime": False,
         "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
         "module_order": json.loads(modules["src/module_order.json"]),
@@ -29996,6 +30233,7 @@ def configure_data_directory(path, context=None):
     os.environ["TMP"] = str(base / "temp")
     os.environ["TEMP"] = str(base / "temp")
     tempfile.tempdir = str(base / "temp")
+    materialize_worker_entrypoints(base)
     app_context.selected_directory = base
     return base
 
@@ -31832,16 +32070,11 @@ class RuntimeInstaller:
         creationflags = (0x08000000 | 0x00000200) if os.name == "nt" else 0
         env = os.environ.copy()
         env["PYTHONNOUSERSITE"] = "1"
+        runtime_worker = worker_entry_path(self.base, "runtime_install_worker.py")
         if self.test_mode is None:
-            command = [sys.executable, str(Path(__file__).resolve()), "runtime-install-worker", str(request_path)]
+            command = [sys.executable, str(runtime_worker), "install", str(request_path)]
         else:
-            command = [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "runtime-installer-test-worker",
-                str(request_path),
-                self.test_mode,
-            ]
+            command = [sys.executable, str(runtime_worker), "test", str(request_path), self.test_mode]
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -32171,7 +32404,7 @@ class GameSpecificVisionTrainer:
         os.replace(temporary, self.runtime._shared_path_for(True))
 
     def _wait_for_training_plan(self):
-        RESOURCE_GOVERNOR.start()
+        RESOURCE_GOVERNOR.ensure_started()
         while True:
             self._raise_if_stopped("资源不足，训练已停止")
             plan = RESOURCE_GOVERNOR.current_plan()
@@ -32181,7 +32414,7 @@ class GameSpecificVisionTrainer:
                 return plan
             FEATURE_ENGINE.clear_frames()
             POLICY_TRAINING_CACHE.clear()
-            gc.collect()
+            collect_garbage("vision_training_plan_wait", 30.0)
             if self.stop_event is not None:
                 if self.stop_event.wait(1.0):
                     raise InputStopped("资源不足，训练已停止")
@@ -32211,6 +32444,7 @@ class GameSpecificVisionTrainer:
                     data.batch_size = max(1, data.batch_size // 2)
                     data.optimizer.zero_grad(set_to_none=True)
                     self._release_torch_cache(data.torch)
+                    collect_garbage("vision_training_oom", 0.0, True)
                     continue
                 if self.progress is not None and completed_steps % 2 == 0:
                     self.progress(35.0 * completed_steps / data.total_steps)
@@ -32235,7 +32469,7 @@ class GameSpecificVisionTrainer:
             data.optimizer = None
             data.scaler = None
             self._release_torch_cache(data.torch)
-            gc.collect()
+            collect_garbage("vision_training_release", 10.0)
 
     def _prepare_torch_data(self, valid, plan):
         torch = self.runtime.torch
@@ -33729,6 +33963,13 @@ def ai_worker_main(base, address, auth_text, family, protocol_version=None):
                     value = status_value()
                 elif operation == "activate_game":
                     value = vision.activate_game(str(payload.get("game_id", "")))
+                elif operation == "reload_game":
+                    game_id = str(payload.get("game_id", ""))
+                    with vision.lock:
+                        vision.active_game = None
+                        vision.model = None
+                    collect_garbage("vision_worker_reload", 0.0, True)
+                    value = vision.activate_game(game_id)
                 elif operation == "vision_manifest":
                     value = vision.manifest()
                 elif operation == "encode":
@@ -33820,7 +34061,7 @@ def ai_worker_main(base, address, auth_text, family, protocol_version=None):
 
 
 class AIWorkerClient:
-    def __init__(self, base, on_failure=None):
+    def __init__(self, base, on_failure=None, worker_filename="ai_worker.py", allow_dedicated_training=True):
         from multiprocessing.connection import Listener
 
         self.base = Path(base).resolve()
@@ -33832,14 +34073,20 @@ class AIWorkerClient:
         ):
             raise RuntimeError("AI工作进程启动前所选后端wheel锁不完整")
         self.on_failure = on_failure
+        self.worker_filename = str(worker_filename)
+        if self.worker_filename not in {"ai_worker.py", "training_worker.py"}:
+            raise RuntimeError("AI工作进程入口无效")
+        self.allow_dedicated_training = bool(allow_dedicated_training)
         self.lock = threading.RLock()
         self.connection = None
         self.process = None
         self.closed = False
         self.active_stop_path = None
+        self.active_training_client = None
         self.status = {}
         self.candidate_index_tokens = set()
-        self.startup_log_path = make_data_directory(self.base, "logs") / "ai_worker_startup.log"
+        log_name = "training_worker_startup.log" if self.worker_filename == "training_worker.py" else "ai_worker_startup.log"
+        self.startup_log_path = make_data_directory(self.base, "logs") / log_name
         self.startup_log_handle = self.startup_log_path.open("ab", buffering=0)
         self.startup_log_handle.write(
             (
@@ -33886,8 +34133,7 @@ class AIWorkerClient:
         )
         command = [
             str(python),
-            str(Path(__file__).resolve()),
-            "ai-worker",
+            str(worker_entry_path(self.base, self.worker_filename)),
             str(self.base),
             str(address_text),
             base64.urlsafe_b64encode(self.auth).decode("ascii"),
@@ -33969,6 +34215,9 @@ class AIWorkerClient:
                 record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
 
     def request_stop(self):
+        training_client = self.active_training_client
+        if training_client is not None:
+            training_client.request_stop()
         path = self.active_stop_path
         if path is not None:
             try:
@@ -33976,7 +34225,33 @@ class AIWorkerClient:
             except RECOVERABLE_ERRORS as error:
                 record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
 
+    def _request_dedicated_training(self, payload, timeout, progress):
+        client = AIWorkerClient(
+            self.base,
+            self.on_failure,
+            worker_filename="training_worker.py",
+            allow_dedicated_training=False,
+        )
+        with self.lock:
+            if self.closed:
+                client.close(0.2)
+                raise RuntimeError("AI工作进程已关闭")
+            self.active_training_client = client
+        try:
+            value = client.request("train", payload, timeout, progress)
+        finally:
+            with self.lock:
+                if self.active_training_client is client:
+                    self.active_training_client = None
+            client.close(2.0)
+        game_id = str((payload or {}).get("game_id", "")) if isinstance(payload, dict) else ""
+        if game_id and self.alive():
+            self.request("reload_game", {"game_id": game_id}, 180.0)
+        return value
+
     def request(self, operation, payload=None, timeout=120.0, progress=None):
+        if operation == "train" and self.allow_dedicated_training and self.worker_filename == "ai_worker.py":
+            return self._request_dedicated_training(payload, timeout, progress)
         with self.lock:
             if self.closed or self.connection is None or self.process is None or self.process.poll() is not None:
                 error = RuntimeError("AI工作进程不可用")
@@ -34086,6 +34361,12 @@ class AIWorkerClient:
         if self.closed:
             return True
         self.request_stop()
+        training_client = self.active_training_client
+        if training_client is not None:
+            try:
+                training_client.close(timeout)
+            except RECOVERABLE_ERRORS as error:
+                record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
         try:
             if self.connection is not None and self.process is not None and self.process.poll() is None:
                 self.request("shutdown", {}, max(1.0, float(timeout)))
@@ -35047,6 +35328,110 @@ def logic_contract_suite():
         FEATURE_ENGINE.numpy_checked and numpy_first is numpy_second,
         {"checked": FEATURE_ENGINE.numpy_checked, "available": numpy_first is not None},
     )
+    coarse_reference = bytes(
+        value
+        for channel in range(FEATURE_CHANNELS)
+        for value in _pool_channel(
+            second, channel * PIXELS, FEATURE_W, FEATURE_H, COARSE_W, COARSE_H
+        )
+    )
+    coarse_optimized = coarse_feature(second)
+    record(
+        "coarse_feature_five_channel_equivalence",
+        coarse_optimized == coarse_reference and len(coarse_optimized) == COARSE_LEN,
+        {"length": len(coarse_optimized), "numpy": numpy_first is not None},
+    )
+    _SEMANTIC_ENCODER_CACHE.clear()
+    default_encoder_first = semantic_encoder_from_model()
+    default_encoder_second = semantic_encoder_from_model({})
+    record(
+        "default_semantic_encoder_fixed_cache_key",
+        default_encoder_first is default_encoder_second
+        and list(_SEMANTIC_ENCODER_CACHE) == [_DEFAULT_SEMANTIC_ENCODER_KEY],
+        {"keys": list(_SEMANTIC_ENCODER_CACHE)},
+    )
+    frame_cache = FrameComputationCache(32)
+    frame_cache.put_component("frame", "semantic", {"targets": [{"class": "button"}], "scene_graph": {}})
+    cached_first = frame_cache.get_component("frame", "semantic")
+    cached_second = frame_cache.get_component("frame", "semantic")
+    cache_mutation_blocked = False
+    try:
+        cached_first["targets"].append({"class": "dialog"})
+    except TypeError:
+        cache_mutation_blocked = True
+    record(
+        "frame_computation_cache_frozen_shared_read",
+        cached_first is cached_second and cache_mutation_blocked,
+        {"shared": cached_first is cached_second, "immutable": cache_mutation_blocked},
+    )
+    metric_probe = RuntimeMetrics(128)
+    for value in range(1, 101):
+        metric_probe.observe("latency", value)
+    percentile_first = metric_probe.percentile("latency", 0.95)
+    percentile_second = metric_probe.percentile("latency", 0.95)
+    record(
+        "targeted_metric_percentile",
+        percentile_first == 95 and percentile_second == percentile_first and len(metric_probe.percentile_cache) == 1,
+        {"p95": percentile_first, "cache_entries": len(metric_probe.percentile_cache)},
+    )
+
+    class TrainingGovernorSmoke:
+        def __init__(self):
+            self.ensure_calls = 0
+            self.plan = RuntimePlan(30, 4, 6, 24, 1, MAX_PROTOTYPES, "windows-x64-cpu")
+
+        def ensure_started(self):
+            self.ensure_calls += 1
+            return self
+
+        def current_plan(self):
+            return self.plan
+
+    class TrainingRuntimeSmoke:
+        torch = None
+
+    governor_smoke = TrainingGovernorSmoke()
+    original_governor = globals()["RESOURCE_GOVERNOR"]
+    training_smoke_error = ""
+    try:
+        globals()["RESOURCE_GOVERNOR"] = governor_smoke
+        function_plan = wait_for_runtime_training_plan(threading.Event())
+        trainer = GameSpecificVisionTrainer(TrainingRuntimeSmoke(), "smoke", [], threading.Event(), None, 1, 0)
+        method_plan = trainer._wait_for_training_plan()
+    except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+        function_plan = None
+        method_plan = None
+        training_smoke_error = type(error).__name__ + ":" + str(error)
+    finally:
+        globals()["RESOURCE_GOVERNOR"] = original_governor
+    record(
+        "training_entry_resource_governor_smoke",
+        function_plan is governor_smoke.plan
+        and method_plan is governor_smoke.plan
+        and governor_smoke.ensure_calls == 2
+        and not training_smoke_error,
+        {"ensure_calls": governor_smoke.ensure_calls, "error": training_smoke_error},
+    )
+    with tempfile.TemporaryDirectory() as worker_folder:
+        worker_root = materialize_worker_entrypoints(worker_folder)
+        ai_worker_source = (worker_root / "ai_worker.py").read_text(encoding="utf-8")
+        training_worker_source = (worker_root / "training_worker.py").read_text(encoding="utf-8")
+        runtime_worker_source = (worker_root / "runtime_install_worker.py").read_text(encoding="utf-8")
+        compile(ai_worker_source, str(worker_root / "ai_worker.py"), "exec")
+        compile(training_worker_source, str(worker_root / "training_worker.py"), "exec")
+        compile(runtime_worker_source, str(worker_root / "runtime_install_worker.py"), "exec")
+        worker_manifest = json.loads((worker_root / "manifest.json").read_text(encoding="utf-8"))
+        record(
+            "minimal_selected_directory_worker_entries",
+            len(ai_worker_source.splitlines()) < 12000
+            and len(runtime_worker_source.splitlines()) < 4000
+            and "class AppUiService" not in ai_worker_source
+            and "def logic_contract_suite" not in ai_worker_source
+            and "from ai_worker import _worker_entry" in training_worker_source
+            and set(worker_manifest.get("workers", {}))
+            == {"ai_worker.py", "training_worker.py", "runtime_install_worker.py"},
+            worker_manifest,
+        )
     first_build_hash = current_build_hash()
     second_build_hash = current_build_hash()
     record(
@@ -37004,6 +37389,58 @@ def frame_computation_key(frame):
     return FrameComputationKey(session_id, window_identity, timestamp, feature_version)
 
 
+class FrozenCacheDict(dict):
+    @staticmethod
+    def _immutable(*args, **kwargs):
+        raise TypeError("帧计算缓存值不可变")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+    __ior__ = _immutable
+
+
+class FrozenCacheList(list):
+    @staticmethod
+    def _immutable(*args, **kwargs):
+        raise TypeError("帧计算缓存值不可变")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+    __iadd__ = _immutable
+    __imul__ = _immutable
+
+
+def freeze_frame_cache_value(value):
+    if isinstance(value, (FrozenCacheDict, FrozenCacheList)):
+        return value
+    if value is None or isinstance(value, (str, int, float, bool, bytes)):
+        return value
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return FrozenCacheDict((str(key), freeze_frame_cache_value(item)) for key, item in value.items())
+    if isinstance(value, (list, tuple, deque)):
+        return FrozenCacheList(freeze_frame_cache_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(freeze_frame_cache_value(item) for item in value)
+    return value
+
+
 class FrameComputationCache:
     def __init__(self, maximum=256):
         self.maximum = max(32, int(maximum))
@@ -37012,17 +37449,19 @@ class FrameComputationCache:
 
     def get(self, key):
         with self.lock:
-            value = self.values.pop(str(key), None)
+            token = str(key)
+            value = self.values.pop(token, None)
             if value is None:
                 return None
-            self.values[str(key)] = value
-            return json.loads(json.dumps(value, ensure_ascii=False))
+            self.values[token] = value
+            return value
 
     def put(self, key, value):
+        frozen = freeze_frame_cache_value(value)
         with self.lock:
             token = str(key)
             self.values.pop(token, None)
-            self.values[token] = json.loads(json.dumps(value, ensure_ascii=False))
+            self.values[token] = frozen
             while len(self.values) > self.maximum:
                 self.values.popitem(last=False)
 
@@ -37033,19 +37472,15 @@ class FrameComputationCache:
             if value is None:
                 return None
             self.values[token] = value
-            component_value = value.get(str(component)) if isinstance(value, dict) else None
-            if component_value is None:
-                return None
-            return json.loads(json.dumps(component_value, ensure_ascii=False))
+            return value.get(str(component)) if isinstance(value, dict) else None
 
     def put_component(self, key, component, value):
         with self.lock:
             token = str(key)
-            payload = self.values.pop(token, {})
-            if not isinstance(payload, dict):
-                payload = {}
-            payload[str(component)] = json.loads(json.dumps(value, ensure_ascii=False))
-            self.values[token] = payload
+            existing = self.values.pop(token, None)
+            payload = dict(existing) if isinstance(existing, dict) else {}
+            payload[str(component)] = freeze_frame_cache_value(value)
+            self.values[token] = freeze_frame_cache_value(payload)
             while len(self.values) > self.maximum:
                 self.values.popitem(last=False)
 
@@ -38038,20 +38473,22 @@ class SharedSemanticEncoder:
 
 
 _SEMANTIC_ENCODER_CACHE = {}
+_DEFAULT_SEMANTIC_ENCODER_KEY = "__default__"
 
 
 def semantic_encoder_from_model(model=None):
     value = model if isinstance(model, dict) else {}
-    checksum = str(value.get("checksum", "default"))
+    if not value or not isinstance(value.get("vectors"), dict):
+        cached = _SEMANTIC_ENCODER_CACHE.get(_DEFAULT_SEMANTIC_ENCODER_KEY)
+        if cached is not None:
+            return cached
+        encoder = SharedSemanticEncoder(SharedSemanticEncoder.train([]))
+        _SEMANTIC_ENCODER_CACHE[_DEFAULT_SEMANTIC_ENCODER_KEY] = encoder
+        return encoder
+    checksum = str(value.get("checksum", ""))
     cached = _SEMANTIC_ENCODER_CACHE.get(checksum)
     if cached is not None:
         return cached
-    if not value or not isinstance(value.get("vectors"), dict):
-        value = SharedSemanticEncoder.train([])
-        checksum = str(value.get("checksum", "default"))
-        cached = _SEMANTIC_ENCODER_CACHE.get(checksum)
-        if cached is not None:
-            return cached
     encoder = SharedSemanticEncoder(value)
     if len(_SEMANTIC_ENCODER_CACHE) >= 8:
         _SEMANTIC_ENCODER_CACHE.pop(next(iter(_SEMANTIC_ENCODER_CACHE)))
@@ -39176,6 +39613,7 @@ def train_latent_world_model(experiences, semantic_model=None):
                     batch_size = max(1, batch_size // 2)
                     optimizer.zero_grad(set_to_none=True)
                     release_torch_training_resources(torch)
+                    collect_garbage("sequence_training_oom", 0.0, True)
                     continue
             ensemble.append(
                 {
