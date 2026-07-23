@@ -63,10 +63,13 @@ now越小越好；
 当now-before>0时：now-before越小越好；
 当before-now>0时：before-now越大越好；
 当before-now>0时：before-now越小越好；
-当now-before≠0时：
+当|now-before|≠0时：|now-before|越大越好；
+当|now-before|≠0时：|now-before|越小越好；
 
 与另一个识别区域内的数字比较：
-尽量接近/越大越好/越小越好；
+|a-b|越大越好；
+|a-b|越小越好；
+/越大越好/越小越好；
 
 跟踪每个识别区域内的数字，因为它们可能会消失/移动/被遮挡；
 
