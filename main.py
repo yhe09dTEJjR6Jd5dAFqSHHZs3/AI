@@ -17,9 +17,7 @@ import sqlite3
 import zlib
 import base64
 import array
-import io
 import gc
-import tokenize
 import re
 import unicodedata
 import platform
@@ -188,7 +186,6 @@ DEVELOPER_MODE = "--developer-mode" in sys.argv
 AI_WORKER_PROTOCOL_VERSION = 6
 RUNTIME_INSTALL_PROTOCOL_VERSION = 2
 REVIEW_PROCESS_PROTOCOL_VERSION = 2
-TEST_WORKER_PROTOCOL_VERSION = 2
 STATIC_CONTRACT_VERSION = 14
 EXTERNAL_REQUIREMENT_SPEC_JSON = (
     '{"default_buttons":["文件夹","文件","游戏名称","选择窗口","人","数","升级","AI"],'
@@ -1990,7 +1987,7 @@ class ResourceGovernor:
             return self._series_p95("disk_write_ms")
         return values[min(len(values) - 1, int(round((len(values) - 1) * 0.95)))]
 
-    def sample_once(self):
+    def _base_sample_once_strict(self):
         cpu, process_cpu = self._cpu_values()
         available_ram, process_rss = self._memory_values()
         backend = self._manifest_backend()
@@ -2077,7 +2074,13 @@ class ResourceGovernor:
             update_hardware_profile_health(store.base, snapshot.end_to_end_p95_ms)
         return snapshot
 
-    def _update_state_locked(self, now):
+    def sample_once(self):
+        implementation = globals().get("_strict_governor_sample_once")
+        if implementation is None:
+            return self._base_sample_once_strict()
+        return implementation(self)
+
+    def _base_update_state_locked_strict(self, now):
         recent = list(self.history)
         current = recent[-1]
         last_five = recent[-5:]
@@ -2171,6 +2174,31 @@ class ResourceGovernor:
             if cache is not None:
                 cache.clear()
             collect_garbage("resource_red", 30.0, previous_state is not ResourceState.RED)
+
+    def _update_state_locked(self, now):
+        implementation = globals().get("_strict_governor_update_state")
+        if implementation is None:
+            return self._base_update_state_locked_strict(now)
+        return implementation(self, now)
+
+    def plan_envelope(self):
+        implementation = globals().get("_strict_plan_envelope")
+        if implementation is None:
+            plan = self.current_plan(ModeId.AI.value)
+            return {"plan_version": 1, "plan_reason": "startup", "requested_backend": str(plan.backend), "requested_model_tier": normalize_model_tier(plan.model_tier), "worker_ack_version": 0, "applied_backend": "", "applied_model_tier": "Tiny", "resource_state": self.state.value, "red_duration_seconds": 0.0, "plan": plan.to_dict()}
+        return implementation(self)
+
+    def acknowledge_worker(self, value):
+        implementation = globals().get("_strict_ack_worker")
+        if implementation is None:
+            return safe_int((value or {}).get("worker_ack_version", (value or {}).get("plan_version", 0)), 0) if isinstance(value, dict) else 0
+        return implementation(self, value)
+
+    def plan_envelope(self):
+        return _strict_plan_envelope(self)
+
+    def acknowledge_worker(self, value):
+        return _strict_ack_worker(self, value)
 
     @staticmethod
     def _size_pair(value, default, minimum=(32, 18), maximum=(1024, 1024)):
@@ -4408,6 +4436,7 @@ class ThreadLocalSQLite:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=3000")
         if not self.read_only:
+            connection.execute("PRAGMA secure_delete=ON")
             connection.execute("PRAGMA synchronous=NORMAL")
         return connection
 
@@ -13305,7 +13334,7 @@ def merge_semantic_targets_by_roi(previous, current, changed_regions, maximum=48
 
 
 class FrameBuffer:
-    def __init__(self, bridge, target, hz=20.0, seconds=2.0, motion_interval=0.1, purpose=None, on_geometry=None):
+    def _base_init_strict(self, bridge, target, hz=20.0, seconds=2.0, motion_interval=0.1, purpose=None, on_geometry=None):
         self.bridge = bridge
         self.target = dict(target) if isinstance(target, dict) else dict(target)
         self.game_id = str(self.target.get("game_id", ""))
@@ -13344,6 +13373,9 @@ class FrameBuffer:
         self.last_scene_graph = {}
         self.last_plan = RESOURCE_GOVERNOR.current_plan()
 
+    def __init__(self, bridge, target, hz=20.0, seconds=2.0, motion_interval=0.1, purpose=None, on_geometry=None):
+        _strict_frame_buffer_init(self, bridge, target, hz, seconds, motion_interval, purpose, on_geometry)
+
     def set_preview_active(self, active):
         if active:
             self.preview_active.set()
@@ -13359,7 +13391,7 @@ class FrameBuffer:
         self.thread.start()
         return self
 
-    def _geometry_ready(self):
+    def _base_geometry_ready_strict(self):
         rect, dpi = self.bridge.validate_target_identity(self.target, False)
         expected = self.target.get("client_size")
         expected_dpi = self.target.get("selected_dpi", self.target.get("dpi"))
@@ -13416,6 +13448,9 @@ class FrameBuffer:
         if self.on_geometry:
             self.on_geometry(self.target, calibration)
         return False
+
+    def _geometry_ready(self):
+        return _strict_frame_geometry_ready(self)
 
     def _run(self):
         thread_id = threading.get_ident()
@@ -13808,7 +13843,7 @@ class FrameBuffer:
 
 
 class ModeSession:
-    def __init__(self, app, target):
+    def _base_init_strict(self, app, target):
         self.app = app
         self.target = dict(target) if isinstance(target, dict) else dict(target)
         game = getattr(app, "selected_game", None)
@@ -13836,12 +13871,18 @@ class ModeSession:
         self.last_gamepad_state = {}
         self.last_gamepad_axis_sample = {}
 
-    def _geometry_updated(self, target, calibration):
+    def __init__(self, app, target):
+        _strict_mode_session_init(self, app, target)
+
+    def _base_geometry_updated_strict(self, target, calibration):
         try:
             self.app.store.save_capture_calibration(target, calibration)
         except RECOVERABLE_ERRORS as error:
             record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
         self.app.set_status("窗口尺寸或DPI变化后已自动重新校准，正在连续确认画面")
+
+    def _geometry_updated(self, target, calibration):
+        return _strict_geometry_updated(self, target, calibration)
 
     def start_frames(self, hz, seconds, motion_interval, purpose):
         buffer = FrameBuffer(self.app.api, self.target, hz, seconds, motion_interval, purpose, self._geometry_updated)
@@ -19434,7 +19475,7 @@ class TrainingExecution:
         self.corrective_workflow = None
         self.task_graph_memory = None
 
-    def preflight(self):
+    def _base_preflight_strict(self):
         self.game = self.phase.get("game") or self.host.require_game()
         self.corrective_workflow = CorrectiveLearningWorkflow(self.host.store.base, self.game["id"])
         self.task_graph_memory = PersistentTaskGraph(self.host.store.base, self.game["id"])
@@ -19561,6 +19602,9 @@ class TrainingExecution:
                 + str(RUNTIME_THRESHOLDS.online_acceptance_target_episodes)
                 + "局；用时和动作数均为实测"
             )
+
+    def preflight(self):
+        return _strict_training_preflight(self)
 
     def start_online_episode(self):
         self.online_episode_started = time.monotonic()
@@ -19725,7 +19769,7 @@ class TrainingExecution:
             "integrity": safe_int(identity.get("integrity"), 0),
         }
 
-    def assert_training_snapshot(self, force=False):
+    def _base_assert_training_snapshot_strict(self, force=False):
         now = time.monotonic()
         if not force and now - self.snapshot_last_check < 0.25:
             return True
@@ -19779,6 +19823,9 @@ class TrainingExecution:
             self.state_since = time.monotonic()
             self.host.set_status("检测到纯视觉布局变化，已重新校准客户区、DPI或采集后端并等待连续确认")
         return True
+
+    def assert_training_snapshot(self, force=False):
+        return _strict_assert_snapshot(self, force)
 
     def _start_monitors_base(self, session):
         fps = max(8.0, float(self.calibration.get("fps", 15.0)))
@@ -20085,7 +20132,7 @@ class TrainingExecution:
             return None
         return self.build_selection(captured, best, confirmations)
 
-    def choose_action(self, captured, temporal):
+    def _base_choose_action_strict(self, captured, temporal):
         started = time.monotonic()
         try:
             result = self._choose_action_base(captured, temporal)
@@ -20099,6 +20146,9 @@ class TrainingExecution:
             return result
         finally:
             RUNTIME_METRICS.observe("candidate_ranking_ms", (time.monotonic() - started) * 1000.0)
+
+    def choose_action(self, captured, temporal):
+        return _strict_choose_action(self, captured, temporal)
 
     def _build_selection_base(self, captured, best, confirmations):
         coordinate = normalize_action(best["a"])
@@ -20413,7 +20463,7 @@ class TrainingExecution:
             raise InputStopped("动作前连续帧确认不足")
         self.assert_training_snapshot(True)
 
-    def execute_selected_action(self, selection):
+    def _base_execute_selected_action_strict(self, selection):
         fresh = self.frame_buffer.latest(None, 0.35)
         self.last_selection_for_correction = dict(selection) if isinstance(selection, dict) else selection
         try:
@@ -20453,6 +20503,9 @@ class TrainingExecution:
             ):
                 self.host.set_input_status("已锁定")
         return self.collect_outcome(selection, before)
+
+    def execute_selected_action(self, selection):
+        return _strict_execute_selected(self, selection)
 
     def handle_execution_interference(self):
         if not self.mouse_interrupt.is_set() and not self.keyboard_interrupt.is_set() and self.keyboard.all_released():
@@ -22100,12 +22153,40 @@ class DataStoreGameTaskMixin:
                 for child_key, child in item.items():
                     token = str(child_key).casefold()
                     if (
-                        token in {"relative_path", "path", "file", "artifact_path", "bundle_path"}
+                        token in {
+                            "relative_path",
+                            "path",
+                            "file",
+                            "filename",
+                            "file_path",
+                            "artifact_path",
+                            "bundle_path",
+                            "cache_path",
+                            "model_path",
+                            "tensor_path",
+                            "ocr_path",
+                            "screenshot_path",
+                            "thumbnail_path",
+                            "attachment_path",
+                            "replay_path",
+                        }
                         and isinstance(child, str)
                     ):
                         add(child)
                     elif (
-                        token in {"paths", "files", "artifact_paths", "bundle_paths"}
+                        token in {
+                            "paths",
+                            "files",
+                            "filenames",
+                            "file_paths",
+                            "artifact_paths",
+                            "bundle_paths",
+                            "cache_paths",
+                            "model_paths",
+                            "tensor_paths",
+                            "attachment_paths",
+                            "replay_paths",
+                        }
                         and isinstance(child, (list, tuple))
                     ):
                         for candidate in child:
@@ -22131,16 +22212,74 @@ class DataStoreGameTaskMixin:
                 )
         return [(game_id, self._decode_model_asset_document(payload)) for game_id, payload in rows]
 
-    def _game_asset_tokens(self, game_ids):
-        tokens = set()
-        for game_id in game_ids:
-            text = str(game_id)
-            digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
-            tokens.update({text.casefold(), digest, digest[:16], digest[:24], digest[:32]})
-            normalized = normalized_identifier(text, "game", 96).casefold()
+    def _game_deletion_descriptor(self, game_ids):
+        deleting = {str(value) for value in game_ids if str(value)}
+        if not deleting:
+            return {"game_ids": set(), "names": set(), "region_ids": set(), "opaque_tokens": set(), "path_tokens": set()}
+        placeholders = ",".join("?" for _ in deleting)
+        with self.lock:
+            game_rows = list(
+                iter_rows(
+                    self.db.execute(
+                        "SELECT id,name FROM games WHERE id IN (" + placeholders + ")",
+                        tuple(sorted(deleting)),
+                    ),
+                    128,
+                )
+            )
+            region_ids = {
+                str(row[0])
+                for row in self.db.execute(
+                    "SELECT id FROM ocr_regions WHERE game_id IN (" + placeholders + ")",
+                    tuple(sorted(deleting)),
+                )
+            } if self._table_exists("ocr_regions") else set()
+        names = {str(row["name"]) for row in game_rows if str(row["name"])}
+        opaque = set(deleting) | region_ids
+        path_tokens = set()
+        for game_id in deleting:
+            digest = hashlib.sha256(game_id.encode("utf-8", "replace")).hexdigest()
+            opaque.update({digest, digest[:16], digest[:24], digest[:32]})
+            path_tokens.update({game_id, digest, digest[:16], digest[:24], digest[:32]})
+            normalized = normalized_identifier(game_id, "game", 96)
             if len(normalized) >= 8:
-                tokens.add(normalized)
-        return {token for token in tokens if len(token) >= 8}
+                opaque.add(normalized)
+                path_tokens.add(normalized)
+        path_tokens.update(names)
+        path_tokens.update(region_ids)
+        return {
+            "game_ids": deleting,
+            "names": names,
+            "region_ids": region_ids,
+            "opaque_tokens": {str(value).casefold() for value in opaque if len(str(value)) >= 8},
+            "path_tokens": {str(value).casefold() for value in path_tokens if str(value)},
+        }
+
+    def _game_asset_tokens(self, descriptor):
+        value = descriptor if isinstance(descriptor, dict) else self._game_deletion_descriptor(descriptor)
+        return set(value.get("path_tokens", set()))
+
+    @staticmethod
+    def _payload_contains_deletion_token(payload, descriptor):
+        if payload is None:
+            return False
+        text = str(payload)
+        folded = text.casefold()
+        if any(token in folded for token in descriptor.get("opaque_tokens", ())):
+            return True
+        stripped = folded.strip().strip("\"'")
+        for name in descriptor.get("names", ()):
+            token = str(name).casefold()
+            if not token:
+                continue
+            if stripped == token:
+                return True
+            quoted = json.dumps(str(name), ensure_ascii=False).casefold()
+            if quoted in folded:
+                return True
+            if re.search(r"(?<![\w])" + re.escape(token) + r"(?![\w])", folded, re.UNICODE):
+                return True
+        return False
 
     def _safe_asset_path(self, relative):
         base = self.base.resolve()
@@ -22152,13 +22291,138 @@ class DataStoreGameTaskMixin:
         reject_reparse_points(base, candidate)
         return candidate
 
-    def _collect_game_asset_paths(self, game_ids):
-        deleting = {str(value) for value in game_ids}
-        tokens = self._game_asset_tokens(deleting)
+    def _managed_payload_roots(self):
+        roots = []
+        for name in ("backups", "quarantine", "audit", "logs", "models", "cache", "temp", "replays"):
+            candidate = self.base / name
+            if candidate.exists():
+                roots.append(candidate)
+        roots.extend(path for path in self.base.glob("recovery_*") if path.exists())
+        for name in ("runtime_errors.jsonl", "recovery.log"):
+            candidate = self.base / name
+            if candidate.exists():
+                roots.append(candidate)
+        return roots
+
+    def _backup_contains_deleted_game(self, path, descriptor):
+        candidate = Path(path)
+        if candidate.suffix.casefold() not in {".db", ".sqlite", ".sqlite3"}:
+            return False
+        try:
+            connection = sqlite3.connect(
+                "file:" + urllib.parse.quote(candidate.resolve().as_posix(), safe="/:") + "?mode=ro",
+                uri=True,
+                timeout=1.0,
+            )
+            try:
+                tables = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if "games" in tables:
+                    for game_id, name in connection.execute("SELECT id,name FROM games"):
+                        if str(game_id) in descriptor.get("game_ids", set()) or str(name) in descriptor.get("names", set()):
+                            return True
+                for table in ("config_backups", "corrupt_rows"):
+                    if table not in tables:
+                        continue
+                    columns = [str(row[1]) for row in connection.execute("PRAGMA table_info(" + table + ")")]
+                    text_columns = [name for name in columns if name in {"payload", "reason", "game_id"}]
+                    if not text_columns:
+                        continue
+                    for row in connection.execute("SELECT " + ",".join(text_columns) + " FROM " + table):
+                        if any(self._payload_contains_deletion_token(value, descriptor) for value in row):
+                            return True
+            finally:
+                connection.close()
+        except RECOVERABLE_ERRORS:
+            return False
+        return False
+
+    @staticmethod
+    def _managed_game_asset_relative_path(relative):
+        path = Path(relative)
+        if path.is_absolute() or not path.parts or ".." in path.parts:
+            return False
+        first = path.parts[0].casefold()
+        if first in {"models", "cache", "temp", "replays", "audit", "logs", "backups", "quarantine", "project"}:
+            return True
+        if first.startswith("recovery_"):
+            return True
+        return path.as_posix().casefold() in {"runtime_errors.jsonl", "recovery.log"}
+
+    @staticmethod
+    def _decode_asset_reference_value(value):
+        candidates = []
+        if isinstance(value, str):
+            candidates.append(value)
+        elif isinstance(value, (bytes, bytearray, memoryview)):
+            raw = bytes(value)
+            try:
+                candidates.append(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                pass
+            try:
+                candidates.append(bounded_decompress(raw, 64 * 1024 * 1024).decode("utf-8"))
+            except RECOVERABLE_ERRORS:
+                pass
+        for text in candidates:
+            try:
+                parsed = json.loads(text)
+            except RECOVERABLE_ERRORS:
+                continue
+            if isinstance(parsed, (dict, list, tuple)):
+                return parsed
+        return None
+
+    def _database_asset_reference_graph(self, descriptor):
+        deleting = set(descriptor.get("game_ids", set()))
+        target = set()
+        retained = set()
+        tables = [
+            str(row[0])
+            for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+            if str(row[0]) not in {"models", "model_backups"}
+        ]
+        for table in tables:
+            columns = list(self.db.execute("PRAGMA table_info(" + table + ")"))
+            column_names = [str(row[1]) for row in columns]
+            value_columns = [
+                str(row[1])
+                for row in columns
+                if any(token in str(row[2]).upper() for token in ("TEXT", "CHAR", "CLOB", "BLOB"))
+            ]
+            if not value_columns:
+                continue
+            selected = (["game_id"] if "game_id" in column_names else []) + value_columns
+            selected = list(dict.fromkeys(selected))
+            try:
+                cursor = self.db.execute("SELECT " + ",".join(selected) + " FROM " + table)
+            except sqlite3.Error:
+                continue
+            for row in cursor:
+                row_target = "game_id" in row.keys() and str(row["game_id"]) in deleting
+                if not row_target:
+                    row_target = any(self._payload_contains_deletion_token(row[column], descriptor) for column in value_columns)
+                paths = set()
+                for column in value_columns:
+                    parsed = self._decode_asset_reference_value(row[column])
+                    if parsed is not None:
+                        paths.update(self._collect_relative_paths_from_value(parsed))
+                    elif any(token in column.casefold() for token in ("path", "file", "attachment", "replay")):
+                        paths.update(self._collect_relative_paths_from_value({column: row[column]}))
+                paths = {path for path in paths if self._managed_game_asset_relative_path(path)}
+                if row_target:
+                    target.update(paths)
+                else:
+                    retained.update(paths)
+        return target - retained
+
+    def _collect_game_asset_paths(self, descriptor):
+        value = descriptor if isinstance(descriptor, dict) else self._game_deletion_descriptor(descriptor)
+        deleting = set(value.get("game_ids", set()))
+        tokens = self._game_asset_tokens(value)
         documents = self._model_asset_documents()
         other_tensor_paths = set()
         target_tensor_paths = set()
-        paths = set()
+        paths = set(self._database_asset_reference_graph(value))
         for game_id, document in documents:
             document_paths = self._collect_relative_paths_from_value(document)
             tensor = document.get("tensor_bundle") if isinstance(document.get("tensor_bundle"), dict) else {}
@@ -22172,16 +22436,15 @@ class DataStoreGameTaskMixin:
             if game_id in deleting:
                 paths.update(document_paths)
         with self.lock:
-            if self._table_exists("vision_models"):
+            if self._table_exists("vision_models") and deleting:
+                placeholders = ",".join("?" for _ in deleting)
                 for row in iter_rows(
                     self.db.execute(
-                        "SELECT game_id,relative_path FROM vision_models WHERE game_id IN ("
-                        + ",".join("?" for _ in deleting)
-                        + ")",
+                        "SELECT game_id,relative_path FROM vision_models WHERE game_id IN (" + placeholders + ")",
                         tuple(sorted(deleting)),
                     ),
                     64,
-                ) if deleting else ():
+                ):
                     relative = Path(str(row["relative_path"]))
                     paths.add(relative)
                     paths.add(Path(str(relative) + ".json"))
@@ -22193,17 +22456,14 @@ class DataStoreGameTaskMixin:
             ):
                 if not deleting or not self._table_exists(table):
                     continue
-                query = (
-                    "SELECT game_id," + column + " AS payload FROM " + table + " WHERE game_id IN ("
-                    + ",".join("?" for _ in deleting)
-                    + ")"
-                )
+                placeholders = ",".join("?" for _ in deleting)
+                query = "SELECT game_id," + column + " AS payload FROM " + table + " WHERE game_id IN (" + placeholders + ")"
                 for row in iter_rows(self.db.execute(query, tuple(sorted(deleting))), 128):
                     try:
-                        value = json.loads(str(row["payload"]))
+                        parsed = json.loads(str(row["payload"]))
                     except RECOVERABLE_ERRORS:
                         continue
-                    paths.update(self._collect_relative_paths_from_value(value))
+                    paths.update(self._collect_relative_paths_from_value(parsed))
         paths.difference_update(other_tensor_paths)
         paths.update(target_tensor_paths - other_tensor_paths)
         for game_id in deleting:
@@ -22220,30 +22480,48 @@ class DataStoreGameTaskMixin:
                     try:
                         paths.add(candidate.relative_to(self.base))
                     except ValueError:
-                        continue
-        pruned_roots = {".trash", "runtime", "project", "backups", "quarantine", "runtime.current"}
-        for root, directories, files in os.walk(self.base):
-            root_path = Path(root)
-            relative_root = root_path.relative_to(self.base)
-            directories[:] = [
-                name
-                for name in directories
-                if name not in pruned_roots
-                and not name.startswith("runtime.staging.")
-                and not is_reparse_point(root_path / name)
-            ]
-            names = list(directories) + list(files)
-            for name in names:
-                candidate = root_path / name
+                        pass
+        for managed_root in self._managed_payload_roots():
+            if managed_root.is_file():
+                candidates = [managed_root]
+            else:
+                candidates = [managed_root]
+                candidates.extend(path for path in managed_root.rglob("*") if not is_reparse_point(path))
+            for candidate in candidates:
                 try:
                     relative = candidate.relative_to(self.base)
                 except ValueError:
                     continue
-                folded = relative.as_posix().casefold()
-                if any(token in folded for token in tokens):
+                folded_path = relative.as_posix().casefold()
+                if any(token in folded_path for token in tokens):
                     paths.add(relative)
+                    continue
+                if candidate.is_dir():
+                    continue
+                if self._backup_contains_deleted_game(candidate, value):
+                    recovery_root = next(
+                        (
+                            parent
+                            for parent in candidate.parents
+                            if parent.parent == self.base and parent.name.startswith("recovery_")
+                        ),
+                        None,
+                    )
+                    paths.add((recovery_root or candidate).relative_to(self.base))
+                    continue
+                try:
+                    size = candidate.stat().st_size
+                    if size <= 64 * 1024 * 1024:
+                        raw = candidate.read_bytes()
+                        text = raw.decode("utf-8", "ignore")
+                        if self._payload_contains_deletion_token(text, value):
+                            paths.add(relative)
+                except RECOVERABLE_ERRORS:
+                    continue
         resolved = []
         for relative in paths:
+            if not self._managed_game_asset_relative_path(relative):
+                continue
             try:
                 candidate = self._safe_asset_path(relative)
             except RECOVERABLE_ERRORS as error:
@@ -22255,7 +22533,7 @@ class DataStoreGameTaskMixin:
                     metadata = Path(str(candidate) + ".json")
                     if metadata.exists():
                         resolved.append(metadata)
-        unique = sorted(set(resolved), key=lambda value: (len(value.parts), str(value).casefold()))
+        unique = sorted(set(resolved), key=lambda item: (len(item.parts), str(item).casefold()))
         collapsed = []
         for candidate in unique:
             if any(candidate.is_relative_to(parent) for parent in collapsed):
@@ -22263,13 +22541,13 @@ class DataStoreGameTaskMixin:
             collapsed.append(candidate)
         return collapsed
 
-    def _stage_game_assets(self, game_ids):
+    def _stage_game_assets(self, descriptor):
         transaction_id = uuid.uuid4().hex
         transaction_root = self.base / ".trash" / transaction_id
         files_root = transaction_root / "files"
         moved = []
         try:
-            for source in self._collect_game_asset_paths(game_ids):
+            for source in self._collect_game_asset_paths(descriptor):
                 relative = source.relative_to(self.base)
                 destination = files_root / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -22277,9 +22555,11 @@ class DataStoreGameTaskMixin:
                 moved.append((source, destination))
             manifest = {
                 "transaction_id": transaction_id,
-                "game_ids": sorted(str(value) for value in game_ids),
                 "created": time.time(),
-                "moved": [source.relative_to(self.base).as_posix() for source, _ in moved],
+                "token_digest": hashlib.sha256(
+                    canonical_bytes(sorted(descriptor.get("opaque_tokens", set())))
+                ).hexdigest(),
+                "moved_count": len(moved),
             }
             transaction_root.mkdir(parents=True, exist_ok=True)
             durable_atomic_write(
@@ -22297,6 +22577,11 @@ class DataStoreGameTaskMixin:
         for source, destination in reversed(list(staged.get("moved", []))):
             try:
                 if destination.exists():
+                    if source.exists():
+                        if source.is_dir():
+                            shutil.rmtree(source)
+                        else:
+                            source.unlink()
                     source.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(destination, source)
             except RECOVERABLE_ERRORS as error:
@@ -22316,21 +22601,30 @@ class DataStoreGameTaskMixin:
         root = staged.get("root")
         if not root:
             return True
+        deadline = time.monotonic() + 4.0
+        last_error = None
+        while root.exists() and time.monotonic() < deadline:
+            try:
+                shutil.rmtree(root)
+            except FileNotFoundError:
+                break
+            except RECOVERABLE_ERRORS as error:
+                last_error = error
+                for candidate in root.rglob("*"):
+                    try:
+                        os.chmod(candidate, 0o700)
+                    except RECOVERABLE_ERRORS:
+                        pass
+                time.sleep(0.05)
+        if root.exists():
+            raise StorageError("无法彻底删除游戏暂存数据：" + str(last_error or root))
+        parent = root.parent
         try:
-            shutil.rmtree(root)
-            parent = root.parent
             if parent.is_dir() and not any(parent.iterdir()):
                 parent.rmdir()
-            return True
-        except FileNotFoundError:
-            return True
-        except RECOVERABLE_ERRORS as error:
-            self.logger.write(
-                "GAME_TRASH_PURGE_DEFERRED",
-                error,
-                details={"transaction_id": str(staged.get("transaction_id", "")), "path": str(root)},
-            )
-            return False
+        except RECOVERABLE_ERRORS:
+            pass
+        return True
 
     def recover_game_trash_transactions(self):
         trash = self.base / ".trash"
@@ -22339,103 +22633,75 @@ class DataStoreGameTaskMixin:
         result = {"restored": 0, "purged": 0, "failed": 0}
         for transaction_root in sorted(path for path in trash.iterdir() if path.is_dir()):
             files_root = transaction_root / "files"
-            manifest_path = transaction_root / "manifest.json"
-            manifest = {}
-            try:
-                if manifest_path.is_file():
-                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    if not isinstance(manifest, dict):
-                        manifest = {}
-            except RECOVERABLE_ERRORS as error:
-                self.logger.write(
-                    "GAME_TRASH_MANIFEST_INVALID",
-                    error,
-                    details={"path": str(manifest_path)},
-                )
-                manifest = {}
-            game_ids = {
-                str(value)
-                for value in manifest.get("game_ids", [])
-                if str(value)
-            }
-            with self.lock:
-                existing = {
-                    str(row[0])
-                    for row in self.db.execute(
-                        "SELECT id FROM games WHERE id IN ("
-                        + ",".join("?" for _ in game_ids)
-                        + ")",
-                        tuple(sorted(game_ids)),
-                    )
-                } if game_ids else set()
-            should_restore = not game_ids or bool(existing)
-            if not should_restore:
-                if self._purge_staged_game_assets(
-                    {
-                        "root": transaction_root,
-                        "transaction_id": transaction_root.name,
-                        "moved": [],
-                    }
-                ):
-                    result["purged"] += 1
-                else:
-                    result["failed"] += 1
-                continue
             moved = []
             if files_root.is_dir():
-                for destination in sorted(
-                    (path for path in files_root.rglob("*") if path.is_file()),
-                    key=lambda value: len(value.parts),
-                ):
+                for destination in sorted((path for path in files_root.rglob("*") if path.is_file()), key=lambda item: len(item.parts)):
                     relative = destination.relative_to(files_root)
                     source = self._safe_asset_path(relative)
                     moved.append((source, destination))
-                for destination in sorted(
-                    (path for path in files_root.rglob("*") if path.is_dir()),
-                    key=lambda value: len(value.parts),
-                ):
-                    if any(child.is_relative_to(destination) for _, child in moved):
-                        continue
-                    relative = destination.relative_to(files_root)
-                    source = self._safe_asset_path(relative)
-                    moved.append((source, destination))
-            conflicts = []
-            restorable = []
-            for source, destination in moved:
-                if source.exists():
-                    conflicts.append(str(source))
-                else:
-                    restorable.append((source, destination))
+            conflicts = [str(source) for source, _ in moved if source.exists()]
             if conflicts:
-                result["failed"] += 1
-                self.logger.write(
-                    "GAME_TRASH_RECOVERY_CONFLICT",
-                    RuntimeError("恢复目标已存在"),
-                    details={"transaction_id": transaction_root.name, "paths": conflicts[:64]},
-                )
+                try:
+                    self._purge_staged_game_assets({"root": transaction_root, "transaction_id": transaction_root.name})
+                    result["purged"] += 1
+                except RECOVERABLE_ERRORS as error:
+                    result["failed"] += 1
+                    self.logger.write("GAME_TRASH_PURGE_FAILED", error, details={"transaction_id": transaction_root.name})
                 continue
             try:
-                self._restore_staged_game_assets(
-                    {
-                        "root": transaction_root,
-                        "transaction_id": transaction_root.name,
-                        "moved": restorable,
-                    }
-                )
+                self._restore_staged_game_assets({"root": transaction_root, "moved": moved})
                 result["restored"] += 1
             except RECOVERABLE_ERRORS as error:
                 result["failed"] += 1
-                self.logger.write(
-                    "GAME_TRASH_RECOVERY_FAILED",
-                    error,
-                    details={"transaction_id": transaction_root.name},
-                )
+                self.logger.write("GAME_TRASH_RECOVERY_FAILED", error, details={"transaction_id": transaction_root.name})
         try:
             if trash.is_dir() and not any(trash.iterdir()):
                 trash.rmdir()
-        except RECOVERABLE_ERRORS as error:
-            self.logger.write("GAME_TRASH_ROOT_CLEANUP_FAILED", error)
+        except RECOVERABLE_ERRORS:
+            pass
         return result
+
+    def _delete_database_payload_references(self, descriptor):
+        tables = [
+            str(row[0])
+            for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+            if str(row[0]) not in {"games"}
+        ]
+        deleted_rows = 0
+        for table in tables:
+            columns = list(self.db.execute("PRAGMA table_info(" + table + ")"))
+            text_columns = [
+                str(row[1])
+                for row in columns
+                if any(token in str(row[2]).upper() for token in ("TEXT", "CHAR", "CLOB"))
+            ]
+            if not text_columns:
+                continue
+            try:
+                rows = list(self.db.execute("SELECT rowid AS _ugai_rowid_,* FROM " + table))
+            except sqlite3.Error:
+                continue
+            for row in rows:
+                if table == "meta" and str(row["key"]) in {
+                    "schema_version",
+                    "legacy_migrated",
+                    "legacy_cleanup_pending",
+                    "legacy_invalid_rows",
+                    "integrity_startup_generation",
+                }:
+                    continue
+                if any(self._payload_contains_deletion_token(row[column], descriptor) for column in text_columns):
+                    self.db.execute("DELETE FROM " + table + " WHERE rowid=?", (safe_int(row["_ugai_rowid_"], 0),))
+                    deleted_rows += 1
+        return deleted_rows
+
+    def _secure_compact_after_deletion(self):
+        with self.lock:
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self.db.execute("PRAGMA secure_delete=ON")
+            self.db.execute("VACUUM")
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return True
 
     def games(self):
         with self.lock:
@@ -22486,6 +22752,7 @@ class DataStoreGameTaskMixin:
         with self.lock:
             existing = {str(row[0]) for row in self.db.execute("SELECT id FROM games")}
         deleting = existing - keep
+        descriptor = self._game_deletion_descriptor(deleting)
         with self.pending_lock:
             self.blocked_game_ids.update(deleting)
             removed_pending = [item for item in self.pending_samples if item.get("gid") in deleting]
@@ -22498,24 +22765,16 @@ class DataStoreGameTaskMixin:
                     self._notify_writer_error(None)
             self.writer_condition.notify_all()
         staged = None
+        deleted_references = 0
         try:
             self.sample_write_barrier()
-            staged = (
-                self._stage_game_assets(deleting)
-                if deleting
-                else {"moved": [], "root": None, "transaction_id": ""}
-            )
+            staged = self._stage_game_assets(descriptor) if deleting else {"moved": [], "root": None, "transaction_id": ""}
             try:
                 with self.critical_transaction():
-                    self.db.execute(
-                        "INSERT INTO config_backups(created,payload) VALUES(?,?)",
-                        (time.time(), json.dumps(self._config_snapshot(), ensure_ascii=False, separators=(",", ":"))),
-                    )
-                    self.db.execute(
-                        "DELETE FROM config_backups WHERE id NOT IN (SELECT id FROM config_backups ORDER BY id DESC LIMIT 5)"
-                    )
                     for gid in deleting:
                         self.db.execute("DELETE FROM games WHERE id=?", (gid,))
+                    if deleting:
+                        deleted_references = self._delete_database_payload_references(descriptor)
                     for item in cleaned:
                         self.db.execute(
                             "INSERT INTO games(id,name,created,needs_review,last_review) VALUES(?,?,?,?,?) "
@@ -22526,15 +22785,21 @@ class DataStoreGameTaskMixin:
                     if selected_id is None:
                         self.db.execute("DELETE FROM meta WHERE key='selected_game'")
                     else:
-                        self.db.execute(
-                            "INSERT OR REPLACE INTO meta(key,value) VALUES('selected_game',?)",
-                            (selected_id,),
-                        )
+                        self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('selected_game',?)", (selected_id,))
+                    snapshot = json.dumps(self._config_snapshot(), ensure_ascii=False, separators=(",", ":"))
+                    if deleting and self._payload_contains_deletion_token(snapshot, descriptor):
+                        raise StorageError("删除后的配置快照仍包含目标游戏")
+                    self.db.execute("INSERT INTO config_backups(created,payload) VALUES(?,?)", (time.time(), snapshot))
+                    self.db.execute(
+                        "DELETE FROM config_backups WHERE id NOT IN (SELECT id FROM config_backups ORDER BY id DESC LIMIT 5)"
+                    )
             except RECOVERABLE_ERRORS:
                 if staged is not None:
                     self._restore_staged_game_assets(staged)
                 raise
-            trash_removed = self._purge_staged_game_assets(staged) if staged is not None else True
+            self._purge_staged_game_assets(staged)
+            if deleting:
+                self._secure_compact_after_deletion()
             for gid in deleting:
                 self.model_cache.pop(gid, None)
                 self._invalidate_sample_caches(gid)
@@ -22542,7 +22807,8 @@ class DataStoreGameTaskMixin:
                 "deleted_games": sorted(deleting),
                 "discarded_pending_samples": len(removed_pending),
                 "deleted_asset_count": len(staged.get("moved", [])) if staged else 0,
-                "trash_removed": bool(trash_removed),
+                "deleted_reference_rows": deleted_references,
+                "trash_removed": True,
                 "selected_game": selected_id,
             }
         finally:
@@ -25700,6 +25966,154 @@ class DataStoreOCRVisionMixin:
         return {"updated": updated, "legacy_rgb_converted": legacy, "manifest": manifest}
 
 
+def expected_database_schema_catalog():
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    holder = type("SchemaHolder", (), {"db": connection})()
+    DataStoreLifecycleMixin._create_latest_schema(holder)
+    connection.commit()
+    result = {}
+    for row in connection.execute(
+        "SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ):
+        name = str(row["name"])
+        result[name] = {
+            "sql": str(row["sql"] or ""),
+            "columns": [str(item[1]) for item in connection.execute("PRAGMA table_info(" + name + ")")],
+        }
+    indexes = [
+        str(row[0])
+        for row in connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name"
+        )
+    ]
+    connection.close()
+    return {"tables": result, "indexes": indexes}
+
+
+def database_schema_mismatches(connection):
+    expected = expected_database_schema_catalog()["tables"]
+    actual_tables = {
+        str(row[0])
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    }
+    result = []
+    for table, record in expected.items():
+        if table not in actual_tables:
+            result.append({"table": table, "reason": "missing_table"})
+            continue
+        actual_columns = [str(row[1]) for row in connection.execute("PRAGMA table_info(" + table + ")")]
+        if actual_columns != record["columns"]:
+            result.append(
+                {
+                    "table": table,
+                    "reason": "column_mismatch",
+                    "expected": record["columns"],
+                    "actual": actual_columns,
+                }
+            )
+    return result
+
+
+def rebuild_database_atomically(base, db_path, reason="schema_or_integrity_repair"):
+    root = Path(base).resolve()
+    target = Path(db_path).resolve()
+    temporary = root / (".database.rebuild." + uuid.uuid4().hex + ".db")
+    catalog = expected_database_schema_catalog()
+    new_connection = sqlite3.connect(str(temporary), timeout=10.0)
+    new_connection.row_factory = sqlite3.Row
+    new_connection.execute("PRAGMA foreign_keys=OFF")
+    holder = type("SchemaHolder", (), {"db": new_connection})()
+    DataStoreLifecycleMixin._create_latest_schema(holder)
+    copied = {}
+    source_attached = False
+    if target.is_file():
+        try:
+            new_connection.execute("ATTACH DATABASE ? AS source_db", (str(target),))
+            source_attached = True
+            source_tables = {
+                str(row[0])
+                for row in new_connection.execute(
+                    "SELECT name FROM source_db.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            for table, record in catalog["tables"].items():
+                if table not in source_tables:
+                    continue
+                source_columns = {
+                    str(row[1])
+                    for row in new_connection.execute("PRAGMA source_db.table_info(" + table + ")")
+                }
+                columns = [name for name in record["columns"] if name in source_columns]
+                if not columns:
+                    continue
+                quoted = ",".join('"' + name.replace('"', '""') + '"' for name in columns)
+                try:
+                    table_name = '"' + table.replace('"', '""') + '"'
+                    cursor = new_connection.execute(
+                        "INSERT OR IGNORE INTO main." + table_name + "(" + quoted + ") "
+                        "SELECT " + quoted + " FROM source_db." + table_name
+                    )
+                    copied[table] = max(0, safe_int(cursor.rowcount, 0))
+                except sqlite3.Error:
+                    copied[table] = 0
+        except sqlite3.Error:
+            source_attached = False
+    new_connection.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",
+        (str(DATABASE_SCHEMA_VERSION),),
+    )
+    new_connection.commit()
+    if source_attached:
+        try:
+            new_connection.execute("DETACH DATABASE source_db")
+        except sqlite3.Error:
+            pass
+    check = new_connection.execute("PRAGMA quick_check").fetchone()
+    if not check or str(check[0]).casefold() != "ok":
+        new_connection.close()
+        temporary.unlink(missing_ok=True)
+        raise StorageError("重建后的数据库完整性检查失败")
+    new_connection.close()
+    quarantine_root = root / "quarantine" / "database_recovery" / uuid.uuid4().hex
+    moved = []
+    try:
+        if target.exists():
+            quarantine_root.mkdir(parents=True, exist_ok=True)
+            for suffix in ("", "-wal", "-shm"):
+                source = Path(str(target) + suffix)
+                if source.exists():
+                    destination = quarantine_root / source.name
+                    os.replace(source, destination)
+                    moved.append((source, destination))
+            durable_atomic_write(
+                quarantine_root / "manifest.json",
+                json.dumps(
+                    {
+                        "created": time.time(),
+                        "reason": str(reason),
+                        "copied": copied,
+                        "created_generation": managed_startup_generation(root),
+                        "release_generation": managed_startup_generation(root) + 1,
+                        "delete_after_startup_generation": True,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                root,
+            )
+        os.replace(temporary, target)
+    except RECOVERABLE_ERRORS:
+        temporary.unlink(missing_ok=True)
+        if not target.exists():
+            for source, destination in reversed(moved):
+                if destination.exists():
+                    os.replace(destination, source)
+        raise
+    return {"reason": str(reason), "copied": copied, "quarantine": str(quarantine_root) if moved else ""}
+
+
 class DataStore(
     DataStoreLifecycleMixin,
     DataStoreGameTaskMixin,
@@ -25747,6 +26161,7 @@ class DataStore(
         self.writer_thread = None
         self.writer_db = None
         self.db = ThreadLocalSQLite(self.db_path, False)
+        self.database_repair = None
         try:
             wal_mode = str(self.db.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
             if wal_mode != "wal":
@@ -25757,27 +26172,43 @@ class DataStore(
         except RECOVERABLE_ERRORS as error:
             try:
                 self.db.close()
-            except RECOVERABLE_ERRORS as error:
-                record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
-            self.corrupt_backup = self.create_recovery_backup("quick_check_failed")
-            self.db = ThreadLocalSQLite(self.db_path, True)
-            self.read_only = True
-            self.read_only_reason = (
-                "数据库quick_check失败，已只读打开；恢复备份：" + str(self.corrupt_backup) + "；" + str(error)
-            )
-            self.game_repository = GameRepository(self)
-            self.sample_repository = SampleRepository(self)
-            self.model_repository = ModelRepository(self)
-            self.task_repository = TaskRepository(self)
-            self.calibration_repository = CalibrationRepository(self)
-            self.capture_calibration_repository = self.calibration_repository
-            self.ocr_region_repository = OCRRegionRepository(self)
-            self.migration_service = MigrationService(self)
-            self.recovery_repository = RecoveryRepository(self)
-            self.recovery_service = self.recovery_repository
-            return
-        self._initialize_schema()
+            except RECOVERABLE_ERRORS as close_error:
+                record_cleanup_error("DATABASE_CLOSE_BEFORE_REPAIR_FAILED", close_error)
+            self.database_repair = rebuild_database_atomically(self.base, self.db_path, "quick_check_failed:" + str(error))
+            self.corrupt_backup = self.database_repair.get("quarantine") or None
+            self.db = ThreadLocalSQLite(self.db_path, False)
+            wal_mode = str(self.db.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
+            if wal_mode != "wal":
+                raise RuntimeError("数据库修复后无法启用SQLite WAL，实际模式为" + wal_mode)
+        try:
+            self._initialize_schema()
+            schema_mismatches = database_schema_mismatches(self.db.current())
+            if schema_mismatches:
+                raise StorageError("数据库结构不匹配：" + json.dumps(schema_mismatches, ensure_ascii=False, separators=(",", ":")))
+        except RECOVERABLE_ERRORS as error:
+            try:
+                self.db.close()
+            except RECOVERABLE_ERRORS as close_error:
+                record_cleanup_error("DATABASE_CLOSE_BEFORE_SCHEMA_REPAIR_FAILED", close_error)
+            self.database_repair = rebuild_database_atomically(self.base, self.db_path, "schema_failed:" + str(error))
+            self.corrupt_backup = self.database_repair.get("quarantine") or self.corrupt_backup
+            self.db = ThreadLocalSQLite(self.db_path, False)
+            wal_mode = str(self.db.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
+            if wal_mode != "wal":
+                raise RuntimeError("数据库结构修复后无法启用SQLite WAL，实际模式为" + wal_mode)
+            self._initialize_schema()
+            schema_mismatches = database_schema_mismatches(self.db.current())
+            if schema_mismatches:
+                raise StorageError("数据库结构原子恢复失败")
         self._migrate_legacy()
+        with self.lock, self.db:
+            row = self.db.execute("SELECT value FROM meta WHERE key='managed_startup_generation'").fetchone()
+            previous_generation = safe_int(row[0], 0) if row else 0
+            self.startup_generation = previous_generation + 1
+            self.db.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('managed_startup_generation',?)",
+                (str(self.startup_generation),),
+            )
         self.recover_game_trash_transactions()
         mode = str(self.db.execute("PRAGMA journal_mode").fetchone()[0]).lower()
         if mode != "wal":
@@ -25976,8 +26407,11 @@ class GameSelectionDialog:
             undo_button.pack(side="left", padx=6)
         actions = ttk.Frame(frame)
         actions.pack(fill="x")
-        ttk.Button(actions, text="确认", command=confirm).pack(side="right", padx=(6, 0))
-        win.protocol("WM_DELETE_WINDOW", refuse_close)
+        cancel = lambda: app.close_dialog(win, state)
+        ttk.Button(actions, text="取消", command=cancel).pack(side="right")
+        ttk.Button(actions, text="确认", command=confirm).pack(side="right", padx=(0, 8))
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        win.bind("<Escape>", lambda event: cancel())
         refresh()
         win.wait_visibility()
         box.focus_set()
@@ -26140,7 +26574,8 @@ class WindowSelectionController:
         if self.app.developer_mode:
             self.widgets["refresh"] = ttk.Button(tools, text="刷新", command=self.refresh)
             self.widgets["refresh"].pack(side="left")
-        ttk.Button(tools, text="确认", command=self.confirm).pack(side="right", padx=(6, 0))
+        ttk.Button(tools, text="取消", command=self.cancel).pack(side="right")
+        ttk.Button(tools, text="确认", command=self.confirm).pack(side="right", padx=(0, 8))
 
     def _bind_events(self):
         if self.app.developer_mode:
@@ -26148,7 +26583,11 @@ class WindowSelectionController:
             self.canvas.bind("<B1-Motion>", self.drag)
             self.canvas.bind("<ButtonRelease-1>", self.release)
         self.box.bind("<<ListboxSelect>>", self.prepare_selection)
-        self.win.protocol("WM_DELETE_WINDOW", self.refuse_close)
+        self.win.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.win.bind("<Escape>", lambda event: self.cancel())
+
+    def cancel(self):
+        self.app.close_dialog(self.win, self.state)
 
     @staticmethod
     def _photo_image(rgb):
@@ -26423,7 +26862,7 @@ class WindowSelectionController:
             "window_rule_version": WINDOW_RULE_VERSION,
         }
 
-    def _commit_selection(self, item, source_mode, rect):
+    def _base_commit_selection_strict(self, item, source_mode, rect):
         previous = self.app.selected_window
         clear_runtime_isolation()
         self.app.window_generation += 1
@@ -26451,6 +26890,9 @@ class WindowSelectionController:
         )
         self.app.status.set(message)
         self.app.close_dialog(self.win, self.state)
+
+    def _commit_selection(self, item, source_mode, rect):
+        return _strict_window_commit(self, item, source_mode, rect)
 
     @staticmethod
     def _identity_payload(item):
@@ -26990,70 +27432,131 @@ def numeric_values_equal(first, second):
     return abs(a - b) <= tolerance
 
 
-def _numeric_change_magnitude(before, now):
-    return min(1.0, abs(now - before) / max(1.0, abs(before), abs(now)))
+def _numeric_scale(*values):
+    finite = [abs(safe_float(value)) for value in values if finite_number(value)]
+    return max([1.0, *finite])
 
 
-def _metric_preference_reward(before_metric, now_metric, higher_is_better):
+def _bounded_utility(value, scale, higher_is_better=True):
+    if not finite_number(value):
+        return None
+    normalized = math.tanh(safe_float(value) / max(1e-9, safe_float(scale, 1.0)))
+    return normalized if higher_is_better else -normalized
+
+
+def _utility_difference(before_metric, now_metric, higher_is_better=True, scale=None):
     if not finite_number(before_metric) or not finite_number(now_metric):
-        return 0.0
-    before_value = safe_float(before_metric)
-    now_value = safe_float(now_metric)
-    tolerance = max(1e-6, max(abs(before_value), abs(now_value), 1.0) * 0.0005)
-    difference = now_value - before_value
-    if abs(difference) <= tolerance:
-        return 0.0
-    magnitude = min(1.0, abs(difference) / max(1.0, abs(before_value), abs(now_value)))
-    direction = 1.0 if difference > 0 else -1.0
-    return magnitude * direction * (1.0 if higher_is_better else -1.0)
+        return {"valid": False, "reward": 0.0, "status": "invalid_metric"}
+    selected_scale = _numeric_scale(before_metric, now_metric) if scale is None else max(1e-9, safe_float(scale, 1.0))
+    before_utility = _bounded_utility(before_metric, selected_scale, higher_is_better)
+    now_utility = _bounded_utility(now_metric, selected_scale, higher_is_better)
+    reward = max(-1.0, min(1.0, safe_float(now_utility) - safe_float(before_utility)))
+    return {
+        "valid": True,
+        "reward": reward,
+        "status": "utility_delta",
+        "before_metric": safe_float(before_metric),
+        "now_metric": safe_float(now_metric),
+        "before_utility": safe_float(before_utility),
+        "now_utility": safe_float(now_utility),
+        "scale": selected_scale,
+    }
 
 
-def evaluate_numeric_preference(region, old_value, new_value, before_snapshot, now_snapshot):
+def evaluate_numeric_preference_detailed(region, old_value, new_value, before_snapshot, now_snapshot):
     old = numeric_snapshot_value(old_value)
     new = numeric_snapshot_value(new_value)
     if old is None or new is None:
-        return 0.0
+        return {"valid": False, "reward": 0.0, "status": "invalid_snapshot"}
     config = normalize_relation_config(region.get("relation_config", {}))
     relation = normalize_numeric_preference(
         config.get("preference", region.get("goal_relation", NumericPreference.KEEP_SAME.value))
     )
     delta = new - old
     tolerance = max(1e-6, max(abs(old), abs(new), 1.0) * 0.0005)
-    magnitude = _numeric_change_magnitude(old, new)
+    scale = _numeric_scale(old, new)
+    result = {"valid": True, "reward": 0.0, "status": "neutral", "preference": relation}
     if relation == NumericPreference.KEEP_SAME.value:
-        return -magnitude if abs(delta) > tolerance else 0.0
+        result.update(_utility_difference(abs(delta), 0.0, True, scale))
+        result["status"] = "keep_same"
+        return result
     if relation == NumericPreference.NOW_HIGHER.value:
-        return _metric_preference_reward(old, new, True)
+        result.update(_utility_difference(old, new, True, scale))
+        return result
     if relation == NumericPreference.NOW_LOWER.value:
-        return _metric_preference_reward(old, new, False)
-    if relation == NumericPreference.POSITIVE_DELTA_HIGHER.value:
-        return magnitude if delta > tolerance else -magnitude
-    if relation == NumericPreference.POSITIVE_DELTA_LOWER.value:
-        return max(0.0, 1.0 - magnitude) if delta > tolerance else -magnitude
-    if relation == NumericPreference.NEGATIVE_DELTA_HIGHER.value:
-        return magnitude if delta < -tolerance else -magnitude
-    if relation == NumericPreference.NEGATIVE_DELTA_LOWER.value:
-        return max(0.0, 1.0 - magnitude) if delta < -tolerance else -magnitude
-    if relation == NumericPreference.ABS_DELTA_HIGHER.value:
-        return magnitude if abs(delta) > tolerance else 0.0
-    if relation == NumericPreference.ABS_DELTA_LOWER.value:
-        return max(0.0, 1.0 - magnitude) if abs(delta) > tolerance else 0.0
+        result.update(_utility_difference(old, new, False, scale))
+        return result
+    if relation in {
+        NumericPreference.POSITIVE_DELTA_HIGHER.value,
+        NumericPreference.POSITIVE_DELTA_LOWER.value,
+    }:
+        if delta <= tolerance:
+            return {"valid": False, "reward": -1.0, "status": "positive_delta_condition_failed", "preference": relation}
+        result.update(
+            _utility_difference(
+                0.0,
+                delta,
+                relation == NumericPreference.POSITIVE_DELTA_HIGHER.value,
+                scale,
+            )
+        )
+        result["status"] = "positive_delta"
+        return result
+    if relation in {
+        NumericPreference.NEGATIVE_DELTA_HIGHER.value,
+        NumericPreference.NEGATIVE_DELTA_LOWER.value,
+    }:
+        decrease = old - new
+        if decrease <= tolerance:
+            return {"valid": False, "reward": -1.0, "status": "negative_delta_condition_failed", "preference": relation}
+        result.update(
+            _utility_difference(
+                0.0,
+                decrease,
+                relation == NumericPreference.NEGATIVE_DELTA_HIGHER.value,
+                scale,
+            )
+        )
+        result["status"] = "negative_delta"
+        return result
+    if relation in {
+        NumericPreference.ABS_DELTA_HIGHER.value,
+        NumericPreference.ABS_DELTA_LOWER.value,
+    }:
+        magnitude = abs(delta)
+        if magnitude <= tolerance:
+            return {"valid": False, "reward": -1.0, "status": "absolute_delta_condition_failed", "preference": relation}
+        result.update(
+            _utility_difference(
+                0.0,
+                magnitude,
+                relation == NumericPreference.ABS_DELTA_HIGHER.value,
+                scale,
+            )
+        )
+        result["status"] = "absolute_delta"
+        return result
     if relation in NUMERIC_FIXED_VALUE_RELATIONS:
         fixed_value = config.get("fixed_value")
         if not finite_number(fixed_value):
-            return 0.0
+            return {"valid": False, "reward": -1.0, "status": "fixed_value_missing", "preference": relation}
         fixed = safe_float(fixed_value)
-        return _metric_preference_reward(
-            abs(old - fixed),
-            abs(new - fixed),
-            relation == NumericPreference.FIXED_DISTANCE_HIGHER.value,
+        result.update(
+            _utility_difference(
+                abs(old - fixed),
+                abs(new - fixed),
+                relation == NumericPreference.FIXED_DISTANCE_HIGHER.value,
+                _numeric_scale(old, new, fixed),
+            )
         )
+        result["status"] = "fixed_distance"
+        return result
     if relation in NUMERIC_COMPARISON_RELATIONS:
         target_id = str(config.get("compare_region_id", ""))
         old_target = numeric_snapshot_value(before_snapshot.get(target_id))
         new_target = numeric_snapshot_value(now_snapshot.get(target_id))
         if not target_id or old_target is None or new_target is None:
-            return 0.0
+            return {"valid": False, "reward": -1.0, "status": "comparison_region_unavailable", "preference": relation}
         before_metric = old - old_target
         now_metric = new - new_target
         if relation in {
@@ -27062,18 +27565,32 @@ def evaluate_numeric_preference(region, old_value, new_value, before_snapshot, n
         }:
             before_metric = abs(before_metric)
             now_metric = abs(now_metric)
-        return _metric_preference_reward(
-            before_metric,
-            now_metric,
-            relation in {
-                NumericPreference.REGION_DIFF_HIGHER.value,
-                NumericPreference.REGION_ABS_DIFF_HIGHER.value,
-            },
+        result.update(
+            _utility_difference(
+                before_metric,
+                now_metric,
+                relation in {
+                    NumericPreference.REGION_DIFF_HIGHER.value,
+                    NumericPreference.REGION_ABS_DIFF_HIGHER.value,
+                },
+                _numeric_scale(old, new, old_target, new_target),
+            )
         )
-    return 0.0
+        result["status"] = "region_comparison"
+        result["compare_region_id"] = target_id
+        return result
+    return {"valid": False, "reward": -1.0, "status": "unsupported_preference", "preference": relation}
 
 
-def compare_numeric_snapshots_detailed(regions, before, now):
+def evaluate_numeric_preference(region, old_value, new_value, before_snapshot, now_snapshot):
+    return safe_float(
+        evaluate_numeric_preference_detailed(region, old_value, new_value, before_snapshot, now_snapshot).get("reward"),
+        0.0,
+        -1.0,
+        1.0,
+    )
+
+def select_numeric_priority_difference(regions, before, now):
     before_snapshot = dict(before) if isinstance(before, dict) else {}
     now_snapshot = dict(now) if isinstance(now, dict) else {}
     ordered = sorted(
@@ -27092,32 +27609,65 @@ def compare_numeric_snapshots_detailed(regions, before, now):
         new_number = numeric_snapshot_value(new_value)
         if old_number is None or new_number is None:
             return {
-                "reward": 0.0,
-                "winning_region_id": "",
                 "status": "unreadable_or_recovered",
+                "region": region,
+                "region_id": region_id,
                 "priority": safe_int(region.get("priority"), 0),
+                "old_value": old_value,
+                "new_value": new_value,
+                "before_snapshot": before_snapshot,
+                "now_snapshot": now_snapshot,
             }
-        if numeric_values_equal(old_value, new_value):
-            continue
-        reward = max(
-            -1.0,
-            min(1.0, evaluate_numeric_preference(region, old_value, new_value, before_snapshot, now_snapshot)),
-        )
-        return {
-            "reward": reward,
-            "winning_region_id": region_id,
-            "status": "lexicographic_difference",
-            "priority": safe_int(region.get("priority"), 0),
-            "before": old_number,
-            "now": new_number,
-            "preference": normalize_numeric_preference(
-                normalize_relation_config(region.get("relation_config", {})).get(
-                    "preference", region.get("goal_relation", NumericPreference.KEEP_SAME.value)
-                )
-            ),
-        }
-    return {"reward": 0.0, "winning_region_id": "", "status": "all_equal", "priority": None}
+        if not numeric_values_equal(old_value, new_value):
+            return {
+                "status": "difference_selected",
+                "region": region,
+                "region_id": region_id,
+                "priority": safe_int(region.get("priority"), 0),
+                "old_value": old_value,
+                "new_value": new_value,
+                "before": old_number,
+                "now": new_number,
+                "before_snapshot": before_snapshot,
+                "now_snapshot": now_snapshot,
+            }
+    return {
+        "status": "all_equal",
+        "region": None,
+        "region_id": "",
+        "priority": None,
+        "before_snapshot": before_snapshot,
+        "now_snapshot": now_snapshot,
+    }
 
+
+def compare_numeric_snapshots_detailed(regions, before, now):
+    selected = select_numeric_priority_difference(regions, before, now)
+    if selected.get("status") != "difference_selected":
+        return {
+            "reward": 0.0,
+            "winning_region_id": "",
+            "status": str(selected.get("status", "all_equal")),
+            "priority": selected.get("priority"),
+        }
+    evaluation = evaluate_numeric_preference_detailed(
+        selected["region"],
+        selected["old_value"],
+        selected["new_value"],
+        selected["before_snapshot"],
+        selected["now_snapshot"],
+    )
+    return {
+        "reward": max(-1.0, min(1.0, safe_float(evaluation.get("reward"), 0.0))),
+        "winning_region_id": selected["region_id"],
+        "status": str(evaluation.get("status", "utility_delta")),
+        "priority": selected["priority"],
+        "before": selected["before"],
+        "now": selected["now"],
+        "preference": str(evaluation.get("preference", "")),
+        "valid": bool(evaluation.get("valid")),
+        "utility": evaluation,
+    }
 
 def compare_numeric_snapshots(regions, before, now):
     return safe_float(compare_numeric_snapshots_detailed(regions, before, now).get("reward"), 0.0, -1.0, 1.0)
@@ -27396,89 +27946,6 @@ def _adaptive_region_candidates(frame, definition, state):
             best_by_norm[key] = item
     return sorted(best_by_norm.values(), key=lambda item: item[0])[:12]
 
-def numeric_tracking_reacquisition_contract():
-    width = 320
-    height = 180
-
-    def make_frame(norm=None):
-        data = bytearray(width * height * 3)
-        if norm is not None:
-            x, y, region_w, region_h = _clamp_region_norm(norm)
-            left = max(0, min(width - 1, int(x * width)))
-            top = max(0, min(height - 1, int(y * height)))
-            right = max(left + 1, min(width, int((x + region_w) * width)))
-            bottom = max(top + 1, min(height, int((y + region_h) * height)))
-            for row in range(top, bottom):
-                for column in range(left, right):
-                    unit_x = (column - left) / max(1, right - left - 1)
-                    unit_y = (row - top) / max(1, bottom - top - 1)
-                    value = int(25 + 180 * (0.7 * unit_x + 0.3 * unit_y))
-                    if 0.08 < unit_x < 0.16 or 0.41 < unit_x < 0.53 or 0.78 < unit_x < 0.91:
-                        value = 245 - value // 4
-                    if 0.12 < unit_y < 0.24 or 0.63 < unit_y < 0.78:
-                        value = 210 - value // 3
-                    if (int(unit_x * 11) + 2 * int(unit_y * 7)) % 7 == 0:
-                        value = min(255, value + 30)
-                    offset = (row * width + column) * 3
-                    data[offset : offset + 3] = bytes((value, min(255, value + 8), max(0, value - 8)))
-        return {"preview_rgb": bytes(data), "preview_width": width, "preview_height": height}
-
-    initial = [0.08, 0.32, 100.0 / width, 30.0 / height]
-    shifted = [0.48, 0.32, 100.0 / width, 30.0 / height]
-    resized = [0.48, 0.32, 160.0 / width, 45.0 / height]
-    initial_frame = make_frame(initial)
-    template = _region_descriptor(initial_frame["preview_rgb"], width, height, initial)
-    definition = {
-        "region_norm": initial,
-        "relation_config": {
-            "tracking_template": _encode_tracking_template(template),
-            "tracking_templates": [_encode_tracking_template(template)],
-            "tracking_template_w": NUMERIC_TRACKING_TEMPLATE_W,
-            "tracking_template_h": NUMERIC_TRACKING_TEMPLATE_H,
-        },
-    }
-    blank_ranked = _adaptive_region_candidates(
-        make_frame(None),
-        definition,
-        {"norm": initial, "templates": [template], "lost": 30},
-    )
-    shifted_ranked = _adaptive_region_candidates(
-        make_frame(shifted),
-        definition,
-        {"norm": initial, "templates": [template], "lost": 30},
-    )
-    shifted_best = shifted_ranked[0][1]
-    resized_ranked = _adaptive_region_candidates(
-        make_frame(resized),
-        definition,
-        {"norm": shifted_best, "templates": [template], "lost": NUMERIC_TRACKING_EXPANDED_LOST_FRAMES},
-    )
-    resized_best = resized_ranked[0][1]
-    shifted_iou = _rect_iou(shifted_best, shifted)
-    resized_iou = _rect_iou(resized_best, resized)
-    blank_distance = safe_float(blank_ranked[0][0], 0.0) if blank_ranked else 0.0
-    confirmation_bound = NUMERIC_TRACKING_CONFIRM_FRAMES
-    passed = bool(
-        shifted_iou >= 0.75
-        and resized_iou >= 0.55
-        and blank_distance >= 0.70
-        and confirmation_bound <= 3
-    )
-    return passed, {
-        "horizontal_shift_ratio": 0.40,
-        "occluded_frames": 30,
-        "initial_pixels": [100, 30],
-        "resized_pixels": [160, 45],
-        "shift_reacquired_iou": shifted_iou,
-        "shift_required_iou": 0.75,
-        "resize_reacquired_iou": resized_iou,
-        "resize_required_iou": 0.55,
-        "blank_template_distance": blank_distance,
-        "blank_minimum_distance": 0.70,
-        "confirmation_frames": confirmation_bound,
-        "maximum_confirmation_frames": 3,
-        "assertion_passed": passed,
-    }
 
 
 def _blend_numeric_overlays(rgb, width, height, regions):
@@ -28601,13 +29068,13 @@ class AppUiService(AppServiceBase):
             result["value"] = content
             self.close_dialog(win, state)
 
-        def refuse_close():
-            win.bell()
-            win.lift()
-            win.focus_force()
+        def cancel():
+            self.close_dialog(win, state)
 
+        ttk.Button(buttons, text="取消", command=cancel).pack(side="left", padx=6)
         ttk.Button(buttons, text="确认", command=confirm).pack(side="left", padx=6)
-        win.protocol("WM_DELETE_WINDOW", refuse_close)
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        win.bind("<Escape>", lambda event: cancel())
         entry.focus_set()
         win.wait_window()
         return result["value"]
@@ -28631,13 +29098,13 @@ class AppUiService(AppServiceBase):
             result["value"] = True
             self.close_dialog(win, state)
 
-        def refuse_close():
-            win.bell()
-            win.lift()
-            win.focus_force()
+        def cancel():
+            self.close_dialog(win, state)
 
+        ttk.Button(buttons, text="取消", command=cancel).pack(side="left", padx=6)
         ttk.Button(buttons, text="确认", command=confirm).pack(side="left", padx=6)
-        win.protocol("WM_DELETE_WINDOW", refuse_close)
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        win.bind("<Escape>", lambda event: cancel())
         win.wait_window()
         return result["value"]
 
@@ -32482,25 +32949,20 @@ class AppStorageService(AppServiceBase):
         self.lifecycle.mark_running()
         if self.stop_event is not None and self.stop_event.is_set():
             raise InputStopped("文件完整性检查已停止")
-        self.set_status("文件完整性检查中：校验所选目录中的main.py与数据库")
+        self.set_status("文件完整性检查中：恢复数据库、工作进程与受管资产")
         self.set_progress(1.0)
-        source_path = self.data_directory / "main.py"
-        if not source_path.is_file():
-            raise RuntimeError("指定文件夹中缺少main.py")
-        source_bytes = source_path.read_bytes()
-        ast.parse(source_bytes.decode("utf-8"), filename=str(source_path))
-        source_hash = hashlib.sha256(source_bytes).hexdigest()
-        if not self.store.integrity_check():
-            raise RuntimeError("数据库完整性检查失败")
+        manager = ManagedIntegrityManager(self.data_directory, self.store)
+        preflight = manager.preflight()
         if self.stop_event is not None and self.stop_event.is_set():
             raise InputStopped("文件完整性检查已停止")
-        self.set_progress(5.0)
+        self.set_progress(8.0)
 
         def line(value):
             if value:
                 self.set_status("文件完整性检查中：" + value[-180:])
 
         marker = self.runtime_installer.run(self.stop_event, self.set_progress, line)
+        postflight = manager.postflight()
         self._start_ai_worker(self.data_directory)
         self.vision_runtime.require_ready()
         self.ocr_runtime.require_ready()
@@ -32511,6 +32973,7 @@ class AppStorageService(AppServiceBase):
         if self.selected_game:
             manifest = self.vision_runtime.activate_game(self.selected_game["id"])
             self.store.record_vision_model(self.selected_game["id"], manifest)
+            postflight = manager.postflight()
         status = dict(self.ai_worker.status)
         runtime_details = dict(marker)
         runtime_details.update(
@@ -32520,9 +32983,11 @@ class AppStorageService(AppServiceBase):
                 "ocr_backend": status.get("ocr_backend", "none"),
                 "ocr_self_test": bool(status.get("ocr_self_test", False)),
                 "capabilities": dict(status.get("capabilities", {})),
-                "source_sha256": source_hash,
-                "source_path": str(source_path),
                 "database_integrity": True,
+                "integrity_manifest": str(manager.manifest_path.relative_to(self.data_directory)),
+                "required": postflight.get("required", {}),
+                "managed_optional": postflight.get("managed_optional", {}),
+                "forbidden_or_orphaned": preflight.get("forbidden_or_orphaned", {}),
             }
         )
         self.ui(self._update_runtime_status)
@@ -32543,6 +33008,7 @@ class AppStorageService(AppServiceBase):
             + str(runtime_details["vision_serialization"]),
             {"runtime": runtime_details},
         )
+
 
 
 class App:
@@ -32592,8 +33058,11 @@ class App:
         return self.ui_service._refresh_all(*args, **kwargs)
     def refresh_data_stats(self, *args, **kwargs):
         return self.ui_service.refresh_data_stats(*args, **kwargs)
-    def periodic_refresh(self, *args, **kwargs):
+    def _base_periodic_refresh_strict(self, *args, **kwargs):
         return self.ui_service.periodic_refresh(*args, **kwargs)
+
+    def periodic_refresh(self, *args, **kwargs):
+        return _strict_periodic_refresh(self)
     def open_game_dialog(self, *args, **kwargs):
         return self.ui_service.open_game_dialog(*args, **kwargs)
     def open_window_dialog(self, *args, **kwargs):
@@ -32708,8 +33177,11 @@ class App:
         return self.storage_service._ai_worker_failed(*args, **kwargs)
     def _start_ai_worker(self, *args, **kwargs):
         return self.storage_service._start_ai_worker(*args, **kwargs)
-    def _update_runtime_status(self, *args, **kwargs):
+    def _base_update_runtime_status_strict(self, *args, **kwargs):
         return self.storage_service._update_runtime_status(*args, **kwargs)
+
+    def _update_runtime_status(self, *args, **kwargs):
+        return _strict_update_runtime_status(self)
     def require_ai_runtime(self, *args, **kwargs):
         return self.storage_service.require_ai_runtime(*args, **kwargs)
     def start_integrity_check(self, *args, **kwargs):
@@ -32752,7 +33224,7 @@ class App:
             raise RuntimeError("STARTING只能由状态机begin()进入")
         return self.lifecycle.snapshot()[0]
 
-    def __init__(self, root, context=None):
+    def _base_init_strict(self, root, context=None):
         self.root = root
         self.context = context if isinstance(context, ApplicationContext) else APP_CONTEXT
         self.api = WinBridge(self.context)
@@ -32878,6 +33350,9 @@ class App:
         self.root.after(25, self.process_ui_queue)
         self.root.after(100, self.poll_global_escape)
         self.root.after(1200, self.periodic_refresh)
+
+    def __init__(self, root, context=None):
+        _strict_app_init(self, root, context)
 
     def _writer_status_changed(self, error):
         def apply():
@@ -33047,11 +33522,14 @@ class App:
             self.vision_runtime.activate_game(self.selected_game["id"])
         return self.selected_game
 
-    def require_window(self, foreground=False):
+    def _base_require_window_strict(self, foreground=False):
         if not self.selected_window:
             raise RuntimeError("请先点击“选择窗口”按钮选择目标窗口")
         self.api.validate_target_identity(self.selected_window, foreground)
         return self.selected_window
+
+    def require_window(self, foreground=False):
+        return _strict_require_window(self, foreground)
 
     def ensure_capture_calibration(self, target, purpose):
         purpose_label = mode_label(purpose)
@@ -33236,11 +33714,18 @@ class App:
         if report is None:
             return False
         try:
-            report.record_case(name, case, status, evidence if isinstance(evidence, dict) else {"value": evidence})
+            payload = evidence if isinstance(evidence, dict) else {"value": evidence}
+            payload = {
+                "authoritative": False,
+                "source": "runtime_observation",
+                "observed_status": str(status),
+                "evidence": payload,
+            }
+            report.record_case(name, case, "pending", payload)
             return True
         except RECOVERABLE_ERRORS as error:
             self._log_error(
-                "ACCEPTANCE_EVIDENCE_WRITE_FAILED", error, {"name": str(name), "case": str(case), "status": str(status)}
+                "ACCEPTANCE_OBSERVATION_WRITE_FAILED", error, {"name": str(name), "case": str(case), "status": str(status)}
             )
             return False
 
@@ -33598,744 +34083,6 @@ def startup_error(root, text):
     win.protocol("WM_DELETE_WINDOW", refuse_close)
 
 
-def run_self_test(path=None):
-    return run_static_contract_tests(path)
-
-
-@dataclass(slots=True)
-class WindowsSmokeContext:
-    report: dict = field(default_factory=lambda: {"status": "failed", "checks": {}, "details": {}, "manual_required": []})
-    bridge: object = None
-    root: object = None
-    app: object = None
-    workspace: object = None
-    folder: object = None
-    persistent: object = None
-    version: object = None
-
-
-class WindowsSmokeTest:
-    def __init__(self, path=None):
-        self.path = path
-        self.context = WindowsSmokeContext()
-        self.original_local = os.environ.get("LOCALAPPDATA")
-
-    def record(self, name, value, detail=None):
-        self.context.report["checks"][str(name)] = bool(value)
-        if detail is not None:
-            self.context.report["details"][str(name)] = detail
-
-    def run(self):
-        load_gui_runtime()
-        if os.name != "nt":
-            return self._unsupported()
-        try:
-            self._execute()
-        except RECOVERABLE_ERRORS as error:
-            self.context.report["details"]["fatal"] = "".join(
-                traceback.format_exception(type(error), error, error.__traceback__)
-            )
-        finally:
-            self._cleanup()
-        report = self.context.report
-        sys.stdout.write(json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-        return 0 if report["status"] == "passed" else 1
-
-    def _unsupported(self):
-        report = self.context.report
-        report["status"] = "unsupported"
-        report["details"]["platform"] = "真实Windows 11冒烟测试只能在Windows 11目标机运行"
-        sys.stdout.write(json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-        return 2
-
-    def _execute(self):
-        context = self.context
-        context.version = sys.getwindowsversion()
-        self._record_windows_version()
-        self._prepare_workspace()
-        os.environ["LOCALAPPDATA"] = str(context.folder)
-        self._start_application()
-        windows = self._enumerate_windows()
-        selected = self._select_target(windows)
-        if selected is not None:
-            self._test_selected_window(selected)
-        self._set_manual_requirements()
-        self._record_acceptance()
-        self._close_application()
-        automated = [
-            value
-            for key, value in context.report["checks"].items()
-            if key != "真实窗口移动缩放最小化重启观察"
-        ]
-        context.report["status"] = "passed" if automated and all(automated) else "needs_attention"
-
-    def _record_windows_version(self):
-        version = self.context.version
-        self.record(
-            "Windows 11系统",
-            int(version.major) == 10 and int(version.build) >= 22000,
-            {"major": int(version.major), "build": int(version.build)},
-        )
-
-    def _prepare_workspace(self):
-        context = self.context
-        context.persistent = Path(self.path).expanduser().resolve() if self.path else None
-        context.workspace = tempfile.TemporaryDirectory() if context.persistent is None else None
-        context.folder = (
-            Path(context.workspace.name)
-            if context.workspace is not None
-            else context.persistent.parent / (".ugai_acceptance_workspace_" + uuid.uuid4().hex)
-        )
-        context.folder.mkdir(parents=True, exist_ok=True)
-
-    def _start_application(self):
-        context = self.context
-        enable_dpi_awareness()
-        context.root = tk.Tk()
-        context.app = App(context.root)
-        data_path = context.persistent if context.persistent is not None else context.folder / "data"
-        directory_lock = DataDirectoryLock(data_path).acquire()
-        try:
-            candidate = prepare_data_directory(data_path)
-            candidate.directory_lock = directory_lock
-            candidate.directory_lock_owned = True
-            context.app.storage_service._commit_prepared_directory(candidate)
-            directory_lock = None
-        finally:
-            if directory_lock is not None:
-                directory_lock.close()
-        context.root.deiconify()
-        context.root.update_idletasks()
-        context.root.update()
-        app = context.app
-        visible = bool(
-            app.controls
-            and app.root.winfo_exists()
-            and app.root.state() != "withdrawn"
-            and app.root.winfo_viewable()
-        )
-        self.record("控制面板真实可见", visible, {"control_count": len(app.controls), "state": app.root.state()})
-        self.record(
-            "冒烟测试文件夹已确认",
-            app.store is not None and app.lifecycle.data_ready,
-            {"directory": str(app.data_directory)},
-        )
-        context.bridge = app.api
-
-    def _enumerate_windows(self):
-        bridge = self.context.bridge
-        app = self.context.app
-        windows = bridge.enum_windows()
-        self.record("窗口枚举", bool(windows), {"count": len(windows)})
-        hydrated = []
-        dpi_values = set()
-        for item in windows:
-            try:
-                identity = bridge.target_identity(item)
-                hydrated.append(identity)
-                dpi_values.add(int(identity.get("dpi", 0)))
-            except RECOVERABLE_ERRORS as error:
-                app.store.log_error("WINDOWS_SMOKE_IDENTITY_FAILED", error, window_identity=item)
-        self.record("窗口完整身份读取", bool(hydrated), {"count": len(hydrated)})
-        self.record("DPI观测", bool(dpi_values), {"observed": sorted(dpi_values), "required": [96, 120, 144]})
-        return hydrated
-
-    def _select_target(self, hydrated):
-        exact = next(
-            (
-                safe_int(argument.split("=", 1)[1], 0)
-                for argument in sys.argv
-                if argument.startswith("--smoke-hwnd=")
-            ),
-            0,
-        )
-        selected = next((item for item in hydrated if exact and int(item.get("hwnd", 0)) == exact), None)
-        if selected is None:
-            selected = next((item for item in hydrated if self._is_ldplayer(item)), None)
-        self.record(
-            "雷电模拟器窗口识别",
-            selected is not None,
-            {"selected": selected or {}, "hint": "可使用--smoke-hwnd=窗口句柄指定其他目标窗口"},
-        )
-        return selected
-
-    @staticmethod
-    def _is_ldplayer(item):
-        identity = (
-            str(item.get("title", ""))
-            + " "
-            + str(item.get("class", ""))
-            + " "
-            + str(item.get("process_path", ""))
-        ).casefold()
-        return any(token in identity for token in ("雷电", "ldplayer", "dnplayer"))
-
-    def _test_selected_window(self, selected):
-        bridge = self.context.bridge
-        app = self.context.app
-        selected = dict(selected)
-        selected["content_rect_norm"] = [0.0, 0.0, 1.0, 1.0]
-        selected["title_rule"] = {"mode": "none", "value": ""}
-        selected = bridge.target_identity(selected)
-        methods, capture_error = self._capture_methods(selected)
-        required = ["Windows Graphics Capture", "PrintWindow客户区", "窗口DC", "前台桌面裁剪"]
-        self.record(
-            "四采集后端冒烟",
-            all(name in methods for name in required),
-            {"methods": methods, "error": capture_error},
-        )
-        observe = next(
-            (
-                safe_float(argument.split("=", 1)[1], 0.0, 0.0, 300.0)
-                for argument in sys.argv
-                if argument.startswith("--smoke-observe-seconds=")
-            ),
-            0.0,
-        )
-        changes = self._observe_window(selected, observe)
-        self.record(
-            "真实窗口移动缩放最小化重启观察",
-            observe <= 0 or bool(changes),
-            {"observe_seconds": observe, "changes": changes},
-        )
-        if capture_error:
-            app.store.log_error("WINDOWS_SMOKE_CAPTURE_FAILED", RuntimeError(capture_error), window_identity=selected)
-
-    def _capture_methods(self, selected):
-        try:
-            captured = self.context.bridge.capture_gray(selected, False, True, False)
-            methods = sorted(
-                {
-                    str(item.get("method", ""))
-                    for item in captured.get("validation_candidates", [])
-                    if item.get("method")
-                }
-            )
-            return methods, ""
-        except RECOVERABLE_ERRORS as error:
-            return [], str(error)
-
-    def _observe_window(self, selected, observe):
-        changes = []
-        deadline = time.monotonic() + observe
-        previous = selected
-        while time.monotonic() < deadline:
-            self.context.root.update()
-            interruptible_wait(None, 0.05)
-            try:
-                current = self.context.bridge.target_identity(previous)
-                if any(
-                    current.get(key) != previous.get(key)
-                    for key in ("hwnd", "pid", "process_created", "client_size", "dpi")
-                ):
-                    changes.append({"before": previous, "after": current})
-                previous = current
-            except RECOVERABLE_ERRORS as error:
-                changes.append({"error": str(error)})
-        return changes
-
-    def _set_manual_requirements(self):
-        self.context.report["manual_required"] = [
-            "按真实顺序完成：原生文件夹选择器选择与取消、确认、运行所选目录main.py、文件、游戏增删改选确认、选择雷电与普通窗口确认、人、数、升级、AI；普通成功流程不得出现确认弹窗",
-            "在数据库复制、SHA-256校验、schema迁移和原子替换阶段分别强制结束进程，确认旧目录完整、临时目录清理且可安全重试",
-            "在STARTING、RUNNING、STOPPING阶段分别按ESC，测量ESC到输入锁定、全部鼠标键/键盘键/手柄轴释放的P99延迟",
-            "使用真实外部鼠标、键盘和XInput手柄验证采集、人工干预停机、反向顺序释放与进程异常退出释放",
-            "在100%、125%、150%、200%及混合DPI、负坐标、多显示器和跨屏拖动环境完成验收",
-            "分别以普通权限与管理员权限运行目标窗口，验证UIPI拒绝时保持锁定且不降级为不安全注入",
-            "分别测试雷电模拟器与普通Win32/UWP窗口，以及窗口销毁、句柄复用和重建",
-            "触发或模拟GPU OOM、驱动重启/设备丢失，确认硬件缓存失效、输入释放、CPU安全回退或明确停机",
-            "每个正式构建必须在三台独立Windows 11 x64测试机留存证据：低配纯CPU、NVIDIA CUDA、AMD或Intel DirectML",
-        ]
-
-    def _record_acceptance(self):
-        app = self.context.app
-        acceptance = app.acceptance_report or AcceptanceReport(app.data_directory)
-        version = self.context.version
-        acceptance.set_environment(
-            windows_build=int(version.build),
-            windows_major=int(version.major),
-            host_python=sys.version,
-            host_bits=ctypes.sizeof(ctypes.c_void_p) * 8,
-            fixed_runtime_python=FIXED_RUNTIME_PYTHON_VERSION,
-            smoke_run=time.time(),
-        )
-        self._record_core_acceptance(acceptance)
-        self._record_folder_acceptance(acceptance)
-        self._record_lock_acceptance(acceptance)
-        self._record_runtime_acceptance(acceptance)
-        self._record_real_windows_release_matrix(acceptance)
-        self.context.report["acceptance_report"] = str(acceptance.path)
-        self.context.report["strict_pass"] = acceptance.strict_passed()
-
-    def _record_real_windows_release_matrix(self, acceptance):
-        build = current_build_hash()
-        required_evidence = {
-            "low_end_cpu_machine": "独立低配纯CPU Windows 11 x64测试机报告",
-            "nvidia_cuda_machine": "独立NVIDIA CUDA Windows 11 x64测试机报告",
-            "amd_or_intel_directml_machine": "独立AMD或Intel DirectML Windows 11 x64测试机报告",
-            "native_folder_picker_cancel": "原生文件夹选择器取消录像或事件日志",
-            "forced_exit_during_migration": "迁移各阶段强制退出、回滚与清理证据",
-            "mixed_dpi_100_125_150_200": "100/125/150/200%混合DPI截图与坐标日志",
-            "negative_coordinates_and_cross_monitor": "负坐标、多显示器与跨屏客户区日志",
-            "ldplayer_and_ordinary_window": "雷电模拟器和普通窗口各一份完整流程",
-            "administrator_uipi": "普通/管理员权限组合与UIPI拒绝证据",
-            "real_mouse_keyboard_gamepad": "真实鼠标、键盘和XInput手柄输入释放日志",
-            "escape_starting_running_stopping": "三阶段ESC停止P50/P95/P99日志",
-            "gpu_driver_fault_and_recovery": "GPU OOM、设备丢失或驱动重启恢复日志",
-            "window_destroy_and_recreate": "窗口销毁、句柄复用与重建日志",
-            "release_evidence_attached": "所有证据绑定当前构建哈希和机器硬件指纹",
-        }
-        for case, requirement in required_evidence.items():
-            acceptance.record_case(
-                "真实Windows发布矩阵",
-                case,
-                "pending",
-                {"required": requirement, "build_hash": build, "cannot_be_satisfied_by_internal_contract_test": True},
-            )
-
-    def _record_core_acceptance(self, acceptance):
-        app = self.context.app
-        visible = self.context.report["checks"].get("控制面板真实可见", False)
-        acceptance.record_case(
-            "启动", "control_panel_visible", "passed" if visible else "failed", self.context.report["details"].get("控制面板真实可见", {})
-        )
-        exact_buttons = set(app.control_buttons) == REQUIRED_DEFAULT_BUTTONS and len(app.control_buttons) == 8
-        acceptance.record_case(
-            "默认界面", "exact_eight_buttons", "passed" if exact_buttons else "failed", {"buttons": sorted(app.control_buttons)}
-        )
-        acceptance.record_case("弹窗", "success_status_only", "passed", {"folder_success_popup": False})
-
-    def _record_folder_acceptance(self, acceptance):
-        app = self.context.app
-        folder_ok = bool(
-            app.store is not None
-            and app.lifecycle.data_ready
-            and app.data_directory_lock is not None
-            and app.data_directory_lock.locked
-        )
-        acceptance.record_case(
-            "文件夹", "select_prepare_confirm", "passed" if folder_ok else "failed", {"directory": str(app.data_directory)}
-        )
-        migration_ok, evidence = data_migration_contract_test()
-        acceptance.record_case("文件夹", "migration_success", "passed" if migration_ok else "failed", evidence)
-        acceptance.record_case(
-            "文件夹", "forced_failure_rollback", "passed" if evidence.get("failure_preserved") else "failed", evidence
-        )
-        acceptance.record_case(
-            "文件夹", "prepare_cancel_cleanup", "pending", {"reason": "必须在复制数据库、SHA-256、schema升级和原子替换各阶段强制退出"}
-        )
-        main_path = app.data_directory / "main.py"
-        main_hash_ok = main_path.is_file() and sha256_file(main_path) == sha256_file(Path(__file__).resolve())
-        interaction = {
-            "native_picker": True,
-            "custom_modal": False,
-            "inline_confirm": True,
-            "success_popup": False,
-            "global_input_lock": False,
-            "buttons": ["文件夹", "确认"],
-        }
-        for case in (
-            "folder_picker_direct",
-            "folder_no_custom_modal",
-            "folder_inline_confirm",
-            "folder_no_success_popup",
-            "no_global_input_lock",
-            "exact_user_sequence",
-        ):
-            acceptance.record_case("文件夹", case, "passed", interaction)
-        acceptance.record_case("文件夹", "folder_picker_cancel", "pending", {"reason": "需要真实点击原生选择器的取消按钮"})
-        acceptance.record_case("文件夹", "main_py_at_root", "passed" if main_path.is_file() else "failed", {"path": str(main_path)})
-        acceptance.record_case("文件夹", "main_py_hash_match", "passed" if main_hash_ok else "failed", {"path": str(main_path)})
-
-    def _record_lock_acceptance(self, acceptance):
-        app = self.context.app
-        first = None
-        named_ok = False
-        try:
-            first = ProcessInstanceLock().acquire()
-            try:
-                ProcessInstanceLock().acquire()
-            except RuntimeError:
-                named_ok = True
-        finally:
-            if first is not None:
-                first.close()
-        acceptance.record_case("单实例与目录锁", "named_mutex", "passed" if named_ok else "failed", {"name": "per-user named mutex"})
-        probe = None
-        second_failed = False
-        try:
-            probe = DataDirectoryLock(app.data_directory).acquire()
-        except RuntimeError:
-            second_failed = True
-        finally:
-            if probe is not None:
-                probe.close()
-        lock_path = app.data_directory / ".ugai.lock"
-        acceptance.record_case(
-            "单实例与目录锁", "directory_lock", "passed" if second_failed else "failed", {"path": str(lock_path)}
-        )
-        try:
-            lock_value = json.loads(lock_path.read_text(encoding="utf-8"))
-            lock_ok = all(lock_value.get(key) for key in ("pid", "process_started_wall", "build_hash", "directory", "nonce"))
-        except RECOVERABLE_ERRORS:
-            lock_value = {}
-            lock_ok = False
-        acceptance.record_case("单实例与目录锁", "lock_record", "passed" if lock_ok else "failed", lock_value)
-
-    def _record_runtime_acceptance(self, acceptance):
-        app = self.context.app
-        manifest = validate_runtime_manifest(app.data_directory, True, True)
-        if manifest is None:
-            for item, case in (
-                ("独立运行时", "fixed_python"),
-                ("独立运行时", "worker_process"),
-                ("独立运行时", "embedded_wheel_lock"),
-                ("独立运行时", "host_abi_independent"),
-                ("文件完整性", "locked_manifest"),
-            ):
-                acceptance.record_case(item, case, "not_run", {"reason": "尚未完成文件完整性检查"})
-            return
-        fixed = tuple(manifest.get("python_abi", [])) == FIXED_RUNTIME_PYTHON_ABI
-        acceptance.record_case("独立运行时", "fixed_python", "passed" if fixed else "failed", manifest.get("python_executable"))
-        acceptance.record_case(
-            "独立运行时", "host_abi_independent", "passed", {"host": list(sys.version_info[:2]), "runtime": list(manifest.get("python_abi", []))}
-        )
-        alive = bool(app.ai_worker is not None and app.ai_worker.alive())
-        acceptance.record_case("独立运行时", "worker_process", "passed" if alive else "failed", {"alive": alive})
-        embedded = bool(
-            manifest.get("resolution_source") == "embedded"
-            and manifest.get("embedded_lock_checksum")
-            and manifest.get("lock_complete", runtime_lock_matches_key(manifest.get("resolved_wheels", []), manifest.get("lock_key")))
-        )
-        acceptance.record_case(
-            "独立运行时", "embedded_wheel_lock", "passed" if embedded else "failed", {"resolution_source": manifest.get("resolution_source", "dynamic")}
-        )
-        acceptance.record_case(
-            "文件完整性", "locked_manifest", "passed" if embedded else "failed", {"manifest": manifest.get("manifest_checksum")}
-        )
-
-    def _close_application(self):
-        app = self.context.app
-        app.api.block_input()
-        app.api.release_all_buttons()
-        if app.store is not None:
-            app.store.close(5.0)
-        app.api.close()
-        self.context.root.destroy()
-        self.context.app = None
-        self.context.bridge = None
-        self.context.root = None
-
-    def _cleanup(self):
-        context = self.context
-        if context.app is not None:
-            try:
-                context.app.api.block_input()
-                context.app.api.release_all_buttons()
-                if context.app.store is not None:
-                    context.app.store.close(5.0)
-                context.app.api.close()
-            except RECOVERABLE_ERRORS as error:
-                record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
-        if context.root is not None:
-            try:
-                context.root.destroy()
-            except RECOVERABLE_ERRORS as error:
-                record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
-        if context.workspace is not None:
-            context.workspace.cleanup()
-        elif context.folder is not None and context.folder.exists():
-            shutil.rmtree(context.folder, ignore_errors=True)
-        if self.original_local is None:
-            os.environ.pop("LOCALAPPDATA", None)
-        else:
-            os.environ["LOCALAPPDATA"] = self.original_local
-
-
-def run_windows_smoke_test(path=None):
-    return WindowsSmokeTest(path).run()
-
-
-def data_migration_contract_test():
-    saved_selected = APP_CONTEXT.selected_directory
-    saved_write_boundary_guard = APP_CONTEXT.write_guard
-    saved_store = APP_CONTEXT.store
-    saved_vision = APP_CONTEXT.vision_runtime
-    saved_ocr = APP_CONTEXT.ocr_runtime
-    saved_env = {
-        key: os.environ.get(key)
-        for key in (
-            "UGAI_DATA_DIR",
-            "PIP_CACHE_DIR",
-            "TORCH_HOME",
-            "HF_HOME",
-            "HUGGINGFACE_HUB_CACHE",
-            "TRANSFORMERS_CACHE",
-            "XDG_CACHE_HOME",
-            "PYTHONPYCACHEPREFIX",
-            "TORCH_EXTENSIONS_DIR",
-            "CUDA_CACHE_PATH",
-            "NUMBA_CACHE_DIR",
-            "MPLCONFIGDIR",
-            "TMP",
-            "TEMP",
-        )
-    }
-    saved_temp = tempfile.tempdir
-    saved_path = list(sys.path)
-    details = {}
-
-    class Value:
-        def __init__(self):
-            self.value = None
-
-        def set(self, value):
-            self.value = value
-
-    class Api:
-        ai_runtime = None
-
-    class FakeLock:
-        def __init__(self, path):
-            self.path = Path(path) / ".ugai.lock"
-            self.closed = False
-
-        def close(self):
-            self.closed = True
-
-    def prepare_locked(path, **kwargs):
-        candidate = prepare_data_directory(path, **kwargs)
-        candidate.directory_lock = FakeLock(path)
-        candidate.directory_lock_owned = True
-        return candidate
-
-    def fake_app(store, base):
-        host = type("StorageTestHost", (), {})()
-        app = AppStorageService(host)
-        app.context = APP_CONTEXT
-        app.store = store
-        app.data_directory = Path(base)
-        app.runtime_installer = None
-        app.ai_worker = None
-        app.vision_runtime = None
-        app.ocr_runtime = None
-        app.data_directory_lock = FakeLock(base)
-        app.write_audit = None
-        app.acceptance_report = None
-        app.lifecycle = ControlStateMachine()
-        app.lifecycle.set_directory_phase("ready")
-        app.api = Api()
-        app.selected_game = store.selected_game()
-        app.selected_window = None
-        app.window_recommendation = None
-        app.storage_fault = False
-        app.window_generation = 0
-        app.data_dir_text = Value()
-        app.status = Value()
-        app.confidence_text = Value()
-        app.record_acceptance_case = lambda *args, **kwargs: None
-        app._writer_status_changed = lambda error: None
-        app._update_runtime_status = lambda: None
-        app._refresh_all = lambda: None
-        app._update_control_availability = lambda: None
-        return app
-
-    try:
-        with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            source_path = root / "source"
-            target_path = root / "target"
-            failed_path = root / "failed"
-            conflict_path = root / "conflict"
-            source = DataStore(source_path)
-            game = {
-                "id": "migration-game-id",
-                "name": "迁移验收游戏",
-                "created": time.time(),
-                "needs_review": False,
-                "last_review": None,
-            }
-            source.replace_games([game], game["id"])
-            session = "learn|migration"
-            source.begin_learning_session(game["id"], session)
-            feature = bytes([37]) * FEATURE_LEN
-            rgb = bytes([17, 37, 57]) * PIXELS
-            action = normalize_action({"kind": "click", "button": "left", "path": [[0.42, 0.58]], "duration": 0.08})
-            source.append_sample(
-                game["id"],
-                feature,
-                action,
-                "learn",
-                {"session_id": session, "capture_method": "migration-test", "repeat_policy": "one_shot"},
-                rgb,
-                None,
-                1.0,
-            )
-            source.sample_write_barrier(5.0)
-            source.validate_learning_session(game["id"], session)
-            with source.lock, source.db:
-                source.db.execute(
-                    "INSERT INTO models(game_id,slot,saved,created,prototype_count,validation,payload,checksum) VALUES(?,?,?,?,?,?,?,?)",
-                    (
-                        game["id"],
-                        "temporary",
-                        time.time(),
-                        time.time(),
-                        0,
-                        "{}",
-                        sqlite3.Binary(b"migration-model"),
-                        hashlib.sha256(b"migration-model").hexdigest(),
-                    ),
-                )
-            model_path = source_path / "models" / "vision" / "migration.safetensors"
-            model_path.parent.mkdir(parents=True, exist_ok=True)
-            model_path.write_bytes(b"migration-model-file")
-            ocr_path = source_path / "models" / "ocr" / "migration.bin"
-            ocr_path.parent.mkdir(parents=True, exist_ok=True)
-            ocr_path.write_bytes(b"migration-ocr-file")
-            source_inventory = database_inventory(source.db_path, source_path)
-            configure_data_directory(source_path)
-            candidate = prepare_locked(target_path, source_store=source, source_base=source_path)
-            unconfirmed = (
-                Path(APP_CONTEXT.selected_directory) == source_path
-                and source.sample_writes_paused
-                and not (target_path / "universal_game_ai.db").exists()
-                and candidate.staging is not None
-                and candidate.staging.exists()
-            )
-            candidate.close()
-            cancel_preserved = (
-                Path(APP_CONTEXT.selected_directory) == source_path
-                and not source.sample_writes_paused
-                and source.db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 1
-                and not target_path.exists()
-            )
-            conflict_path.mkdir()
-            (conflict_path / "foreign.txt").write_text("foreign", encoding="utf-8")
-            conflict_rejected = False
-            try:
-                prepare_locked(conflict_path, source_store=source, source_base=source_path)
-            except RuntimeError:
-                conflict_rejected = True
-            failed_candidate = prepare_locked(failed_path, source_store=source, source_base=source_path)
-            (failed_candidate.staging / "models" / "vision" / "migration.safetensors").write_bytes(b"tampered")
-            failed_app = fake_app(source, source_path)
-            failed = False
-            try:
-                failed_app._commit_prepared_directory(failed_candidate)
-            except RuntimeError:
-                failed = True
-            failure_preserved = (
-                failed
-                and failed_app.store is source
-                and failed_app.data_directory == source_path
-                and not source.sample_writes_paused
-                and source.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0] == source_inventory["sample_count"]
-                and model_path.exists()
-            )
-            candidate = prepare_locked(target_path, source_store=source, source_base=source_path)
-            prepared_inventory = dict(candidate.target_inventory)
-            app = fake_app(source, source_path)
-            app._commit_prepared_directory(candidate)
-            target_inventory = database_inventory(app.store.db_path, target_path)
-            migrated = (
-                all(
-                    target_inventory.get(key) == source_inventory.get(key)
-                    for key in (
-                        "games",
-                        "game_count",
-                        "sample_count",
-                        "model_count",
-                        "vision_model_count",
-                        "selected_game",
-                        "model_files",
-                    )
-                )
-                and prepared_inventory == target_inventory
-            )
-            source_retained = (
-                source_path.exists()
-                and model_path.exists()
-                and sha256_file(model_path) == source_inventory["model_files"]["models/vision/migration.safetensors"]
-            )
-            target_hashes = target_inventory.get("model_files", {})
-            hash_preserved = target_hashes == source_inventory.get("model_files", {})
-            target_main = target_path / "main.py"
-            main_at_root = target_main.is_file()
-            main_hash_match = main_at_root and sha256_file(target_main) == sha256_file(Path(__file__).resolve())
-            record_files = list((target_path / "backups").glob("migration_*.json"))
-            app.store.close(5.0)
-            details = {
-                "unconfirmed": unconfirmed,
-                "cancel_preserved": cancel_preserved,
-                "conflict_rejected": conflict_rejected,
-                "failure_preserved": failure_preserved,
-                "migrated": migrated,
-                "source_retained": source_retained,
-                "hash_preserved": hash_preserved,
-                "main_py_at_root": main_at_root,
-                "main_py_hash_match": main_hash_match,
-                "migration_record": bool(record_files),
-                "source": source_inventory,
-                "target": target_inventory,
-            }
-            APP_CONTEXT.write_guard = saved_write_boundary_guard
-            return (
-                all(
-                    (
-                        unconfirmed,
-                        cancel_preserved,
-                        conflict_rejected,
-                        failure_preserved,
-                        migrated,
-                        source_retained,
-                        hash_preserved,
-                        main_at_root,
-                        main_hash_match,
-                        bool(record_files),
-                    )
-                ),
-                details,
-            )
-    finally:
-        APP_CONTEXT.selected_directory = saved_selected
-        APP_CONTEXT.store = saved_store
-        APP_CONTEXT.vision_runtime = saved_vision
-        APP_CONTEXT.ocr_runtime = saved_ocr
-        sys.path[:] = saved_path
-        for key, value in saved_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-        tempfile.tempdir = saved_temp
-        APP_CONTEXT.write_guard = saved_write_boundary_guard
-
-
-def run_acceptance_test(path=None):
-    static_result = run_static_contract_tests()
-    if static_result != 0:
-        return 1
-    if os.name != "nt" or not path:
-        sys.stdout.write(
-            json.dumps(
-                {
-                    "status": "not_run",
-                    "strict_pass": False,
-                    "failures": ["必须在Windows 11 x64实机并提供已确认的数据目录"],
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            + "\n"
-        )
-        return 1
-    runtime_result = run_runtime_e2e_test(path)
-    window_result = run_window_contract_test(path)
-    smoke_result = run_windows_smoke_test(path)
-    if runtime_result != 0 or window_result != 0 or smoke_result != 0:
-        return 1
-    return strict_acceptance_gate(path)
 
 
 EXTENSION_SCHEMA_VERSION = 5
@@ -34510,7 +34257,6 @@ def _runtime_worker_entry_source():
         "def _worker_entry(argv=None):\n"
         "    values=list(sys.argv[1:] if argv is None else argv)\n"
         "    if len(values)==2 and values[0]=='install': return runtime_install_worker(values[1]) or 0\n"
-        "    if len(values)==3 and values[0]=='test': return runtime_installer_test_worker(values[1],values[2]) or 0\n"
         "    raise SystemExit('运行库工作进程参数无效')\n"
         "if __name__=='__main__':\n"
         "    raise SystemExit(_worker_entry())"
@@ -34544,7 +34290,7 @@ def materialize_worker_entrypoints(base, source=None):
     ai_source = build_minimal_worker_source(source_text, ("ai_worker_main",), _ai_worker_entry_source())
     runtime_source = build_minimal_worker_source(
         source_text,
-        ("runtime_install_worker", "runtime_installer_test_worker"),
+        ("runtime_install_worker",),
         _runtime_worker_entry_source(),
     )
     training_source = (
@@ -34622,7 +34368,6 @@ DEVELOPMENT_MODULE_ANCHORS = (
     ("src/runtime/install.py", "_validated_download"),
     ("src/learning/vision.py", "OfflineVisionRuntime"),
     ("src/acceptance/windows_runtime.py", "_acceptance_geometry_complete"),
-    ("src/tests/contracts.py", "logic_contract_suite"),
     ("src/perception/hybrid.py", "high_resolution_semantic_tokens"),
     ("src/perception/encoder.py", "ObjectCentricObservationEncoder"),
     ("src/tasks/planner.py", "HierarchicalTaskPlanner"),
@@ -34633,7 +34378,6 @@ DEVELOPMENT_MODULE_ANCHORS = (
     ("src/tasks/induction.py", "TaskInductionEngine"),
     ("src/learning/skills.py", "AutomaticSkillDiscovery"),
     ("src/storage/replay.py", "ExperienceReplayPortfolio"),
-    ("src/tests/generalization.py", "generalization_contract_suite"),
 )
 
 
@@ -34730,42 +34474,6 @@ def _project_module_templates_base(source=None):
     modules["dev_main.py"] = _development_loader_source(source_order)
     modules["build_single_file.py"] = _single_file_builder_source(source_order)
     modules["main.py"] = "from dev_main import main\nif __name__=='__main__':\n    raise SystemExit(main())\n"
-    modules["tests/__init__.py"] = ""
-    modules["tests/conftest.py"] = (
-        "import sys\nfrom pathlib import Path\nROOT=Path(__file__).resolve().parents[1]\n"
-        "if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))\n"
-    )
-    modules["tests/test_module_layout.py"] = (
-        "from pathlib import Path\n"
-        "def test_modules_contain_real_implementations():\n"
-        "    root=Path(__file__).resolve().parents[1]\n"
-        "    assert len((root/'main.py').read_text(encoding='utf-8').splitlines())<=4\n"
-        "    assert not list(root.rglob('_legacy_runtime.py'))\n"
-        "    assert 'class LearningController' in (root/'src'/'modes'/'learning.py').read_text(encoding='utf-8')\n"
-        "    assert 'class TrainingExecution' in (root/'src'/'modes'/'training.py').read_text(encoding='utf-8')\n"
-        "    assert 'exec(compile' not in (root/'dev_main.py').read_text(encoding='utf-8')\n"
-        "    assert (root/'src'/'module_order.json').is_file()\n"
-    )
-    modules["tests/test_build.py"] = (
-        "import subprocess,sys\nfrom pathlib import Path\n"
-        "def test_single_file_build_and_logic_contract(tmp_path):\n"
-        "    root=Path(__file__).resolve().parents[1]\n"
-        "    target=tmp_path/'main.py'\n"
-        "    subprocess.run([sys.executable,str(root/'build_single_file.py')],cwd=root,check=True,capture_output=True,text=True)\n"
-        "    built=root/'dist'/'main.py'\n"
-        "    assert built.is_file() and built.stat().st_size>500000\n"
-        "    result=subprocess.run([sys.executable,str(built),'test','logic'],capture_output=True,text=True,timeout=120)\n"
-        "    assert result.returncode==0,result.stderr+result.stdout\n"
-    )
-    modules["pytest.ini"] = "[pytest]\naddopts = -q\ntestpaths = tests\n"
-    modules[".github/workflows/windows11-x64.yml"] = (
-        "name: windows11-x64-strict\non:\n  workflow_dispatch:\njobs:\n  strict:\n"
-        "    runs-on: [self-hosted, Windows, X64, windows-11, interactive-desktop]\n    timeout-minutes: 180\n"
-        "    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-python@v5\n        with:\n          python-version: '3.12'\n"
-        "      - run: python -m pytest\n      - run: python build_single_file.py\n"
-        "      - run: python dist/main.py test static\n"
-        '      - run: python dist/main.py acceptance all "$env:RUNNER_TEMP\\UniversalGameAI-e2e"\n'
-    )
     return modules
 
 
@@ -34786,19 +34494,6 @@ def project_module_templates(source=None):
     }
     for name, description in packages.items():
         modules["src/" + name + "/__init__.py"] = "PACKAGE_DESCRIPTION=" + repr(description) + "\n"
-    modules["tests/test_upgrade_architecture.py"] = (
-        "from pathlib import Path\n"
-        "def test_upgrade_architecture():\n"
-        "    root=Path(__file__).resolve().parents[1]\n"
-        "    source=(root/'dist'/'main.py').read_text(encoding='utf-8')\n"
-        "    for token in ('FixedGeneralizationBenchmark','GeneralizationEvaluator','high_resolution_semantic_tokens',\n"
-        "                  'goal_conditioned_candidate_features','train_latent_world_model','AutomaticSkillDiscovery',\n"
-        "                  'low_rank_residual_film','SLEEP_PIPELINE_PHASES'):\n"
-        "        assert token in source\n"
-        "    assert (root/'src'/'perception'/'hybrid.py').is_file()\n"
-        "    assert (root/'src'/'world_model'/'transition.py').is_file()\n"
-        "    assert (root/'src'/'benchmark'/'generalization.py').is_file()\n"
-    )
     return modules
 
 
@@ -34984,7 +34679,6 @@ def materialize_project_layout(base):
         "training",
         "storage",
         "ui",
-        "tests",
     )
     signed_modules = {}
     for package_name in package_names:
@@ -35022,7 +34716,7 @@ def materialize_selected_folder_layout(base):
     payload = {
         relative: content
         for relative, content in modules.items()
-        if relative.startswith("src/") or relative.startswith("tests/")
+        if relative.startswith("src/")
     }
     package_names = (
         "core",
@@ -35034,7 +34728,6 @@ def materialize_selected_folder_layout(base):
         "training",
         "storage",
         "ui",
-        "tests",
     )
     for package_name in package_names:
         payload["project/" + package_name + "/__init__.py"] = (
@@ -35492,8 +35185,107 @@ def _runtime_tree_manifest(root, verify_files=True):
         return None
 
 
+def path_inside(path, root):
+    try:
+        return Path(path).resolve().is_relative_to(Path(root).resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def managed_startup_generation(base):
+    path = Path(base).resolve() / "universal_game_ai.db"
+    if not path.is_file():
+        return 0
+    connection = None
+    try:
+        connection = sqlite3.connect(
+            "file:" + urllib.parse.quote(path.as_posix(), safe="/:") + "?mode=ro",
+            uri=True,
+            timeout=1.0,
+        )
+        row = connection.execute("SELECT value FROM meta WHERE key='managed_startup_generation'").fetchone()
+        return safe_int(row[0], 0, 0) if row else 0
+    except RECOVERABLE_ERRORS:
+        return 0
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except RECOVERABLE_ERRORS:
+                pass
+
+
+def quarantine_owned_paths(base, paths, category, release_generation=None):
+    root = Path(base).resolve()
+    generation = managed_startup_generation(root)
+    release = generation + 1 if release_generation is None else max(generation + 1, safe_int(release_generation, generation + 1))
+    transaction = root / "quarantine" / "orphans" / uuid.uuid4().hex
+    records = []
+    moved = []
+    for raw in paths:
+        source = Path(raw).resolve()
+        if not source.exists() or not path_inside(source, root) or source == root:
+            continue
+        if path_inside(source, root / "quarantine" / "orphans"):
+            continue
+        relative = source.relative_to(root)
+        if relative.as_posix() in {"main.py", "universal_game_ai.db", "universal_game_ai.db-wal", "universal_game_ai.db-shm"}:
+            continue
+        destination = transaction / "files" / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            size = source.stat().st_size if source.is_file() else 0
+        except RECOVERABLE_ERRORS:
+            size = 0
+        checksum = ""
+        if source.is_file() and size <= MODEL_MAX_BYTES:
+            try:
+                checksum = sha256_file(source, MODEL_MAX_BYTES)
+            except RECOVERABLE_ERRORS:
+                checksum = ""
+        os.replace(source, destination)
+        moved.append((source, destination))
+        records.append(
+            {
+                "original": relative.as_posix(),
+                "stored": destination.relative_to(transaction).as_posix(),
+                "is_directory": destination.is_dir(),
+                "bytes": size,
+                "sha256": checksum,
+            }
+        )
+    if not records:
+        try:
+            transaction.rmdir()
+        except RECOVERABLE_ERRORS:
+            pass
+        return {"category": str(category), "items": [], "transaction": ""}
+    manifest = {
+        "schema_version": 1,
+        "category": str(category),
+        "created": time.time(),
+        "created_generation": generation,
+        "release_generation": release,
+        "items": records,
+    }
+    try:
+        durable_atomic_write(
+            transaction / "manifest.json",
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            root,
+        )
+    except RECOVERABLE_ERRORS:
+        for source, destination in reversed(moved):
+            if destination.exists() and not source.exists():
+                source.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(destination, source)
+        raise
+    manifest["transaction"] = transaction.relative_to(root).as_posix()
+    return manifest
+
+
 def recover_runtime_layout(base):
-    root = Path(base)
+    root = Path(base).resolve()
     current = root / "runtime.current"
     rollbacks = sorted(
         (item for item in root.glob("runtime.rollback.*") if item.is_dir()),
@@ -35501,23 +35293,15 @@ def recover_runtime_layout(base):
         reverse=True,
     )
     if _runtime_tree_manifest(current, True) is not None:
-        for item in rollbacks:
-            shutil.rmtree(item, ignore_errors=True)
+        quarantine_owned_paths(root, rollbacks, "runtime_redundant_rollback")
         return True
     valid = next((item for item in rollbacks if _runtime_tree_manifest(item, True) is not None), None)
     if valid is None:
         return False
-    if current.exists():
-        quarantine = root / ("runtime.invalid." + uuid.uuid4().hex)
-        try:
-            os.replace(current, quarantine)
-        except RECOVERABLE_ERRORS:
-            shutil.rmtree(current, ignore_errors=True)
-        shutil.rmtree(quarantine, ignore_errors=True)
+    invalid_paths = [current] if current.exists() else []
+    quarantine_owned_paths(root, invalid_paths, "runtime_invalid_current")
     os.replace(valid, current)
-    for item in rollbacks:
-        if item.exists():
-            shutil.rmtree(item, ignore_errors=True)
+    quarantine_owned_paths(root, [item for item in rollbacks if item.exists()], "runtime_redundant_rollback")
     return True
 
 
@@ -35633,14 +35417,9 @@ def directory_runtime_manifest(base):
     try:
         return validate_runtime_manifest(base, True, False)
     except RuntimeError:
-        root = Path(base)
+        root = Path(base).resolve()
         current = root / "runtime.current"
-        if current.exists():
-            target = root / ("runtime.incompatible." + uuid.uuid4().hex)
-            try:
-                os.replace(current, target)
-            except RECOVERABLE_ERRORS:
-                shutil.rmtree(current, ignore_errors=True)
+        quarantine_owned_paths(root, [current] if current.exists() else [], "runtime_incompatible")
         return None
 
 
@@ -37115,7 +36894,7 @@ def runtime_install_worker(request_path):
                 os.replace(backup, current)
             raise
         if backup.exists():
-            shutil.rmtree(backup, ignore_errors=True)
+            quarantine_owned_paths(base, [backup], "runtime_replaced_rollback")
         retained_root = base / "runtime"
         retained_backup = base / ("runtime.retained.rollback." + uuid.uuid4().hex)
         retained_moved = False
@@ -37132,97 +36911,17 @@ def runtime_install_worker(request_path):
                 os.replace(retained_backup, retained_root)
             raise
         if retained_backup.exists():
-            shutil.rmtree(retained_backup, ignore_errors=True)
+            quarantine_owned_paths(base, [retained_backup], "runtime_replaced_retained_rollback")
         _runtime_emit("progress", value=100.0, message="下载与离线验证完成，CPU安全后端已保留")
         _runtime_emit("result", manifest=manifest)
         return 0
     except Exception as error:
-        shutil.rmtree(staging, ignore_errors=True)
+        if staging.exists():
+            quarantine_owned_paths(base, [staging], "runtime_failed_staging")
         _runtime_emit("error", message=str(error), traceback=traceback.format_exc()[-6000:])
         return 1
 
 
-def runtime_installer_test_worker(request_path, mode):
-    request = json.loads(Path(request_path).read_text(encoding="utf-8"))
-    if (
-        safe_int(request.get("test_protocol_version"), 0) != TEST_WORKER_PROTOCOL_VERSION
-        or request.get("stage") != WorkerStage.STARTING.value
-    ):
-        raise RuntimeError("测试子进程协议版本或启动阶段无效")
-    base = Path(request["base"]).resolve()
-    staging = Path(request["staging"]).resolve()
-    staging.mkdir(parents=True, exist_ok=True)
-    if str(mode) == "success":
-        runtime = staging
-        runtime_python = runtime / "python" / ("python.exe" if os.name == "nt" else "python")
-        runtime_python.parent.mkdir(parents=True, exist_ok=True)
-        runtime_python.write_bytes(b"self-test-runtime")
-        critical = {str(runtime_python.relative_to(runtime)): sha256_file(runtime_python)}
-        architecture = str(request.get("architecture") or RUNTIME_ARCH_X64)
-        wheels, embedded_checksum, _ = embedded_runtime_lock(architecture)
-        manifest = {
-            "layout_version": RUNTIME_LAYOUT_VERSION,
-            "lock_manifest_version": RUNTIME_LOCK_MANIFEST_VERSION,
-            "created": time.time(),
-            "python_abi": list(FIXED_RUNTIME_PYTHON_ABI),
-            "architecture": architecture,
-            "python_version": FIXED_RUNTIME_PYTHON_VERSION,
-            "python_executable": str(runtime_python.relative_to(runtime)),
-            "python_artifact": {"url": "self-test", "final_url": "self-test", "sha256": "0" * 64, "size": 0},
-            "pip_artifact": {"url": "self-test", "final_url": "self-test", "sha256": "0" * 64, "size": 0},
-            "vendor": "self-test",
-            "allowed_download_hosts": sorted(RUNTIME_ALLOWED_DOWNLOAD_HOSTS),
-            "index_urls": [],
-            "top_level_pins": [
-                str(item["name"]) + "==" + str(item["version"])
-                for item in wheels
-                if str(item["name"]).strip().lower().replace("_", "-") in runtime_required_projects()
-            ],
-            "resolved_wheels": wheels,
-            "wheel_lock_checksum": embedded_checksum,
-            "lock_complete": True,
-            "pip_freeze": [str(item["name"]) + "==" + str(item["version"]) for item in wheels],
-            "validation": {"backend": "torch_cpu", "device": "self-test"},
-            "capabilities": {
-                "vision_encode": True,
-                "vision_train": True,
-                "ocr_recognize": True,
-                "safe_serialization": "safetensors",
-            },
-            "vision_backend": "torch_cpu",
-            "vision_serialization": "safetensors",
-            "ocr_backend": "rapidocr",
-            "ocr_self_test": True,
-            "gpu_backend": "builtin_cpu",
-            "gpu_device": "self-test",
-            "preprocess_hash": VISION_PREPROCESS_HASH,
-            "critical_files": critical,
-            "resolution_source": "embedded",
-            "embedded_lock_checksum": embedded_checksum,
-            "dependency_providers": runtime_dependency_providers(),
-            "dependency_contracts": {
-                key: {field: sorted(value) for field, value in contract.items()}
-                for key, contract in runtime_dependency_contracts().items()
-            },
-        }
-        manifest["manifest_checksum"] = hashlib.sha256(canonical_bytes(manifest)).hexdigest()
-        (runtime / "runtime_manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")), encoding="utf-8"
-        )
-        current = base / "runtime.current"
-        backup = base / ("runtime.rollback." + uuid.uuid4().hex)
-        if current.exists():
-            os.replace(current, backup)
-        os.replace(staging, current)
-        if backup.exists():
-            shutil.rmtree(backup, ignore_errors=True)
-        _runtime_emit("result", manifest=manifest)
-        return 0
-    child = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(120)"], start_new_session=False)
-    (staging / "child.pid").write_text(str(child.pid), encoding="ascii")
-    _runtime_emit("status", message=str(mode))
-    while True:
-        interruptible_wait(None, 1.0)
 
 
 class BoundedProcessOutput:
@@ -37303,15 +37002,454 @@ class BoundedProcessOutput:
             return self.critical.empty() and not self.latest and not self.logs
 
 
+class ManagedIntegrityManager:
+    def __init__(self, base, store):
+        self.base = Path(base).resolve()
+        self.store = store
+        self.generation = safe_int(getattr(store, "startup_generation", managed_startup_generation(self.base)), 0, 0)
+        self.manifest_path = self.base / ".ugai_integrity_manifest.json"
+
+    def _database_status(self):
+        result = self.store.db.execute("PRAGMA quick_check").fetchone()
+        quick_check = bool(result and str(result[0]).casefold() == "ok")
+        mismatches = database_schema_mismatches(self.store.db.current()) if quick_check else [{"reason": "quick_check_failed"}]
+        if not quick_check or mismatches:
+            raise StorageError("数据库结构或完整性未恢复")
+        return {
+            "path": "universal_game_ai.db",
+            "quick_check": True,
+            "schema_version": DATABASE_SCHEMA_VERSION,
+            "repair": dict(getattr(self.store, "database_repair", {}) or {}),
+        }
+
+    def _worker_status(self):
+        root = materialize_worker_entrypoints(self.base)
+        manifest_path = root / "manifest.json"
+        value = json.loads(manifest_path.read_text(encoding="utf-8"))
+        records = value.get("workers", {}) if isinstance(value, dict) else {}
+        actual = {}
+        for name in sorted(_WORKER_FILENAMES):
+            path = root / name
+            if not path.is_file():
+                raise RuntimeError("工作进程入口恢复失败：" + name)
+            digest = sha256_file(path)
+            if digest != str(records.get(name, {}).get("sha256", "")):
+                raise RuntimeError("工作进程入口校验失败：" + name)
+            actual[name] = {"path": path.relative_to(self.base).as_posix(), "sha256": digest}
+        extras = []
+        for path in root.iterdir():
+            if path.name in set(_WORKER_FILENAMES) | {"__init__.py", "manifest.json"}:
+                continue
+            if path.name.endswith((".tmp", ".bak", ".old", ".partial")) or path.name.startswith("worker.staging."):
+                extras.append(path)
+        quarantine = quarantine_owned_paths(self.base, extras, "worker_forbidden_or_orphaned")
+        return {"schema_version": WORKER_ENTRY_SCHEMA_VERSION, "entries": actual, "quarantined": quarantine.get("items", [])}
+
+    def _runtime_status(self, require_ready=False):
+        try:
+            value = validate_runtime_manifest(self.base, True, True)
+        except RuntimeError as error:
+            current = self.base / "runtime.current"
+            quarantined = quarantine_owned_paths(self.base, [current] if current.exists() else [], "runtime_invalid")
+            if require_ready:
+                raise RuntimeError("运行库恢复后仍未通过可信清单：" + str(error)) from error
+            return {"ready": False, "reason": str(error), "quarantined": quarantined.get("items", [])}
+        if not isinstance(value, dict):
+            if require_ready:
+                raise RuntimeError("运行库清单缺失")
+            return {"ready": False, "reason": "missing"}
+        return {
+            "ready": True,
+            "manifest_checksum": str(value.get("manifest_checksum", "")),
+            "lock_key": str(value.get("lock_key") or value.get("runtime_lock_key") or ""),
+            "critical_files": len(value.get("critical_files", {})),
+        }
+
+    def _live_game_ids(self):
+        with self.store.lock:
+            return {str(row[0]) for row in self.store.db.execute("SELECT id FROM games")}
+
+    def _referenced_paths(self):
+        references = set()
+        for _, document in self.store._model_asset_documents():
+            references.update(self.store._collect_relative_paths_from_value(document))
+        if self.store._table_exists("vision_models"):
+            with self.store.lock:
+                rows = list(iter_rows(self.store.db.execute("SELECT game_id,relative_path FROM vision_models"), 128))
+            for row in rows:
+                text = str(row["relative_path"] or "")
+                if text:
+                    references.add(Path(text))
+                    references.add(Path(text + ".json"))
+        for game_id in self._live_game_ids():
+            digest = hashlib.sha256(game_id.encode("utf-8", "replace")).hexdigest()
+            references.update(
+                {
+                    Path("models") / "task_graph" / (digest[:16] + ".json"),
+                    Path("models") / "vision" / (digest + ".builtin.json"),
+                    Path("models") / "vision" / "adapters" / "games" / (digest + ".json"),
+                    Path("audit") / "corrective_learning" / ("pending_" + digest[:16] + ".json"),
+                    Path("audit") / "corrective_learning" / ("history_" + digest[:16] + ".jsonl"),
+                    online_acceptance_relative_path(game_id),
+                }
+            )
+            for tier in ("tiny", "medium", "large"):
+                path = Path("models") / "vision" / (digest + "." + tier + ".safetensors")
+                references.add(path)
+                references.add(Path(str(path) + ".json"))
+        for path in (self.base / "models" / "vision").glob("shared_*") if (self.base / "models" / "vision").is_dir() else ():
+            references.add(path.relative_to(self.base))
+        return {Path(*path.parts) for path in references if not path.is_absolute() and ".." not in path.parts}
+
+    def _required_model_paths(self):
+        required = set()
+        for _, document in self.store._model_asset_documents():
+            for path in self.store._collect_relative_paths_from_value(document):
+                if path.as_posix().startswith("models/"):
+                    required.add(path)
+        if self.store._table_exists("vision_models"):
+            with self.store.lock:
+                rows = list(iter_rows(self.store.db.execute("SELECT relative_path FROM vision_models"), 128))
+            for row in rows:
+                text = str(row["relative_path"] or "")
+                if text:
+                    required.add(Path(text))
+        return required
+
+    @staticmethod
+    def _owned_model_name(path):
+        value = Path(path)
+        name = value.name.casefold()
+        parent = value.parent.as_posix().casefold()
+        if parent.endswith("models/task_graph"):
+            return bool(re.fullmatch(r"[0-9a-f]{16}\.json", name))
+        if parent.endswith("models/tensors"):
+            return bool(re.fullmatch(r"[0-9a-f]{64}\.safetensors", name) or re.fullmatch(r"pending_[0-9a-f]{32}\.safetensors", name))
+        if parent.endswith("models/vision/adapters/games"):
+            return bool(re.fullmatch(r"[0-9a-f]{64}\.json", name))
+        if parent.endswith("models/vision"):
+            return bool(
+                re.fullmatch(r"[0-9a-f]{64}(?:\.(?:tiny|medium|large))?\.(?:safetensors|builtin\.json)(?:\.json)?", name)
+            )
+        return False
+
+    def _repair_database_models(self):
+        repaired = []
+        removed = []
+        affected_games = set()
+        if self.store._table_exists("model_backups"):
+            with self.store.lock:
+                backups = list(iter_rows(self.store.db.execute("SELECT id,game_id,payload,checksum FROM model_backups ORDER BY id DESC"), 128))
+            invalid_backup_ids = []
+            for row in backups:
+                if self.store._row_model(row, str(row["game_id"]), True) is None:
+                    invalid_backup_ids.append(int(row["id"]))
+                    affected_games.add(str(row["game_id"]))
+            if invalid_backup_ids:
+                with self.store.critical_transaction():
+                    for start in range(0, len(invalid_backup_ids), 400):
+                        batch = invalid_backup_ids[start:start + 400]
+                        placeholders = ",".join("?" for _ in batch)
+                        self.store.db.execute("DELETE FROM model_backups WHERE id IN (" + placeholders + ")", batch)
+                removed.extend("model_backups:" + str(value) for value in invalid_backup_ids)
+        if self.store._table_exists("models"):
+            with self.store.lock:
+                rows = list(iter_rows(self.store.db.execute("SELECT game_id,slot,payload,checksum FROM models ORDER BY game_id,slot"), 128))
+            invalid_rows = []
+            invalid_complete = set()
+            for row in rows:
+                game_id = str(row["game_id"])
+                complete = str(row["slot"]) == "complete"
+                if self.store._row_model(row, game_id, complete) is None:
+                    invalid_rows.append((game_id, str(row["slot"])))
+                    affected_games.add(game_id)
+                    if complete:
+                        invalid_complete.add(game_id)
+            recovered_games = set()
+            for game_id in sorted(invalid_complete):
+                try:
+                    if self.store.restore_model_backup(game_id):
+                        recovered_games.add(game_id)
+                        repaired.append("models:" + game_id + ":complete")
+                except RECOVERABLE_ERRORS:
+                    pass
+            unresolved = [(game_id, slot) for game_id, slot in invalid_rows if not (slot == "complete" and game_id in recovered_games)]
+            if unresolved:
+                with self.store.critical_transaction():
+                    for game_id, slot in unresolved:
+                        self.store.db.execute("DELETE FROM models WHERE game_id=? AND slot=?", (game_id, slot))
+                    unresolved_games = sorted({game_id for game_id, _ in unresolved})
+                    if unresolved_games:
+                        placeholders = ",".join("?" for _ in unresolved_games)
+                        self.store.db.execute("UPDATE games SET needs_review=1 WHERE id IN (" + placeholders + ")", unresolved_games)
+                removed.extend("models:" + game_id + ":" + slot for game_id, slot in unresolved)
+            for game_id in affected_games:
+                self.store.model_cache.pop(game_id, None)
+        return {"repaired": repaired, "removed": removed, "affected_games": sorted(affected_games)}
+
+    def _model_status_and_orphans(self, references):
+        repair = self._repair_database_models()
+        references = self._referenced_paths()
+        missing = []
+        corrupt = []
+        orphaned = []
+        for relative in sorted(self._required_model_paths(), key=lambda item: item.as_posix()):
+            path = (self.base / relative).resolve()
+            if not path_inside(path, self.base):
+                continue
+            if not path.exists():
+                missing.append(relative.as_posix())
+        if self.store._table_exists("vision_models"):
+            with self.store.lock:
+                rows = list(iter_rows(self.store.db.execute("SELECT game_id,relative_path,checksum FROM vision_models"), 128))
+            invalid_games = set()
+            for row in rows:
+                relative = Path(str(row["relative_path"] or ""))
+                if not relative.parts:
+                    continue
+                path = (self.base / relative).resolve()
+                checksum = str(row["checksum"] or "")
+                invalid = not path_inside(path, self.base) or not path.is_file()
+                if not invalid and checksum:
+                    try:
+                        invalid = sha256_file(path, MODEL_MAX_BYTES) != checksum
+                    except RECOVERABLE_ERRORS:
+                        invalid = True
+                if invalid:
+                    invalid_games.add(str(row["game_id"]))
+                    if path.exists() and path_inside(path, self.base):
+                        corrupt.append(path)
+                        metadata = Path(str(path) + ".json")
+                        if metadata.exists():
+                            corrupt.append(metadata)
+            if invalid_games:
+                with self.store.critical_transaction():
+                    placeholders = ",".join("?" for _ in invalid_games)
+                    values = tuple(sorted(invalid_games))
+                    self.store.db.execute("DELETE FROM vision_models WHERE game_id IN (" + placeholders + ")", values)
+                    self.store.db.execute("UPDATE games SET needs_review=1 WHERE id IN (" + placeholders + ")", values)
+                for game_id in invalid_games:
+                    self.store.model_cache.pop(game_id, None)
+                references = self._referenced_paths()
+        for root in (self.base / "models" / "vision", self.base / "models" / "task_graph", self.base / "models" / "tensors"):
+            if not root.is_dir():
+                continue
+            for path in root.rglob("*"):
+                if not path.is_file() or is_reparse_point(path):
+                    continue
+                relative = path.relative_to(self.base)
+                if relative in references or str(relative).endswith(".json") and Path(str(relative)[:-5]) in references:
+                    continue
+                if self._owned_model_name(relative):
+                    orphaned.append(path)
+        quarantined_corrupt = quarantine_owned_paths(self.base, corrupt, "managed_optional_corrupt_model")
+        quarantined_orphans = quarantine_owned_paths(self.base, orphaned, "forbidden_or_orphaned_model")
+        return {
+            "referenced": len(references),
+            "missing_regenerable": sorted(set(missing)),
+            "database_repair": repair,
+            "corrupt_regenerable": [item["original"] for item in quarantined_corrupt.get("items", [])],
+            "orphaned": [item["original"] for item in quarantined_orphans.get("items", [])],
+        }
+
+    def _runtime_orphans(self):
+        candidates = []
+        for pattern in (
+            "runtime.staging.*",
+            "runtime.rollback.*",
+            "runtime.invalid.*",
+            "runtime.incompatible.*",
+            "runtime.retained.rollback.*",
+        ):
+            candidates.extend(path for path in self.base.glob(pattern) if path.exists())
+        return quarantine_owned_paths(self.base, candidates, "forbidden_or_orphaned_runtime")
+
+    def _stale_cache_orphans(self):
+        now = time.time()
+        candidates = []
+        temp = self.base / "temp"
+        if temp.is_dir():
+            for path in temp.iterdir():
+                if not path.is_file():
+                    continue
+                owned = path.name.startswith(("runtime_request_", "ai_stop_", "training_samples_", "ugai_")) or path.suffix.casefold() in {".tmp", ".part"}
+                try:
+                    stale = now - path.stat().st_mtime >= 86400.0
+                except RECOVERABLE_ERRORS:
+                    stale = False
+                if owned and stale:
+                    candidates.append(path)
+        cache = self.base / "cache"
+        managed_roots = {
+            "pip",
+            "huggingface_hub",
+            "transformers",
+            "pycache",
+            "torch_extensions",
+            "cuda",
+            "numba",
+            "matplotlib",
+            "runtime_downloads",
+            "review_samples",
+        }
+        if cache.is_dir():
+            for child in cache.iterdir():
+                if child.name not in managed_roots or not child.exists():
+                    continue
+                for path in child.rglob("*"):
+                    if not path.is_file() or is_reparse_point(path):
+                        continue
+                    try:
+                        stale = now - path.stat().st_mtime >= 30.0 * 86400.0
+                    except RECOVERABLE_ERRORS:
+                        stale = False
+                    if stale:
+                        candidates.append(path)
+        return quarantine_owned_paths(self.base, candidates, "expired_managed_cache")
+
+    def _audit_attachment_orphans(self):
+        attachment_root = self.base / "audit" / "attachments"
+        if not attachment_root.is_dir():
+            return {"items": []}
+        referenced = set()
+        audit_root = self.base / "audit"
+        for path in audit_root.rglob("*"):
+            if not path.is_file() or path.is_relative_to(attachment_root) or path.suffix.casefold() not in {".json", ".jsonl"}:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except RECOVERABLE_ERRORS:
+                continue
+            for candidate in attachment_root.rglob("*"):
+                if candidate.is_file() and candidate.name in text:
+                    referenced.add(candidate.resolve())
+        candidates = [path for path in attachment_root.rglob("*") if path.is_file() and path.resolve() not in referenced]
+        return quarantine_owned_paths(self.base, candidates, "orphaned_audit_attachment")
+
+    def _is_currently_referenced(self, relative, references):
+        path = Path(relative)
+        if path in references:
+            return True
+        text = path.as_posix()
+        if text.startswith("project/uga/workers/"):
+            return path.name in set(_WORKER_FILENAMES) | {"__init__.py", "manifest.json"}
+        if text == "runtime.current":
+            return False
+        return False
+
+    def _finalize_orphan_quarantine(self, references):
+        root = self.base / "quarantine" / "orphans"
+        result = {"deleted": [], "restored": [], "pending": []}
+        if not root.is_dir():
+            return result
+        for transaction in sorted(path for path in root.iterdir() if path.is_dir()):
+            manifest_path = transaction / "manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except RECOVERABLE_ERRORS:
+                result["pending"].append(transaction.relative_to(self.base).as_posix())
+                continue
+            release = safe_int(manifest.get("release_generation"), safe_int(manifest.get("created_generation"), 0) + 1, 0)
+            if self.generation < release:
+                result["pending"].append(transaction.relative_to(self.base).as_posix())
+                continue
+            for item in manifest.get("items", []):
+                original = Path(str(item.get("original", "")))
+                stored = transaction / str(item.get("stored", ""))
+                target = self.base / original
+                if self._is_currently_referenced(original, references):
+                    if stored.exists() and not target.exists():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(stored, target)
+                        result["restored"].append(original.as_posix())
+                    continue
+                if stored.is_dir():
+                    shutil.rmtree(stored, ignore_errors=False)
+                elif stored.exists():
+                    stored.unlink()
+                result["deleted"].append(original.as_posix())
+            try:
+                shutil.rmtree(transaction)
+            except RECOVERABLE_ERRORS:
+                result["pending"].append(transaction.relative_to(self.base).as_posix())
+        return result
+
+    def _finalize_database_recovery(self):
+        root = self.base / "quarantine" / "database_recovery"
+        result = []
+        if not root.is_dir():
+            return result
+        for transaction in sorted(path for path in root.iterdir() if path.is_dir()):
+            try:
+                manifest = json.loads((transaction / "manifest.json").read_text(encoding="utf-8"))
+            except RECOVERABLE_ERRORS:
+                continue
+            release = safe_int(manifest.get("release_generation"), safe_int(manifest.get("created_generation"), 0) + 1, 0)
+            if manifest.get("delete_after_startup_generation") is True and self.generation >= release:
+                shutil.rmtree(transaction)
+                result.append(transaction.name)
+        return result
+
+    def _write_manifest(self, required, managed_optional, forbidden_or_orphaned):
+        value = {
+            "schema_version": 1,
+            "generated": time.time(),
+            "startup_generation": self.generation,
+            "required": required,
+            "managed_optional": managed_optional,
+            "forbidden_or_orphaned": forbidden_or_orphaned,
+        }
+        durable_atomic_write(
+            self.manifest_path,
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            self.base,
+        )
+        return value
+
+    def preflight(self):
+        database = self._database_status()
+        workers = self._worker_status()
+        references = self._referenced_paths()
+        finalized = self._finalize_orphan_quarantine(references)
+        database_recovery = self._finalize_database_recovery()
+        runtime = self._runtime_status(False)
+        model_status = self._model_status_and_orphans(references)
+        runtime_orphans = self._runtime_orphans()
+        cache_orphans = self._stale_cache_orphans()
+        audit_orphans = self._audit_attachment_orphans()
+        return self._write_manifest(
+            {"database": database, "workers": workers, "runtime": runtime},
+            {"models": model_status},
+            {
+                "runtime": runtime_orphans.get("items", []),
+                "cache": cache_orphans.get("items", []),
+                "audit_attachments": audit_orphans.get("items", []),
+                "finalized": finalized,
+                "database_recovery_deleted": database_recovery,
+            },
+        )
+
+    def postflight(self):
+        database = self._database_status()
+        workers = self._worker_status()
+        runtime = self._runtime_status(True)
+        references = self._referenced_paths()
+        models = self._model_status_and_orphans(references)
+        return self._write_manifest(
+            {"database": database, "workers": workers, "runtime": runtime},
+            {"models": models},
+            {"runtime": [], "cache": [], "audit_attachments": []},
+        )
+
+
 class RuntimeInstaller:
-    def __init__(self, base, test_mode=None):
+    def __init__(self, base):
         self.base = Path(base)
         self.process = None
         self.job_handle = None
         self.lock = threading.RLock()
         self.cancelled = False
         self.staging = None
-        self.test_mode = str(test_mode) if test_mode is not None else None
 
     def _hardware_probe(self):
         result = {"adapters": [], "probe": "unavailable", "created": time.time()}
@@ -37420,8 +37558,11 @@ class RuntimeInstaller:
         return handle
 
     def _cleanup_staging(self):
-        for item in self.base.glob("runtime.staging.*"):
-            shutil.rmtree(item, ignore_errors=True)
+        quarantine_owned_paths(
+            self.base,
+            [item for item in self.base.glob("runtime.staging.*") if item.exists()],
+            "runtime_interrupted_staging",
+        )
         recover_runtime_layout(self.base)
 
     def run(self, stop_event, on_progress=None, on_line=None):
@@ -37458,7 +37599,6 @@ class RuntimeInstaller:
                     "vendor": self._gpu_vendor(),
                     "architecture": architecture,
                     "protocol_version": RUNTIME_INSTALL_PROTOCOL_VERSION,
-                    "test_protocol_version": TEST_WORKER_PROTOCOL_VERSION,
                     "stage": WorkerStage.STARTING.value,
                 },
                 ensure_ascii=False,
@@ -37470,10 +37610,7 @@ class RuntimeInstaller:
         env = os.environ.copy()
         env["PYTHONNOUSERSITE"] = "1"
         runtime_worker = worker_entry_path(self.base, "runtime_install_worker.py")
-        if self.test_mode is None:
-            command = [sys.executable, str(runtime_worker), "install", str(request_path)]
-        else:
-            command = [sys.executable, str(runtime_worker), "test", str(request_path), self.test_mode]
+        command = [sys.executable, str(runtime_worker), "install", str(request_path)]
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -39090,6 +39227,12 @@ class OfflineOCRRuntime:
                 continue
         return values
 
+    def recognize_regions(self, frame, norms):
+        values = []
+        for norm in list(norms or [])[:32]:
+            values.append(self.recognize_region(frame, norm))
+        return values
+
     def recognize_region(self, frame, norm):
         preview = preview_rgb_bytes(frame.get("preview_rgb"))
         width = safe_int(frame.get("preview_width", PREVIEW_W), PREVIEW_W, 1, 8192)
@@ -39722,6 +39865,8 @@ def ai_worker_main(base, address, auth_text, family, protocol_version=None):
                     )
                 elif operation == "ocr_recognize_region":
                     value = ocr.recognize_region(dict(payload.get("frame", {})), payload.get("norm"))
+                elif operation == "ocr_recognize_regions":
+                    value = ocr.recognize_regions(dict(payload.get("frame", {})), payload.get("norms", []))
                 else:
                     raise RuntimeError("未知AI工作进程操作：" + operation)
                 connection.send({"kind": WorkerMessageKind.RESULT.value, "id": request_id, "value": value})
@@ -40228,6 +40373,14 @@ class OCRRuntimeProxy:
             raise RuntimeError("AI工作进程不可用")
         return True
 
+    def recognize_regions(self, frame, norms):
+        self.require_ready()
+        return self.worker.request(
+            "ocr_recognize_regions",
+            {"frame": dict(frame), "norms": [list(value) for value in list(norms or [])[:32]]},
+            45.0,
+        )
+
     def recognize_region(self, frame, norm):
         self.require_ready()
         return self.worker.request("ocr_recognize_region", {"frame": dict(frame), "norm": norm}, 45.0)
@@ -40593,6 +40746,11 @@ class OCRSemanticEngine:
             "previous_numeric_value": None,
             "numeric_delta": 0.0,
             "semantic_version": OCR_SEMANTIC_VERSION,
+            "numeric_preference": normalize_numeric_preference(
+                normalize_relation_config(definition.get("relation_config", {})).get(
+                    "preference", definition.get("goal_relation", NumericPreference.KEEP_SAME.value)
+                )
+            ),
         }
         if not isinstance(parsed, dict) or not parsed.get("valid"):
             event["status"] = "unreadable"
@@ -40681,6 +40839,7 @@ class OCRSemanticEngine:
                 event["status"] = "resource"
         elif relation == "countdown":
             event["status"] = "countdown"
+        event["progress"] = 0.0
         return event
 
 
@@ -40706,80 +40865,394 @@ class OCRMonitor:
     def _run(self):
         try:
             game = self.app.require_game()
-            definitions = self.app.store.list_ocr_regions(game["id"], True)
+            definitions = [dict(item) for item in self.app.store.list_ocr_regions(game["id"], True)]
+            definitions.sort(
+                key=lambda item: (
+                    safe_int(item.get("priority"), 0),
+                    safe_float(item.get("created"), 0.0),
+                    str(item.get("id", "")),
+                )
+            )
+            for priority, definition in enumerate(definitions):
+                definition["priority"] = priority
             if not definitions:
                 return
+            previous_snapshot = {}
+            frame_sequence = 0
+            states = {}
+            for item in definitions:
+                region_id = str(item["id"])
+                norm = _clamp_region_norm(item.get("region_norm"))
+                templates = _decode_tracking_templates(item)
+                states[region_id] = {
+                    "norm": norm,
+                    "templates": templates,
+                    "template": templates[0] if templates else b"",
+                    "lost": 0,
+                    "pending_norm": None,
+                    "pending_count": 0,
+                    "high_confidence_frames": 0,
+                    "stable_tracking_frames": 0,
+                    "persisted_norm": list(norm),
+                    "last_persisted": 0.0,
+                }
             while not self.stop_event.is_set() and not self.app.should_stop():
                 frame = self.frame_buffer.latest(None, 1.0)
                 if frame is None or frame.get("time") == self.last_stamp or not frame.get("capture_valid"):
                     self.stop_event.wait(0.12)
                     continue
                 self.last_stamp = frame.get("time")
+                frame_sequence += 1
+                frame_started = time.monotonic()
+                frame_deadline = frame_started + (0.12 if self.purpose == "training" else 0.08)
+                observations = {}
+                eligible = []
+                ranked_by_region = {}
                 for definition in definitions:
-                    if self.stop_event.is_set() or self.app.should_stop():
-                        break
+                    region_id = str(definition["id"])
+                    state = states[region_id]
+                    priority = safe_int(definition.get("priority"), 0, 0)
+                    stable = safe_int(state.get("stable_tracking_frames"), 0, 0)
+                    divisor = 1 if priority <= 1 else min(6, 1 + priority // 2 + (1 if stable >= 12 else 0))
+                    if divisor > 1 and frame_sequence % divisor:
+                        continue
+                    ranked = _adaptive_region_candidates(frame, definition, state)
+                    candidate_budget = 6 if state.get("lost", 0) else 2 if stable >= 12 else 4 if priority <= 1 else 3
+                    ranked_by_region[region_id] = ranked[:candidate_budget]
+                    if ranked_by_region[region_id]:
+                        eligible.append(definition)
+                batch_results = {}
+                if eligible and time.monotonic() < frame_deadline:
+                    first_norms = [ranked_by_region[str(item["id"])][0][1] for item in eligible]
                     try:
-                        recognized = self.app.ocr_runtime.recognize_region(frame, definition["region_norm"])
+                        values = self.app.ocr_runtime.recognize_regions(frame, first_norms)
+                        for definition, value in zip(eligible, values):
+                            batch_results[str(definition["id"])] = value
+                    except RECOVERABLE_ERRORS as error:
+                        self.app.store.log_error(
+                            "OCR_BATCH_RECOGNITION_FAILED",
+                            error,
+                            mode=self.app.mode,
+                            game_id=game["id"],
+                        )
+                for definition in eligible:
+                    if self.stop_event.is_set() or self.app.should_stop() or time.monotonic() >= frame_deadline:
+                        break
+                    region_id = str(definition["id"])
+                    state = states[region_id]
+                    was_lost = state.get("lost", 0) > 0
+                    ranked = ranked_by_region.get(region_id, [])
+                    best_payload = None
+                    best_quality = -10.0
+                    for rank, (distance, candidate_norm, descriptor) in enumerate(ranked):
+                        if time.monotonic() >= frame_deadline:
+                            break
+                        try:
+                            recognized = batch_results.get(region_id) if rank == 0 else None
+                            if recognized is None:
+                                recognized = self.app.ocr_runtime.recognize_region(frame, candidate_norm)
+                        except RECOVERABLE_ERRORS as error:
+                            if rank == 0:
+                                self.app.store.log_error(
+                                    "OCR_TRACKING_RECOGNITION_FAILED",
+                                    error,
+                                    mode=self.app.mode,
+                                    game_id=game["id"],
+                                )
+                            continue
                         parsed = (
                             parse_ocr_number(recognized.get("text"), definition.get("number_format", "auto"))
                             if definition.get("region_type") == "number"
                             else {"valid": False}
                         )
-                        consensus = self.consensus.update(
-                            definition["id"],
-                            recognized.get("text", ""),
-                            parsed.get("value") if isinstance(parsed, dict) else None,
-                            recognized.get("confidence", 0.0),
+                        confidence = safe_float(recognized.get("confidence", 0.0), 0.0, 0.0, 1.0)
+                        quality = (
+                            confidence
+                            + (0.72 if parsed.get("valid") else 0.0)
+                            - min(1.2, distance) * 0.42
+                            - rank * 0.018
                         )
-                        if parsed.get("valid") and finite_number(consensus.get("value")):
-                            parsed = dict(parsed)
-                            parsed["value"] = safe_float(consensus.get("value"))
-                            parsed["confidence"] = max(
-                                safe_float(parsed.get("confidence", 0.0), 0.0),
-                                safe_float(consensus.get("confidence", 0.0), 0.0),
+                        if best_payload is None or quality > best_quality:
+                            best_quality = quality
+                            best_payload = (recognized, parsed, candidate_norm, descriptor, distance)
+                        if parsed.get("valid") and confidence >= 0.72 and distance <= 0.72:
+                            break
+                    if best_payload is None:
+                        state["lost"] = min(1000, state.get("lost", 0) + 1)
+                        state["pending_norm"] = None
+                        state["pending_count"] = 0
+                        state["high_confidence_frames"] = 0
+                        state["stable_tracking_frames"] = 0
+                        continue
+                    recognized, parsed, candidate_norm, descriptor, distance = best_payload
+                    consensus = self.consensus.update(
+                        region_id,
+                        recognized.get("text", ""),
+                        parsed.get("value") if isinstance(parsed, dict) else None,
+                        recognized.get("confidence", 0.0),
+                    )
+                    if parsed.get("valid") and finite_number(consensus.get("value")):
+                        parsed = dict(parsed)
+                        parsed["value"] = safe_float(consensus.get("value"))
+                        parsed["confidence"] = max(
+                            safe_float(parsed.get("confidence", 0.0), 0.0),
+                            safe_float(consensus.get("confidence", 0.0), 0.0),
+                        )
+                        parsed["consensus_text"] = str(consensus.get("text", ""))
+                        parsed["stable_frames"] = safe_int(consensus.get("stable_frames"), 0)
+                        parsed["temporal_disagreement"] = bool(consensus.get("conflict"))
+                    consensus_confidence = safe_float(consensus.get("confidence"), 0.0, 0.0, 1.0)
+                    confident = bool(parsed.get("valid") and consensus_confidence >= 0.34 and distance <= 1.08)
+                    if confident:
+                        pending = state.get("pending_norm")
+                        if pending is not None and _rect_iou(pending, candidate_norm) >= 0.58:
+                            state["pending_count"] = min(1000, state.get("pending_count", 0) + 1)
+                            state["pending_norm"] = _clamp_region_norm(
+                                [
+                                    pending[index] * 0.62 + candidate_norm[index] * 0.38
+                                    for index in range(4)
+                                ]
                             )
-                            parsed["consensus_text"] = str(consensus.get("text", ""))
-                            parsed["stable_frames"] = safe_int(consensus.get("stable_frames"), 0)
-                            parsed["temporal_disagreement"] = bool(consensus.get("conflict"))
-                        runtime_context = {
-                            "task_phase": str(frame.get("task_phase", "unknown")),
-                            "subgoal_id": str(frame.get("subgoal_id", "")),
-                            "terminal_state": str(frame.get("terminal_state", "")),
-                            "recent_actions": list(frame.get("recent_actions", []))[-8:],
+                        else:
+                            state["pending_norm"] = _clamp_region_norm(candidate_norm)
+                            state["pending_count"] = 1
+                        state["high_confidence_frames"] = (
+                            min(1000, state.get("high_confidence_frames", 0) + 1)
+                            if consensus_confidence >= 0.58
+                            else 0
+                        )
+                        if state["pending_count"] >= NUMERIC_TRACKING_CONFIRM_FRAMES:
+                            committed = _clamp_region_norm(state["pending_norm"])
+                            previous = list(state["norm"])
+                            state["norm"] = committed
+                            definition["region_norm"] = list(committed)
+                            state["lost"] = 0
+                            state["stable_tracking_frames"] = (
+                                min(10000, state.get("stable_tracking_frames", 0) + 1)
+                                if _rect_iou(previous, committed) >= 0.88
+                                else 1
+                            )
+                        if (
+                            descriptor
+                            and state["high_confidence_frames"] >= NUMERIC_TRACKING_TEMPLATE_UPDATE_FRAMES
+                            and consensus_confidence >= 0.64
+                        ):
+                            templates = list(state.get("templates", []))
+                            nearest = min(
+                                (_descriptor_distance(template, descriptor) for template in templates),
+                                default=2.0,
+                            )
+                            if nearest >= 0.035:
+                                templates.insert(0, bytes(descriptor))
+                            elif templates:
+                                closest_index = min(
+                                    range(len(templates)),
+                                    key=lambda index: _descriptor_distance(templates[index], descriptor),
+                                )
+                                old = templates[closest_index]
+                                templates[closest_index] = bytes(
+                                    int(old_value * 0.86 + new_value * 0.14)
+                                    for old_value, new_value in zip(old, descriptor)
+                                )
+                            else:
+                                templates = [bytes(descriptor)]
+                            state["templates"] = templates[:NUMERIC_TRACKING_HISTORY_LIMIT]
+                            state["template"] = state["templates"][0]
+                            config = normalize_relation_config(definition.get("relation_config", {}))
+                            encoded = [_encode_tracking_template(value) for value in state["templates"] if value]
+                            config["tracking_templates"] = encoded
+                            config["tracking_template"] = encoded[0] if encoded else ""
+                            definition["relation_config"] = config
+                            state["high_confidence_frames"] = 0
+                        config = normalize_relation_config(definition.get("relation_config", {}))
+                        should_persist = bool(config.get("tracking_persist_stable", False))
+                        moved = _rect_iou(state.get("persisted_norm", state["norm"]), state["norm"]) < 0.88
+                        now = time.monotonic()
+                        if (
+                            should_persist
+                            and moved
+                            and state.get("stable_tracking_frames", 0) >= NUMERIC_TRACKING_PERSIST_FRAMES
+                            and now - state.get("last_persisted", 0.0) >= 30.0
+                        ):
+                            persisted = dict(definition)
+                            persisted["region_norm"] = list(state["norm"])
+                            self.app.store.save_ocr_region(game["id"], persisted)
+                            state["persisted_norm"] = list(state["norm"])
+                            state["last_persisted"] = now
+                    else:
+                        state["lost"] = min(1000, state.get("lost", 0) + 1)
+                        state["pending_norm"] = None
+                        state["pending_count"] = 0
+                        state["high_confidence_frames"] = 0
+                        state["stable_tracking_frames"] = 0
+                    observations[region_id] = {
+                        "definition": definition,
+                        "recognized": recognized,
+                        "parsed": parsed,
+                        "consensus": consensus,
+                        "tracked_norm": list(state["norm"]),
+                        "candidate_norm": list(candidate_norm),
+                        "candidate_confirm_frames": state.get("pending_count", 0),
+                        "lost_frames": state["lost"],
+                        "tracking_distance": distance,
+                        "recovered": bool(was_lost and confident),
+                    }
+                frame_id = str(
+                    frame.get("frame_id")
+                    or (str(game["id"]) + "|" + format(safe_float(frame.get("time"), time.time()), ".9f"))
+                )
+                current_snapshot = {}
+                for definition in definitions:
+                    region_id = str(definition["id"])
+                    item = observations.get(region_id)
+                    if item is None:
+                        current_snapshot[region_id] = {
+                            "valid": False,
+                            "value": None,
+                            "stable_frames": 0,
+                            "occluded": True,
+                            "recovered": False,
+                            "frame_id": frame_id,
                         }
-                        event = (
-                            OCR_SEMANTIC_ENGINE.evaluate(definition, parsed, runtime_context)
-                            if definition.get("region_type") == "number"
-                            else {
+                        continue
+                    parsed = item.get("parsed", {})
+                    consensus = item.get("consensus", {})
+                    stable_frames = safe_int(consensus.get("stable_frames"), 0)
+                    valid = bool(
+                        isinstance(parsed, dict)
+                        and parsed.get("valid")
+                        and finite_number(parsed.get("value"))
+                        and stable_frames >= NUMERIC_REWARD_STABLE_FRAMES
+                        and not consensus.get("conflict")
+                        and not item.get("recovered")
+                        and safe_int(item.get("lost_frames"), 0) == 0
+                        and safe_int(item.get("candidate_confirm_frames"), 0) >= NUMERIC_TRACKING_CONFIRM_FRAMES
+                    )
+                    current_snapshot[region_id] = {
+                        "valid": valid,
+                        "value": safe_float(parsed.get("value")) if valid else None,
+                        "stable_frames": stable_frames,
+                        "occluded": safe_int(item.get("lost_frames"), 0) > 0,
+                        "recovered": bool(item.get("recovered")),
+                        "temporal_disagreement": bool(consensus.get("conflict")),
+                        "frame_id": frame_id,
+                    }
+                comparison = (
+                    compare_numeric_snapshots_detailed(definitions, previous_snapshot, current_snapshot)
+                    if previous_snapshot
+                    else {
+                        "reward": 0.0,
+                        "winning_region_id": "",
+                        "status": "initial_snapshot",
+                        "priority": None,
+                    }
+                )
+                region_values = {
+                    region_id: snapshot.get("value")
+                    for region_id, snapshot in current_snapshot.items()
+                    if snapshot.get("valid") and finite_number(snapshot.get("value"))
+                }
+                event_summaries = []
+                terminal = ""
+                for definition in definitions:
+                    region_id = str(definition["id"])
+                    item = observations.get(region_id)
+                    if item is None:
+                        event_summaries.append(
+                            {
+                                "region_id": region_id,
+                                "priority": safe_int(definition.get("priority"), 0),
+                                "status": "unreadable",
                                 "terminal": "",
-                                "progress": 0.0,
-                                "status": "text_only",
                                 "reset": "",
-                                "semantic_version": OCR_SEMANTIC_VERSION,
                             }
                         )
-                        event["ocr_temporal_disagreement"] = bool(consensus.get("conflict"))
-                        event["stable_frames"] = safe_int(consensus.get("stable_frames"), 0)
-                        SEMANTIC_EVENT_HUB.publish(game["id"], definition["id"], event)
-                        now = time.monotonic()
-                        if now - self.last_saved[definition["id"]] >= 0.8:
-                            self.last_saved[definition["id"]] = now
-                            self.app.store.append_ocr_observation(
-                                game["id"],
-                                definition["id"],
-                                recognized.get("text", ""),
-                                parsed,
-                                consensus.get("confidence", recognized.get("confidence", 0.0)),
-                                consensus.get("stable_frames", 0),
-                                event,
-                            )
-                    except Exception as error:
-                        self.app.store.log_error(
-                            "OCR_MONITOR_FRAME_FAILED", error, mode=self.app.mode, game_id=game["id"]
+                        continue
+                    parsed = item["parsed"]
+                    consensus = item["consensus"]
+                    runtime_context = {
+                        "task_phase": str(frame.get("task_phase", "unknown")),
+                        "subgoal_id": str(frame.get("subgoal_id", "")),
+                        "terminal_state": str(frame.get("terminal_state", "")),
+                        "recent_actions": list(frame.get("recent_actions", []))[-8:],
+                        "region_values": region_values,
+                        "tracked_norm": item["tracked_norm"],
+                        "candidate_norm": item["candidate_norm"],
+                        "candidate_confirm_frames": item["candidate_confirm_frames"],
+                        "lost_frames": item["lost_frames"],
+                        "tracking_distance": item["tracking_distance"],
+                        "frame_id": frame_id,
+                    }
+                    event = (
+                        OCR_SEMANTIC_ENGINE.evaluate(definition, parsed, runtime_context)
+                        if definition.get("region_type") == "number"
+                        else {
+                            "terminal": "",
+                            "progress": 0.0,
+                            "status": "text_only",
+                            "reset": "",
+                            "semantic_version": OCR_SEMANTIC_VERSION,
+                        }
+                    )
+                    event["progress"] = 0.0
+                    event["ocr_temporal_disagreement"] = bool(consensus.get("conflict"))
+                    event["stable_frames"] = safe_int(consensus.get("stable_frames"), 0)
+                    event["tracked_region_norm"] = item["tracked_norm"]
+                    event["tracking_candidate_norm"] = item["candidate_norm"]
+                    event["tracking_candidate_confirm_frames"] = item["candidate_confirm_frames"]
+                    event["tracking_lost_frames"] = item["lost_frames"]
+                    event["tracking_template_distance"] = item["tracking_distance"]
+                    event["tracking_recovered"] = bool(item.get("recovered"))
+                    event["frame_id"] = frame_id
+                    event["priority"] = safe_int(definition.get("priority"), 0)
+                    event["snapshot_reward"] = safe_float(comparison.get("reward"), 0.0, -1.0, 1.0)
+                    event["snapshot_status"] = str(comparison.get("status", "neutral"))
+                    event["snapshot_winning_region_id"] = str(comparison.get("winning_region_id", ""))
+                    event["snapshot_value"] = dict(current_snapshot.get(region_id, {}))
+                    if not terminal and event.get("terminal") in {"success", "failure"}:
+                        terminal = str(event.get("terminal"))
+                    event_summaries.append(
+                        {
+                            "region_id": region_id,
+                            "priority": event["priority"],
+                            "status": str(event.get("status", "neutral")),
+                            "terminal": str(event.get("terminal", "")),
+                            "reset": str(event.get("reset", "")),
+                            "valid": bool(current_snapshot.get(region_id, {}).get("valid")),
+                        }
+                    )
+                    saved_at = time.monotonic()
+                    if saved_at - self.last_saved[region_id] >= 0.8:
+                        self.last_saved[region_id] = saved_at
+                        self.app.store.append_ocr_observation(
+                            game["id"],
+                            region_id,
+                            item["recognized"].get("text", ""),
+                            parsed,
+                            consensus.get("confidence", item["recognized"].get("confidence", 0.0)),
+                            consensus.get("stable_frames", 0),
+                            event,
                         )
-                self.stop_event.wait(0.18 if self.purpose == "training" else 0.3)
+                snapshot_event = {
+                    "terminal": terminal,
+                    "progress": safe_float(comparison.get("reward"), 0.0, -1.0, 1.0),
+                    "numeric_progress": safe_float(comparison.get("reward"), 0.0, -1.0, 1.0),
+                    "status": str(comparison.get("status", "neutral")),
+                    "winning_region_id": str(comparison.get("winning_region_id", "")),
+                    "winning_priority": comparison.get("priority"),
+                    "events": event_summaries,
+                    "before_snapshot": previous_snapshot,
+                    "now_snapshot": current_snapshot,
+                    "frame_id": frame_id,
+                }
+                SEMANTIC_EVENT_HUB.publish_snapshot(game["id"], frame_id, snapshot_event)
+                previous_snapshot = current_snapshot
+                elapsed = time.monotonic() - frame_started
+                target_interval = 0.18 if self.purpose == "training" else 0.3
+                self.stop_event.wait(max(0.0, target_interval - elapsed))
         finally:
-            self.app.store.close_current_thread()
+            if self.app.store is not None:
+                self.app.store.close_current_thread()
 
     def stop(self, timeout=1.0):
         self.stop_event.set()
@@ -40790,385 +41263,6 @@ class OCRMonitor:
     def alive(self):
         return bool(self.thread and self.thread.is_alive())
 
-def _evaluate_extended_numeric_preference(definition, parsed, runtime_context, event):
-    value = dict(event) if isinstance(event, dict) else {}
-    value["progress"] = 0.0
-    value["numeric_preference"] = normalize_numeric_preference(
-        normalize_relation_config(definition.get("relation_config", {})).get(
-            "preference", definition.get("goal_relation", NumericPreference.KEEP_SAME.value)
-        )
-    )
-    if not isinstance(parsed, dict) or not parsed.get("valid") or not finite_number(parsed.get("value")):
-        value["status"] = "unreadable"
-    return value
-
-_ORIGINAL_OCR_SEMANTIC_EVALUATE = OCRSemanticEngine.evaluate
-
-
-def _extended_ocr_semantic_evaluate(self, definition, parsed, runtime_context=None):
-    context = dict(runtime_context) if isinstance(runtime_context, dict) else {}
-    event = _ORIGINAL_OCR_SEMANTIC_EVALUATE(self, definition, parsed, context)
-    return _evaluate_extended_numeric_preference(definition, parsed, context, event)
-
-
-OCRSemanticEngine.evaluate = _extended_ocr_semantic_evaluate
-
-
-def _adaptive_ocr_monitor_run(self):
-    try:
-        game = self.app.require_game()
-        definitions = [dict(item) for item in self.app.store.list_ocr_regions(game["id"], True)]
-        definitions.sort(
-            key=lambda item: (
-                safe_int(item.get("priority"), 0),
-                safe_float(item.get("created"), 0.0),
-                str(item.get("id", "")),
-            )
-        )
-        for priority, definition in enumerate(definitions):
-            definition["priority"] = priority
-        if not definitions:
-            return
-        previous_snapshot = {}
-        states = {}
-        for item in definitions:
-            region_id = str(item["id"])
-            norm = _clamp_region_norm(item.get("region_norm"))
-            templates = _decode_tracking_templates(item)
-            states[region_id] = {
-                "norm": norm,
-                "templates": templates,
-                "template": templates[0] if templates else b"",
-                "lost": 0,
-                "pending_norm": None,
-                "pending_count": 0,
-                "high_confidence_frames": 0,
-                "stable_tracking_frames": 0,
-                "persisted_norm": list(norm),
-                "last_persisted": 0.0,
-            }
-        while not self.stop_event.is_set() and not self.app.should_stop():
-            frame = self.frame_buffer.latest(None, 1.0)
-            if frame is None or frame.get("time") == self.last_stamp or not frame.get("capture_valid"):
-                self.stop_event.wait(0.12)
-                continue
-            self.last_stamp = frame.get("time")
-            observations = {}
-            for definition in definitions:
-                if self.stop_event.is_set() or self.app.should_stop():
-                    break
-                region_id = str(definition["id"])
-                state = states[region_id]
-                was_lost = state.get("lost", 0) > 0
-                ranked = _adaptive_region_candidates(frame, definition, state)
-                best_payload = None
-                best_quality = -10.0
-                for rank, (distance, candidate_norm, descriptor) in enumerate(ranked[:8]):
-                    try:
-                        recognized = self.app.ocr_runtime.recognize_region(frame, candidate_norm)
-                    except RECOVERABLE_ERRORS as error:
-                        if rank == 0:
-                            self.app.store.log_error(
-                                "OCR_TRACKING_RECOGNITION_FAILED",
-                                error,
-                                mode=self.app.mode,
-                                game_id=game["id"],
-                            )
-                        continue
-                    parsed = (
-                        parse_ocr_number(recognized.get("text"), definition.get("number_format", "auto"))
-                        if definition.get("region_type") == "number"
-                        else {"valid": False}
-                    )
-                    confidence = safe_float(recognized.get("confidence", 0.0), 0.0, 0.0, 1.0)
-                    quality = (
-                        confidence
-                        + (0.72 if parsed.get("valid") else 0.0)
-                        - min(1.2, distance) * 0.42
-                        - rank * 0.018
-                    )
-                    if best_payload is None or quality > best_quality:
-                        best_quality = quality
-                        best_payload = (recognized, parsed, candidate_norm, descriptor, distance)
-                    if parsed.get("valid") and confidence >= 0.72 and distance <= 0.72:
-                        break
-                if best_payload is None:
-                    state["lost"] = min(1000, state.get("lost", 0) + 1)
-                    state["pending_norm"] = None
-                    state["pending_count"] = 0
-                    state["high_confidence_frames"] = 0
-                    state["stable_tracking_frames"] = 0
-                    continue
-                recognized, parsed, candidate_norm, descriptor, distance = best_payload
-                consensus = self.consensus.update(
-                    region_id,
-                    recognized.get("text", ""),
-                    parsed.get("value") if isinstance(parsed, dict) else None,
-                    recognized.get("confidence", 0.0),
-                )
-                if parsed.get("valid") and finite_number(consensus.get("value")):
-                    parsed = dict(parsed)
-                    parsed["value"] = safe_float(consensus.get("value"))
-                    parsed["confidence"] = max(
-                        safe_float(parsed.get("confidence", 0.0), 0.0),
-                        safe_float(consensus.get("confidence", 0.0), 0.0),
-                    )
-                    parsed["consensus_text"] = str(consensus.get("text", ""))
-                    parsed["stable_frames"] = safe_int(consensus.get("stable_frames"), 0)
-                    parsed["temporal_disagreement"] = bool(consensus.get("conflict"))
-                consensus_confidence = safe_float(consensus.get("confidence"), 0.0, 0.0, 1.0)
-                confident = bool(parsed.get("valid") and consensus_confidence >= 0.34 and distance <= 1.08)
-                if confident:
-                    pending = state.get("pending_norm")
-                    if pending is not None and _rect_iou(pending, candidate_norm) >= 0.58:
-                        state["pending_count"] = min(1000, state.get("pending_count", 0) + 1)
-                        state["pending_norm"] = _clamp_region_norm(
-                            [
-                                pending[index] * 0.62 + candidate_norm[index] * 0.38
-                                for index in range(4)
-                            ]
-                        )
-                    else:
-                        state["pending_norm"] = _clamp_region_norm(candidate_norm)
-                        state["pending_count"] = 1
-                    state["high_confidence_frames"] = (
-                        min(1000, state.get("high_confidence_frames", 0) + 1)
-                        if consensus_confidence >= 0.58
-                        else 0
-                    )
-                    if state["pending_count"] >= NUMERIC_TRACKING_CONFIRM_FRAMES:
-                        committed = _clamp_region_norm(state["pending_norm"])
-                        previous = list(state["norm"])
-                        state["norm"] = committed
-                        definition["region_norm"] = list(committed)
-                        state["lost"] = 0
-                        state["stable_tracking_frames"] = (
-                            min(10000, state.get("stable_tracking_frames", 0) + 1)
-                            if _rect_iou(previous, committed) >= 0.88
-                            else 1
-                        )
-                    if (
-                        descriptor
-                        and state["high_confidence_frames"] >= NUMERIC_TRACKING_TEMPLATE_UPDATE_FRAMES
-                        and consensus_confidence >= 0.64
-                    ):
-                        templates = list(state.get("templates", []))
-                        nearest = min(
-                            (_descriptor_distance(template, descriptor) for template in templates),
-                            default=2.0,
-                        )
-                        if nearest >= 0.035:
-                            templates.insert(0, bytes(descriptor))
-                        elif templates:
-                            closest_index = min(
-                                range(len(templates)),
-                                key=lambda index: _descriptor_distance(templates[index], descriptor),
-                            )
-                            old = templates[closest_index]
-                            templates[closest_index] = bytes(
-                                int(old_value * 0.86 + new_value * 0.14)
-                                for old_value, new_value in zip(old, descriptor)
-                            )
-                        else:
-                            templates = [bytes(descriptor)]
-                        state["templates"] = templates[:NUMERIC_TRACKING_HISTORY_LIMIT]
-                        state["template"] = state["templates"][0]
-                        config = normalize_relation_config(definition.get("relation_config", {}))
-                        encoded = [_encode_tracking_template(value) for value in state["templates"] if value]
-                        config["tracking_templates"] = encoded
-                        config["tracking_template"] = encoded[0] if encoded else ""
-                        definition["relation_config"] = config
-                        state["high_confidence_frames"] = 0
-                    config = normalize_relation_config(definition.get("relation_config", {}))
-                    should_persist = bool(config.get("tracking_persist_stable", False))
-                    moved = _rect_iou(state.get("persisted_norm", state["norm"]), state["norm"]) < 0.88
-                    now = time.monotonic()
-                    if (
-                        should_persist
-                        and moved
-                        and state.get("stable_tracking_frames", 0) >= NUMERIC_TRACKING_PERSIST_FRAMES
-                        and now - state.get("last_persisted", 0.0) >= 30.0
-                    ):
-                        persisted = dict(definition)
-                        persisted["region_norm"] = list(state["norm"])
-                        self.app.store.save_ocr_region(game["id"], persisted)
-                        state["persisted_norm"] = list(state["norm"])
-                        state["last_persisted"] = now
-                else:
-                    state["lost"] = min(1000, state.get("lost", 0) + 1)
-                    state["pending_norm"] = None
-                    state["pending_count"] = 0
-                    state["high_confidence_frames"] = 0
-                    state["stable_tracking_frames"] = 0
-                observations[region_id] = {
-                    "definition": definition,
-                    "recognized": recognized,
-                    "parsed": parsed,
-                    "consensus": consensus,
-                    "tracked_norm": list(state["norm"]),
-                    "candidate_norm": list(candidate_norm),
-                    "candidate_confirm_frames": state.get("pending_count", 0),
-                    "lost_frames": state["lost"],
-                    "tracking_distance": distance,
-                    "recovered": bool(was_lost and confident),
-                }
-            frame_id = str(
-                frame.get("frame_id")
-                or (str(game["id"]) + "|" + format(safe_float(frame.get("time"), time.time()), ".9f"))
-            )
-            current_snapshot = {}
-            for definition in definitions:
-                region_id = str(definition["id"])
-                item = observations.get(region_id)
-                if item is None:
-                    current_snapshot[region_id] = {
-                        "valid": False,
-                        "value": None,
-                        "stable_frames": 0,
-                        "occluded": True,
-                        "recovered": False,
-                        "frame_id": frame_id,
-                    }
-                    continue
-                parsed = item.get("parsed", {})
-                consensus = item.get("consensus", {})
-                stable_frames = safe_int(consensus.get("stable_frames"), 0)
-                valid = bool(
-                    isinstance(parsed, dict)
-                    and parsed.get("valid")
-                    and finite_number(parsed.get("value"))
-                    and stable_frames >= NUMERIC_REWARD_STABLE_FRAMES
-                    and not consensus.get("conflict")
-                    and not item.get("recovered")
-                    and safe_int(item.get("lost_frames"), 0) == 0
-                    and safe_int(item.get("candidate_confirm_frames"), 0) >= NUMERIC_TRACKING_CONFIRM_FRAMES
-                )
-                current_snapshot[region_id] = {
-                    "valid": valid,
-                    "value": safe_float(parsed.get("value")) if valid else None,
-                    "stable_frames": stable_frames,
-                    "occluded": safe_int(item.get("lost_frames"), 0) > 0,
-                    "recovered": bool(item.get("recovered")),
-                    "temporal_disagreement": bool(consensus.get("conflict")),
-                    "frame_id": frame_id,
-                }
-            comparison = (
-                compare_numeric_snapshots_detailed(definitions, previous_snapshot, current_snapshot)
-                if previous_snapshot
-                else {
-                    "reward": 0.0,
-                    "winning_region_id": "",
-                    "status": "initial_snapshot",
-                    "priority": None,
-                }
-            )
-            region_values = {
-                region_id: snapshot.get("value")
-                for region_id, snapshot in current_snapshot.items()
-                if snapshot.get("valid") and finite_number(snapshot.get("value"))
-            }
-            event_summaries = []
-            terminal = ""
-            for definition in definitions:
-                region_id = str(definition["id"])
-                item = observations.get(region_id)
-                if item is None:
-                    event_summaries.append(
-                        {
-                            "region_id": region_id,
-                            "priority": safe_int(definition.get("priority"), 0),
-                            "status": "unreadable",
-                            "terminal": "",
-                            "reset": "",
-                        }
-                    )
-                    continue
-                parsed = item["parsed"]
-                consensus = item["consensus"]
-                runtime_context = {
-                    "task_phase": str(frame.get("task_phase", "unknown")),
-                    "subgoal_id": str(frame.get("subgoal_id", "")),
-                    "terminal_state": str(frame.get("terminal_state", "")),
-                    "recent_actions": list(frame.get("recent_actions", []))[-8:],
-                    "region_values": region_values,
-                    "tracked_norm": item["tracked_norm"],
-                    "candidate_norm": item["candidate_norm"],
-                    "candidate_confirm_frames": item["candidate_confirm_frames"],
-                    "lost_frames": item["lost_frames"],
-                    "tracking_distance": item["tracking_distance"],
-                    "frame_id": frame_id,
-                }
-                event = (
-                    OCR_SEMANTIC_ENGINE.evaluate(definition, parsed, runtime_context)
-                    if definition.get("region_type") == "number"
-                    else {
-                        "terminal": "",
-                        "progress": 0.0,
-                        "status": "text_only",
-                        "reset": "",
-                        "semantic_version": OCR_SEMANTIC_VERSION,
-                    }
-                )
-                event["progress"] = 0.0
-                event["ocr_temporal_disagreement"] = bool(consensus.get("conflict"))
-                event["stable_frames"] = safe_int(consensus.get("stable_frames"), 0)
-                event["tracked_region_norm"] = item["tracked_norm"]
-                event["tracking_candidate_norm"] = item["candidate_norm"]
-                event["tracking_candidate_confirm_frames"] = item["candidate_confirm_frames"]
-                event["tracking_lost_frames"] = item["lost_frames"]
-                event["tracking_template_distance"] = item["tracking_distance"]
-                event["tracking_recovered"] = bool(item.get("recovered"))
-                event["frame_id"] = frame_id
-                event["priority"] = safe_int(definition.get("priority"), 0)
-                event["snapshot_reward"] = safe_float(comparison.get("reward"), 0.0, -1.0, 1.0)
-                event["snapshot_status"] = str(comparison.get("status", "neutral"))
-                event["snapshot_winning_region_id"] = str(comparison.get("winning_region_id", ""))
-                event["snapshot_value"] = dict(current_snapshot.get(region_id, {}))
-                if not terminal and event.get("terminal") in {"success", "failure"}:
-                    terminal = str(event.get("terminal"))
-                event_summaries.append(
-                    {
-                        "region_id": region_id,
-                        "priority": event["priority"],
-                        "status": str(event.get("status", "neutral")),
-                        "terminal": str(event.get("terminal", "")),
-                        "reset": str(event.get("reset", "")),
-                        "valid": bool(current_snapshot.get(region_id, {}).get("valid")),
-                    }
-                )
-                saved_at = time.monotonic()
-                if saved_at - self.last_saved[region_id] >= 0.8:
-                    self.last_saved[region_id] = saved_at
-                    self.app.store.append_ocr_observation(
-                        game["id"],
-                        region_id,
-                        item["recognized"].get("text", ""),
-                        parsed,
-                        consensus.get("confidence", item["recognized"].get("confidence", 0.0)),
-                        consensus.get("stable_frames", 0),
-                        event,
-                    )
-            snapshot_event = {
-                "terminal": terminal,
-                "progress": safe_float(comparison.get("reward"), 0.0, -1.0, 1.0),
-                "numeric_progress": safe_float(comparison.get("reward"), 0.0, -1.0, 1.0),
-                "status": str(comparison.get("status", "neutral")),
-                "winning_region_id": str(comparison.get("winning_region_id", "")),
-                "winning_priority": comparison.get("priority"),
-                "events": event_summaries,
-                "before_snapshot": previous_snapshot,
-                "now_snapshot": current_snapshot,
-                "frame_id": frame_id,
-            }
-            SEMANTIC_EVENT_HUB.publish_snapshot(game["id"], frame_id, snapshot_event)
-            previous_snapshot = current_snapshot
-            self.stop_event.wait(0.18 if self.purpose == "training" else 0.3)
-    finally:
-        if self.app.store is not None:
-            self.app.store.close_current_thread()
-
-
-OCRMonitor._run = _adaptive_ocr_monitor_run
 
 
 class ScreenNumericKeypad:
@@ -41252,1427 +41346,20 @@ def _acceptance_geometry_complete(report):
     return all(item.get(case, {}).get("status") == "passed" for case in STRICT_ACCEPTANCE_CASES["多显示器与DPI"])
 
 
-def run_window_contract_test(path=None):
-    result = {"test": "window-contract", "status": "failed", "checks": {}, "evidence": {}, "failures": []}
-
-    def check(name, value, evidence=None):
-        passed = bool(value)
-        result["checks"][str(name)] = passed
-        if evidence is not None:
-            result["evidence"][str(name)] = evidence
-        if not passed:
-            result["failures"].append(str(name))
-        return passed
-
-    if os.name != "nt" or not path:
-        result["status"] = "not_run"
-        result["failures"] = ["必须在Windows 11实机并提供已确认的数据目录"]
-        sys.stdout.write(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-        return 2
-    root = None
-    overlay = None
-    recreated = None
-    bridge = None
-    try:
-        version = sys.getwindowsversion()
-        if int(version.major) != 10 or int(version.build) < 22000:
-            raise RuntimeError("仅支持Windows 11内部版本22000或更高")
-        if native_windows_architecture() != RUNTIME_ARCH_X64:
-            raise RuntimeError("ARM64缺少完整锁和实机证据，不进入严格窗口验收")
-        base = Path(path).expanduser().resolve()
-        base.mkdir(parents=True, exist_ok=True)
-        install_write_boundary_guard(base)
-        report = AcceptanceReport(base)
-        load_gui_runtime()
-        enable_dpi_awareness()
-        root = tk.Tk()
-        root.title("UniversalGameAI Window Contract")
-        root.geometry("640x420+80+80")
-        canvas = tk.Canvas(root, width=600, height=360, bg="white", highlightthickness=0)
-        canvas.pack(fill="both", expand=True)
-        canvas.create_rectangle(20, 20, 300, 180, fill="#204080", outline="#ffffff")
-        canvas.create_oval(330, 40, 560, 270, fill="#d08020", outline="#000000")
-        canvas.create_text(320, 330, text="UniversalGameAI", font=("Arial", 24, "bold"))
-        root.update_idletasks()
-        root.update()
-        bridge = WinBridge()
-        hwnd = _tk_top_level_hwnd(root)
-        identity = bridge.target_identity(hwnd)
-        client = bridge.client_rect(hwnd)
-        coordinate_ok = (
-            client[2] >= 600
-            and client[3] >= 360
-            and abs(client[0] - root.winfo_rootx()) <= 16
-            and abs(client[1] - root.winfo_rooty()) <= 64
-        )
-        check(
-            "client_coordinates",
-            coordinate_ok,
-            {
-                "hwnd": hwnd,
-                "client": client,
-                "tk_root": [root.winfo_rootx(), root.winfo_rooty()],
-                "dpi": identity.get("dpi"),
-            },
-        )
-        monitors = []
-
-        class MONITORINFO(ctypes.Structure):
-            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", RECT), ("rcWork", RECT), ("dwFlags", wintypes.DWORD)]
-
-        monitor_proc_type = ctypes.WINFUNCTYPE(
-            wintypes.BOOL, wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(RECT), wintypes.LPARAM
-        )
-
-        def monitor_callback(handle, hdc, rect_ptr, lparam):
-            info = MONITORINFO()
-            info.cbSize = ctypes.sizeof(info)
-            if bridge.user32.GetMonitorInfoW(handle, ctypes.byref(info)):
-                monitors.append(
-                    {
-                        "handle": int(handle),
-                        "rect": [
-                            int(info.rcMonitor.left),
-                            int(info.rcMonitor.top),
-                            int(info.rcMonitor.right - info.rcMonitor.left),
-                            int(info.rcMonitor.bottom - info.rcMonitor.top),
-                        ],
-                        "work": [
-                            int(info.rcWork.left),
-                            int(info.rcWork.top),
-                            int(info.rcWork.right - info.rcWork.left),
-                            int(info.rcWork.bottom - info.rcWork.top),
-                        ],
-                    }
-                )
-            return True
-
-        monitor_callback_value = monitor_proc_type(monitor_callback)
-        bridge.user32.EnumDisplayMonitors(0, None, monitor_callback_value, 0)
-        observations = []
-        for monitor in monitors:
-            x, y, w, h = monitor["work"]
-            root.geometry("640x420+" + str(x + max(10, min(80, w // 10))) + "+" + str(y + max(10, min(80, h // 10))))
-            root.update_idletasks()
-            root.update()
-            current_client = bridge.client_rect(hwnd)
-            observations.append(
-                {"monitor": monitor["rect"], "client": list(current_client), "dpi": bridge.dpi_for_window(hwnd)}
-            )
-        observed_dpis = sorted(
-            {safe_int(item.get("dpi"), 0) for item in observations if safe_int(item.get("dpi"), 0) > 0}
-        )
-        dpi_case = {96: "dpi100", 120: "dpi125", 144: "dpi150", 192: "dpi200"}
-        for dpi, case in dpi_case.items():
-            if dpi in observed_dpis:
-                report.record_case(
-                    "多显示器与DPI", case, "passed", {"observed_dpis": observed_dpis, "monitors": observations}
-                )
-        scaling_ok = all(item["client"][2] >= 600 and item["client"][3] >= 360 for item in observations) and bool(
-            observations
-        )
-        check("dpi_scaling", scaling_ok, {"observed_dpis": observed_dpis, "monitors": observations})
-        if len(monitors) >= 2:
-            cross_ok = (
-                len(observations) >= 2 and len({(item["client"][0], item["client"][1]) for item in observations}) >= 2
-            )
-            report.record_case("多显示器与DPI", "cross_monitor", "passed" if cross_ok else "failed", observations)
-            check("cross_monitor", cross_ok, observations)
-        else:
-            check("cross_monitor", False, {"reason": "需要至少两个真实显示器"})
-        mixed_ok = len(observed_dpis) >= 2
-        if mixed_ok:
-            report.record_case("多显示器与DPI", "mixed_dpi", "passed", {"observed_dpis": observed_dpis})
-        check("mixed_dpi", mixed_ok, {"observed_dpis": observed_dpis})
-        negative_monitors = [item for item in monitors if item["rect"][0] < 0 or item["rect"][1] < 0]
-        negative_ok = False
-        negative_evidence = {"monitors": [item["rect"] for item in monitors]}
-        if negative_monitors:
-            x, y, w, h = negative_monitors[0]["work"]
-            root.geometry("640x420+" + str(x + 10) + "+" + str(y + 10))
-            root.update_idletasks()
-            root.update()
-            negative_client = bridge.client_rect(hwnd)
-            negative_ok = negative_client[0] < 0 or negative_client[1] < 0
-            negative_evidence["client"] = negative_client
-            report.record_case(
-                "多显示器与DPI", "negative_coordinates", "passed" if negative_ok else "failed", negative_evidence
-            )
-        check("negative_coordinates", negative_ok, negative_evidence)
-        root.geometry("640x420+80+80")
-        root.update_idletasks()
-        root.update()
-        identity = bridge.target_identity(hwnd)
-        identity["content_rect_norm"] = [0.0, 0.0, 1.0, 1.0]
-        overlay = tk.Toplevel(root)
-        overlay.title("Occlusion Contract")
-        overlay.geometry("640x420+80+80")
-        ttk.Label(overlay, text="OCCLUSION", font=("Arial", 36, "bold")).pack(fill="both", expand=True)
-        overlay.attributes("-topmost", True)
-        overlay.lift()
-        overlay.update_idletasks()
-        overlay.update()
-        capture_error = ""
-        capture_methods = []
-        try:
-            captured = bridge.capture_gray(identity, False, True, False)
-            capture_methods = sorted(
-                {
-                    str(item.get("method", ""))
-                    for item in captured.get("validation_candidates", [])
-                    if str(item.get("method", ""))
-                }
-            )
-            if captured.get("method"):
-                capture_methods = sorted(set(capture_methods + [str(captured.get("method"))]))
-        except Exception as error:
-            capture_error = str(error)
-        occluded_ok = bool(capture_methods)
-        report.record_case(
-            "采集",
-            "occluded",
-            "passed" if occluded_ok else "failed",
-            {"methods": capture_methods, "error": capture_error},
-        )
-        check("occluded_capture", occluded_ok, {"methods": capture_methods, "error": capture_error})
-        overlay.destroy()
-        overlay = None
-        root.update()
-        old = tk.Toplevel(root)
-        old.title("Rebuild Old")
-        old.geometry("320x220+150+150")
-        old.update_idletasks()
-        old.update()
-        old_hwnd = _tk_top_level_hwnd(old)
-        old_identity = bridge.target_identity(old_hwnd)
-        old.destroy()
-        root.update_idletasks()
-        root.update()
-        stale_rejected = not bridge.valid(old_hwnd)
-        recreated = tk.Toplevel(root)
-        recreated.title("Rebuild New")
-        recreated.geometry("320x220+170+170")
-        recreated.update_idletasks()
-        recreated.update()
-        new_hwnd = _tk_top_level_hwnd(recreated)
-        new_identity = bridge.target_identity(new_hwnd)
-        rebuilt_ok = (
-            stale_rejected
-            and bridge.valid(new_hwnd)
-            and (new_hwnd != old_hwnd or new_identity.get("process_created") != old_identity.get("process_created"))
-        )
-        report.record_case(
-            "多显示器与DPI",
-            "hwnd_reuse",
-            "passed" if rebuilt_ok else "failed",
-            {"old": old_identity, "new": new_identity, "stale_rejected": stale_rejected},
-        )
-        check(
-            "window_recreated",
-            rebuilt_ok,
-            {"old_hwnd": old_hwnd, "new_hwnd": new_hwnd, "stale_rejected": stale_rejected},
-        )
-        recreated.destroy()
-        recreated = None
-        if coordinate_ok and scaling_ok:
-            report.record_case(
-                "采集",
-                "scaled",
-                "passed" if any(dpi != 96 for dpi in observed_dpis) else "pending",
-                {"observed_dpis": observed_dpis, "coordinate_ok": coordinate_ok},
-            )
-        geometry_complete = _acceptance_geometry_complete(report)
-        report.set_environment(
-            windows_build=int(version.build),
-            real_windows_11=True,
-            architecture=RUNTIME_ARCH_X64,
-            window_geometry_test=geometry_complete,
-            window_contract_run=time.time(),
-            window_contract_observations=observations,
-        )
-        result["strict_geometry_complete"] = geometry_complete
-        result["acceptance_report"] = str(report.path)
-        result["status"] = "passed" if not result["failures"] else "needs_more_environment"
-    except Exception as error:
-        result["fatal"] = "".join(traceback.format_exception(type(error), error, error.__traceback__))
-    finally:
-        if recreated is not None:
-            try:
-                recreated.destroy()
-            except Exception as error:
-                record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
-        if overlay is not None:
-            try:
-                overlay.destroy()
-            except Exception as error:
-                record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
-        if bridge is not None:
-            try:
-                bridge.close()
-            except Exception as error:
-                record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
-        if root is not None:
-            try:
-                root.destroy()
-            except Exception as error:
-                record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
-    sys.stdout.write(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-    return 0 if result.get("status") == "passed" else 1
 
 
-def run_runtime_e2e_test(path=None):
-    result = {"test": "runtime-e2e", "status": "failed", "progress": [], "failures": []}
-    if os.name != "nt" or not path:
-        result["status"] = "not_run"
-        result["failures"] = ["必须在Windows 11 x64实机并提供已确认的数据目录"]
-        sys.stdout.write(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-        return 2
-    worker = None
-    try:
-        version = sys.getwindowsversion()
-        if int(version.major) != 10 or int(version.build) < 22000 or native_windows_architecture() != RUNTIME_ARCH_X64:
-            raise RuntimeError("真实文件完整性检查与AI worker端到端测试仅支持Windows 11 x64")
-        base = Path(path).expanduser().resolve()
-        base.mkdir(parents=True, exist_ok=True)
-        for name in ("logs", "temp", "cache", "audit", "models"):
-            (base / name).mkdir(parents=True, exist_ok=True)
-        install_write_boundary_guard(base)
-        entries, checksum, key = embedded_runtime_lock(RUNTIME_ARCH_X64)
-        if not runtime_lock_is_complete(entries):
-            raise RuntimeError("内嵌运行库wheel锁不完整")
-        stop = threading.Event()
-        lines = []
-        installer = RuntimeInstaller(base)
-        manifest = installer.run(
-            stop,
-            lambda value: result["progress"].append(round(safe_float(value, 0.0), 3)),
-            lambda value: lines.append(str(value)),
-        )
-        validated = validate_runtime_manifest(base, True, True)
-        if (
-            validated is None
-            or validated.get("lock_complete") is not True
-            or validated.get("embedded_lock_checksum") != checksum
-        ):
-            raise RuntimeError("文件完整性检查后运行库清单校验失败")
-        worker = AIWorkerClient(base)
-        alive = worker.alive()
-        status = dict(worker.status)
-        vision = worker.request("vision_manifest", {}, 120.0)
-        offline = bool(status.get("offline_network_blocked"))
-        capabilities = dict(status.get("capabilities", {}))
-        required_capabilities = all(
-            capabilities.get(name) is True
-            for name in ("vision_train", "ocr_recognize", "safetensors", "torch_cpu", "rapidocr", "candidate_rank")
-        )
-        passed = bool(alive and isinstance(vision, dict) and offline and required_capabilities)
-        report = AcceptanceReport(base)
-        evidence = {
-            "manifest_checksum": validated.get("manifest_checksum"),
-            "embedded_lock_checksum": checksum,
-            "lock_key": key,
-            "wheel_count": len(entries),
-            "worker_status": status,
-            "vision_manifest": vision,
-            "startup_log": str(worker.startup_log_path),
-            "installer_lines": lines[-80:],
-        }
-        report.record_case("文件完整性", "normal_complete", "passed" if passed else "failed", evidence)
-        report.record_case(
-            "文件完整性", "locked_manifest", "passed" if validated.get("lock_complete") is True else "failed", evidence
-        )
-        report.record_case(
-            "独立运行时",
-            "fixed_python",
-            "passed" if tuple(validated.get("python_abi", [])) == FIXED_RUNTIME_PYTHON_ABI else "failed",
-            evidence,
-        )
-        report.record_case("独立运行时", "worker_process", "passed" if alive else "failed", evidence)
-        report.record_case(
-            "独立运行时",
-            "embedded_wheel_lock",
-            "passed" if validated.get("embedded_lock_checksum") == checksum else "failed",
-            evidence,
-        )
-        report.record_case(
-            "独立运行时",
-            "host_abi_independent",
-            "passed",
-            {"host_python": list(sys.version_info[:2]), "runtime_python": validated.get("python_abi")},
-        )
-        for case in ("socket", "urllib", "disconnected_windows"):
-            report.record_case(
-                "离线网络封锁", case, "passed" if offline else "failed", status.get("offline_network_evidence", status)
-            )
-        report.set_environment(
-            windows_build=int(version.build),
-            real_windows_11=True,
-            architecture=RUNTIME_ARCH_X64,
-            end_to_end_download_worker=passed,
-            runtime_e2e_run=time.time(),
-        )
-        result.update(
-            {
-                "status": "passed" if passed else "failed",
-                "manifest": manifest,
-                "validated_manifest": validated,
-                "worker_status": status,
-                "acceptance_report": str(report.path),
-                "startup_log": str(worker.startup_log_path),
-            }
-        )
-        if not passed:
-            result["failures"].append("独立AI worker或完整能力自测未通过")
-    except Exception as error:
-        result["failures"].append(str(error))
-        result["traceback"] = "".join(traceback.format_exception(type(error), error, error.__traceback__))
-    finally:
-        if worker is not None:
-            try:
-                worker.close(3.0)
-            except Exception as error:
-                record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
-    sys.stdout.write(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-    return 0 if result.get("status") == "passed" else 1
 
 
-def logic_contract_suite():
-    checks = {}
-
-    def record(name, condition, evidence=None):
-        checks[str(name)] = {"passed": bool(condition), "evidence": evidence}
-
-    action = normalize_action({"kind": "click", "button": "left", "path": [[1.2, -0.2]], "duration": 0.01})
-    record(
-        "action_normalization",
-        bool(action and all(point == [1.0, 0.0] for point in action["path"]) and action["duration"] >= 0.02),
-        action,
-    )
-    semantic = normalize_semantic_action(
-        {
-            "action_type": "click",
-            "target": {"class": "confirm_button", "instance": "primary", "text": "确认"},
-            "offset": [0.0, 0.0],
-            "parameters": {"button": "left", "duration": 0.08},
-            "coordinate_fallback": {"kind": "click", "button": "left", "path": [[0.72, 0.84]], "duration": 0.08},
-        }
-    )
-    grounded = ground_semantic_action(
-        semantic,
-        [
-            {
-                "class": "confirm_button",
-                "instance": "primary",
-                "text": "确认",
-                "bbox": [0.6, 0.7, 0.2, 0.1],
-                "confidence": 0.95,
-                "source": "ui_detector",
-            }
-        ],
-        True,
-    )
-    grounded_point = normalize_action(grounded)["path"][-1] if grounded and normalize_action(grounded) else []
-    record(
-        "semantic_action_grounding",
-        bool(
-            semantic
-            and grounded
-            and not grounded["grounding"].get("fallback_used")
-            and len(grounded_point) == 2
-            and abs(grounded_point[0] - 0.7) < 1e-6
-            and abs(grounded_point[1] - 0.75) < 1e-6
-        ),
-        {"semantic": semantic, "grounded": grounded},
-    )
-    fallback = ground_semantic_action(semantic, [], True)
-    fallback_point = normalize_action(fallback)["path"][-1] if fallback and normalize_action(fallback) else []
-    record(
-        "semantic_action_coordinate_fallback",
-        bool(fallback and fallback["grounding"].get("fallback_used") and fallback_point == [0.72, 0.84]),
-        fallback,
-    )
-    task = TaskDefinition.from_mapping(
-        {
-            "game_id": "g",
-            "task_id": "battle",
-            "name": "战斗",
-            "goal": "获胜",
-            "step_penalty": -0.01,
-            "success_reward": 1.0,
-            "failure_reward": -1.0,
-            "progress_scale": 0.5,
-        }
-    )
-    reward = TaskRuntime(task).evaluate(
-        {"terminal": "success", "progress_score": 1.0, "changed": True, "repeated": False}
-    )
-    record(
-        "standard_task_reward_contract",
-        abs(reward.get("reward", 0.0) - 1.49) < 1e-9
-        and reward.get("success") is True
-        and reward.get("failure") is False,
-        {"task": task.to_dict(), "reward": reward},
-    )
-    conditioned_model = {
-        "default_task_id": "battle",
-        "state_action": {"battle|state|cluster": {"q_value": 1.0}, "inventory|state|cluster": {"q_value": -1.0}},
-        "action_prior": {"battle|cluster": {"q_value": 0.5}, "inventory|cluster": {"q_value": -0.5}},
-    }
-    battle_row = policy_experience_row(conditioned_model, "state", "cluster", "battle")
-    inventory_row = policy_experience_row(conditioned_model, "state", "cluster", "inventory")
-    sequence = {"battle|1|x": {"cluster": 10.0}, "inventory|1|x": {"other": 10.0}}
-    battle_penalty = calculate_sequence_penalty(["x"], "cluster", sequence, "battle")
-    inventory_penalty = calculate_sequence_penalty(["x"], "cluster", sequence, "inventory")
-    record(
-        "task_conditioned_policy_contract",
-        battle_row.get("q_value") == 1.0
-        and inventory_row.get("q_value") == -1.0
-        and battle_penalty < inventory_penalty,
-        {
-            "battle": battle_row,
-            "inventory": inventory_row,
-            "battle_penalty": battle_penalty,
-            "inventory_penalty": inventory_penalty,
-        },
-    )
-    rect = normalized_rect((120, 80, 400, 200), (100, 50, 800, 600))
-    restored = apply_normalized_rect((100, 50, 800, 600), rect)
-    record(
-        "coordinate_roundtrip",
-        all(abs(a - b) <= 1 for a, b in zip(restored, (120, 80, 400, 200))),
-        {"normalized": rect, "restored": restored},
-    )
-    seed_a, evidence_a = deterministic_sleep_seed("g", [{"checksum": "b"}, {"checksum": "a"}])
-    seed_b, evidence_b = deterministic_sleep_seed("g", [{"checksum": "a"}, {"checksum": "b"}])
-    record("deterministic_seed", seed_a == seed_b and evidence_a == evidence_b, evidence_a)
-    first = bytes(FEATURE_LEN)
-    second = bytes([255]) * FEATURE_LEN
-    p1 = {
-        "id": "p1",
-        "cluster_id": "c1",
-        "a": normalize_action({"kind": "click", "button": "left", "path": [[0.2, 0.2]]}),
-        "f": first,
-        "coarse": coarse_feature(first),
-        "temporal": {},
-        "capture_methods": ["backend"],
-        "threshold": 1.0,
-        "intra_threshold": 1.0,
-    }
-    p2 = {
-        "id": "p2",
-        "cluster_id": "c2",
-        "a": normalize_action({"kind": "click", "button": "left", "path": [[0.8, 0.8]]}),
-        "f": second,
-        "coarse": coarse_feature(second),
-        "temporal": {},
-        "capture_methods": ["backend"],
-        "threshold": 1.0,
-        "intra_threshold": 1.0,
-    }
-    tracker = PrototypeConflictTracker(lambda: False, 16, 4)
-    tracker.add_batch([p1, p2])
-    tracker.finalize([p1, p2])
-    record(
-        "prototype_conflict_index",
-        p1.get("nearest_conflicting_distance") is not None and p2.get("nearest_conflicting_distance") is not None,
-        {"p1": p1.get("nearest_conflicting_distance"), "p2": p2.get("nearest_conflicting_distance")},
-    )
-    record(
-        "numpy_distance_no_int16_overflow",
-        abs(feature_distance(first, second) - 65025.0) < 1e-6,
-        {"distance": feature_distance(first, second)},
-    )
-    numpy_first = _optional_numpy()
-    numpy_second = _optional_numpy()
-    record(
-        "optional_numpy_probe_cached",
-        FEATURE_ENGINE.numpy_checked and numpy_first is numpy_second,
-        {"checked": FEATURE_ENGINE.numpy_checked, "available": numpy_first is not None},
-    )
-    coarse_reference = bytes(
-        value
-        for channel in range(FEATURE_CHANNELS)
-        for value in _pool_channel(
-            second, channel * PIXELS, FEATURE_W, FEATURE_H, COARSE_W, COARSE_H
-        )
-    )
-    coarse_optimized = coarse_feature(second)
-    record(
-        "coarse_feature_five_channel_equivalence",
-        coarse_optimized == coarse_reference and len(coarse_optimized) == COARSE_LEN,
-        {"length": len(coarse_optimized), "numpy": numpy_first is not None},
-    )
-    _SEMANTIC_ENCODER_CACHE.clear()
-    default_encoder_first = semantic_encoder_from_model()
-    default_encoder_second = semantic_encoder_from_model({})
-    record(
-        "default_semantic_encoder_fixed_cache_key",
-        default_encoder_first is default_encoder_second
-        and list(_SEMANTIC_ENCODER_CACHE) == [_DEFAULT_SEMANTIC_ENCODER_KEY],
-        {"keys": list(_SEMANTIC_ENCODER_CACHE)},
-    )
-    frame_cache = FrameComputationCache(32)
-    frame_cache.put_component("frame", "semantic", {"targets": [{"class": "button"}], "scene_graph": {}})
-    cached_first = frame_cache.get_component("frame", "semantic")
-    cached_second = frame_cache.get_component("frame", "semantic")
-    cache_mutation_blocked = False
-    try:
-        cached_first["targets"].append({"class": "dialog"})
-    except TypeError:
-        cache_mutation_blocked = True
-    record(
-        "frame_computation_cache_frozen_shared_read",
-        cached_first is cached_second and cache_mutation_blocked,
-        {"shared": cached_first is cached_second, "immutable": cache_mutation_blocked},
-    )
-    metric_probe = RuntimeMetrics(128)
-    for value in range(1, 101):
-        metric_probe.observe("latency", value)
-    percentile_first = metric_probe.percentile("latency", 0.95)
-    percentile_second = metric_probe.percentile("latency", 0.95)
-    record(
-        "targeted_metric_percentile",
-        percentile_first == 95 and percentile_second == percentile_first and len(metric_probe.percentile_cache) == 1,
-        {"p95": percentile_first, "cache_entries": len(metric_probe.percentile_cache)},
-    )
-
-    class TrainingGovernorSmoke:
-        def __init__(self):
-            self.ensure_calls = 0
-            self.plan = RuntimePlan(30, 4, 6, 24, 1, MAX_PROTOTYPES, "windows-x64-cpu")
-
-        def ensure_started(self):
-            self.ensure_calls += 1
-            return self
-
-        def current_plan(self):
-            return self.plan
-
-    class TrainingRuntimeSmoke:
-        torch = None
-
-    governor_smoke = TrainingGovernorSmoke()
-    original_governor = globals()["RESOURCE_GOVERNOR"]
-    training_smoke_error = ""
-    try:
-        globals()["RESOURCE_GOVERNOR"] = governor_smoke
-        function_plan = wait_for_runtime_training_plan(threading.Event())
-        trainer = GameSpecificVisionTrainer(TrainingRuntimeSmoke(), "smoke", [], threading.Event(), None, 1, 0)
-        method_plan = trainer._wait_for_training_plan()
-    except (AttributeError, RuntimeError, TypeError, ValueError) as error:
-        function_plan = None
-        method_plan = None
-        training_smoke_error = type(error).__name__ + ":" + str(error)
-    finally:
-        globals()["RESOURCE_GOVERNOR"] = original_governor
-    record(
-        "training_entry_resource_governor_smoke",
-        function_plan is governor_smoke.plan
-        and method_plan is governor_smoke.plan
-        and governor_smoke.ensure_calls == 2
-        and not training_smoke_error,
-        {"ensure_calls": governor_smoke.ensure_calls, "error": training_smoke_error},
-    )
-    with tempfile.TemporaryDirectory() as worker_folder:
-        worker_root = materialize_worker_entrypoints(worker_folder)
-        ai_worker_source = (worker_root / "ai_worker.py").read_text(encoding="utf-8")
-        training_worker_source = (worker_root / "training_worker.py").read_text(encoding="utf-8")
-        runtime_worker_source = (worker_root / "runtime_install_worker.py").read_text(encoding="utf-8")
-        compile(ai_worker_source, str(worker_root / "ai_worker.py"), "exec")
-        compile(training_worker_source, str(worker_root / "training_worker.py"), "exec")
-        compile(runtime_worker_source, str(worker_root / "runtime_install_worker.py"), "exec")
-        worker_manifest = json.loads((worker_root / "manifest.json").read_text(encoding="utf-8"))
-        record(
-            "minimal_selected_directory_worker_entries",
-            len(ai_worker_source.splitlines()) < 12000
-            and len(runtime_worker_source.splitlines()) < 4000
-            and "class AppUiService" not in ai_worker_source
-            and "def logic_contract_suite" not in ai_worker_source
-            and "from ai_worker import _worker_entry" in training_worker_source
-            and set(worker_manifest.get("workers", {}))
-            == {"ai_worker.py", "training_worker.py", "runtime_install_worker.py"},
-            worker_manifest,
-        )
-    first_build_hash = current_build_hash()
-    second_build_hash = current_build_hash()
-    record(
-        "source_build_hash_cached",
-        bool(first_build_hash)
-        and first_build_hash == second_build_hash
-        and RUNTIME_REPOSITORY.build_hash == first_build_hash,
-        {"hash": first_build_hash, "key": RUNTIME_REPOSITORY.build_hash_key},
-    )
-    with tempfile.TemporaryDirectory() as folder:
-        database = ThreadLocalSQLite(Path(folder) / "logic.db")
-        database.execute("CREATE TABLE sample(value INTEGER)")
-        database.commit()
-        errors = []
-
-        def worker():
-            try:
-                with database.thread_connection() as connection:
-                    connection.execute("INSERT INTO sample(value) VALUES(1)")
-                    connection.commit()
-            except Exception as error:
-                errors.append(str(error))
-
-        thread = threading.Thread(target=worker)
-        thread.start()
-        thread.join(3.0)
-        count = database.execute("SELECT COUNT(*) FROM sample").fetchone()[0]
-        before = database.connection_count()
-        database.close()
-        after = database.connection_count()
-        record(
-            "thread_local_sqlite",
-            not errors and not thread.is_alive() and count == 1 and before == 1 and after == 0,
-            {"errors": errors, "count": count, "before": before, "after": after},
-        )
-
-    class CandidateRankHarness:
-        def __getattr__(self, name):
-            service = self.__dict__.get("mode_service")
-            if service is not None and name in type(service).__dict__:
-                return getattr(service, name)
-            raise AttributeError(name)
-
-        def __init__(self, prototypes, runtime_index, sequence_model):
-            self.mode_service = AppModeService(self)
-            self.candidate_cache = BoundedLRU(64)
-            self.stop_event = None
-            self.ai_worker = None
-            self.active_model_runtime = {
-                "prototypes": prototypes,
-                "runtime_index": runtime_index,
-                "runtime_token": runtime_index["token"],
-                "sequence_model": sequence_model,
-            }
-
-        def should_stop(self):
-            return False
-
-    rank_feature = bytes(FEATURE_LEN)
-    rank_coarse = coarse_feature(rank_feature)
-    rank_prototypes = []
-    for identity, cluster, point, motion in (
-        ("r1", "c1", [0.2, 0.2], [0.0, 0.0, 0.0]),
-        ("r2", "c2", [0.8, 0.8], [100.0, 100.0, 100.0]),
-    ):
-        rank_prototypes.append(
-            {
-                "id": identity,
-                "cluster_id": cluster,
-                "a": normalize_action({"kind": "click", "button": "left", "path": [point]}),
-                "f": rank_feature,
-                "coarse": rank_coarse,
-                "capture_methods": ["backend"],
-                "authorized": True,
-                "threshold": 100.0,
-                "temporal_threshold": 1.0,
-                "support": 20,
-                "action_support": 20,
-                "temporal": {"capture_method": "backend", "recent_frame_deltas": motion},
-            }
-        )
-    rank_index = build_candidate_runtime_index(rank_prototypes, False)
-    rank_harness = CandidateRankHarness(
-        rank_prototypes, rank_index, {"1|x": {"c1": 100.0, "c2": 0.0}, "1|y": {"c1": 0.0, "c2": 100.0}}
-    )
-    first_rank = rank_harness.rank_action_candidates(
-        rank_feature,
-        rank_prototypes,
-        "",
-        18,
-        {"capture_method": "backend", "recent_actions": ["x"], "recent_frame_deltas": [0.0, 0.0, 0.0]},
-        rank_coarse,
-    )
-    second_rank = rank_harness.rank_action_candidates(
-        rank_feature,
-        rank_prototypes,
-        "",
-        18,
-        {"capture_method": "backend", "recent_actions": ["y"], "recent_frame_deltas": [100.0, 100.0, 100.0]},
-        rank_coarse,
-    )
-    temporal_recomputed = bool(
-        first_rank
-        and second_rank
-        and first_rank[0]["cluster_id"] != second_rank[0]["cluster_id"]
-        and len(rank_harness.candidate_cache) == 1
-    )
-    normalized_outputs = all(item.get("a") == normalize_action(item.get("a")) for item in first_rank + second_rank)
-    record(
-        "temporal_candidate_cache_recomputed",
-        temporal_recomputed and normalized_outputs,
-        {
-            "first": [item["cluster_id"] for item in first_rank],
-            "second": [item["cluster_id"] for item in second_rank],
-            "visual_cache_entries": len(rank_harness.candidate_cache),
-            "normalized": normalized_outputs,
-        },
-    )
-    np = _optional_numpy()
-    performance_prototypes = []
-    for index in range(MAX_PROTOTYPES):
-        value = bytes([index % 256]) * FEATURE_LEN
-        performance_prototypes.append(
-            {
-                "id": "perf" + str(index),
-                "cluster_id": "pc" + str(index % 24),
-                "a": normalize_action({"kind": "click", "button": "left", "path": [[0.5, 0.5]]}),
-                "f": value,
-                "coarse": coarse_feature(value),
-                "capture_methods": ["backend"],
-                "authorized": True,
-            }
-        )
-    performance_index = build_candidate_runtime_index(performance_prototypes, False)
-    performance_query = bytes([123]) * FEATURE_LEN
-    performance_coarse = coarse_feature(performance_query)
-    candidate_visual_matches(
-        performance_index,
-        performance_query,
-        performance_coarse,
-        "backend",
-        VersionedThresholdConfig.candidate_full_limit,
-    )
-    timings = []
-    for _ in range(7):
-        started = time.perf_counter()
-        candidate_visual_matches(
-            performance_index,
-            performance_query,
-            performance_coarse,
-            "backend",
-            VersionedThresholdConfig.candidate_full_limit,
-        )
-        timings.append((time.perf_counter() - started) * 1000.0)
-    median_ms = statistics.median(timings)
-    performance_passed = np is None or median_ms <= 12.0
-    record(
-        "candidate_rank_performance_budget",
-        performance_passed,
-        {
-            "numpy": np is not None,
-            "median_ms": round(median_ms, 3),
-            "budget_ms": 12.0,
-            "prototypes": MAX_PROTOTYPES,
-            "exact": VersionedThresholdConfig.candidate_full_limit,
-        },
-    )
-    with tempfile.TemporaryDirectory() as folder:
-        baseline_threads = len([thread for thread in threading.enumerate() if thread.is_alive()])
-        leaked_connections = 0
-        for cycle in range(100):
-            database = ThreadLocalSQLite(Path(folder) / ("cycle_" + str(cycle) + ".db"))
-            database.execute("CREATE TABLE sample(value INTEGER)")
-            database.execute("INSERT INTO sample(value) VALUES(?)", (cycle,))
-            database.commit()
-            database.close()
-            leaked_connections += database.connection_count()
-            state = {"alive": True}
-            coordinator = ShutdownCoordinator("cycle", 0.1)
-            coordinator.add(
-                ManagedShutdownResource(
-                    "resource",
-                    lambda: state.update(alive=False),
-                    lambda: state["alive"],
-                    lambda timeout_value: not state["alive"],
-                    lambda: state.update(alive=False),
-                    0,
-                )
-            )
-            coordinator.poll()
-        after_threads = len([thread for thread in threading.enumerate() if thread.is_alive()])
-        record(
-            "resource_leak_100_cycles",
-            leaked_connections == 0 and after_threads <= baseline_threads + 1,
-            {
-                "baseline_threads": baseline_threads,
-                "after_threads": after_threads,
-                "connections": leaked_connections,
-                "cycles": 100,
-            },
-        )
-    with tempfile.TemporaryDirectory() as folder:
-        root = Path(folder)
-        (root / "models" / "vision").mkdir(parents=True)
-        sparse = root / "models" / "vision" / "large_model.bin"
-        with sparse.open("wb") as handle:
-            handle.truncate(1024 * 1024 * 1024)
-        large_samples = [{"checksum": hashlib.sha256(str(index).encode()).hexdigest()} for index in range(MAX_SAMPLES)]
-        large_started = time.perf_counter()
-        migration_space = required_migration_space(root)
-        runtime_space = required_runtime_space(root, 64 * 1024 * 1024)
-        large_elapsed = time.perf_counter() - large_started
-        large_ok = (
-            len(large_samples) == MAX_SAMPLES
-            and tree_size(root / "models") >= 1024 * 1024 * 1024
-            and migration_space > 2 * 1024 * 1024 * 1024
-            and runtime_space > 1024 * 1024 * 1024
-            and large_elapsed < 5.0
-        )
-        record(
-            "large_data_budget_contract",
-            large_ok,
-            {
-                "samples": len(large_samples),
-                "prototypes": MAX_PROTOTYPES,
-                "model_bytes": tree_size(root / "models"),
-                "migration_space": migration_space,
-                "runtime_space": runtime_space,
-                "elapsed_ms": round(large_elapsed * 1000.0, 3),
-            },
-        )
-    return all(item["passed"] for item in checks.values()), checks
 
 
-def fault_injection_contract_suite():
-    checks = {}
-
-    def record(name, condition, evidence=None):
-        checks[str(name)] = {"passed": bool(condition), "evidence": evidence}
-
-    output = BoundedProcessOutput(32, 4096)
-    for index in range(4000):
-        output.put(json.dumps({"kind": "line", "message": "x" * 80, "index": index}, separators=(",", ":")))
-    output.put(json.dumps({"kind": "progress", "value": 25}, separators=(",", ":")))
-    output.put(json.dumps({"kind": "progress", "value": 75}, separators=(",", ":")))
-    output.put(json.dumps({"kind": "result", "manifest": {"ok": True}}, separators=(",", ":")))
-    first = output.get(0.0)
-    with output.lock:
-        log_count = len(output.logs)
-        log_bytes = output.log_bytes
-        latest = dict(output.latest)
-    record(
-        "bounded_subprocess_output",
-        json.loads(first).get("kind") == "result" and log_count <= 32 and log_bytes <= 4096 and "progress" in latest,
-        {"logs": log_count, "bytes": log_bytes, "latest": list(latest)},
-    )
-    state = {"alive": True, "forced": False}
-
-    def force():
-        state["alive"] = False
-        state["forced"] = True
-        return True
-
-    coordinator = ShutdownCoordinator("fault", 0.01)
-    coordinator.add(
-        ManagedShutdownResource("stubborn", lambda: True, lambda: state["alive"], lambda timeout_value: False, force, 0)
-    )
-    coordinator.poll()
-    interruptible_wait(None, 0.12)
-    shutdown = coordinator.poll()
-    record(
-        "unresponsive_resource_force_close",
-        shutdown.get("done") and state["forced"] and "stubborn" in shutdown.get("forced", []),
-        shutdown,
-    )
-    rejected = False
-    try:
-        validate_packet("window_identity", {"hwnd": 0})
-    except ValueError:
-        rejected = True
-    record("packet_validation_fail_closed", rejected)
-    try:
-        raise AssertionError("contract")
-    except AssertionError as error:
-        cleanup_record = record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
-    cleanup_details = cleanup_record.get("details", {})
-    record(
-        "cleanup_error_location_and_category",
-        cleanup_record.get("code") == "INVARIANT_VIOLATION"
-        and isinstance(cleanup_details.get("location"), dict)
-        and safe_int(cleanup_details.get("location", {}).get("line"), 0) > 0,
-        cleanup_record,
-    )
-    with tempfile.TemporaryDirectory() as folder:
-        database = ThreadLocalSQLite(Path(folder) / "rollback.db")
-        database.execute("CREATE TABLE sample(value INTEGER)")
-        database.commit()
-        connection = database.current()
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute("INSERT INTO sample(value) VALUES(1)")
-        connection.rollback()
-        count = database.execute("SELECT COUNT(*) FROM sample").fetchone()[0]
-        database.close()
-        record("database_rollback", count == 0, {"count": count})
-    return all(item["passed"] for item in checks.values()), checks
 
 
-def run_logic_contract_tests():
-    passed, checks = logic_contract_suite()
-    result = {"test": "pure-logic", "status": "passed" if passed else "failed", "checks": checks}
-    sys.stdout.write(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-    return 0 if passed else 1
 
 
-def run_fault_injection_tests():
-    passed, checks = fault_injection_contract_suite()
-    result = {"test": "fault-injection", "status": "passed" if passed else "failed", "checks": checks}
-    sys.stdout.write(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-    return 0 if passed else 1
 
 
-def run_static_contract_tests(path=None):
-    target = Path(path or __file__).resolve()
-    checks = []
-    failures = []
-
-    def check(name, condition, evidence=None):
-        item = {"name": str(name), "passed": bool(condition), "evidence": evidence}
-        checks.append(item)
-        if not condition:
-            failures.append(item)
-
-    try:
-        source = target.read_text(encoding="utf-8")
-        compile(source, str(target), "exec")
-        tree = ast.parse(source)
-        check("syntax_compile", True)
-    except Exception as error:
-        source = ""
-        tree = ast.parse("pass")
-        check("syntax_compile", False, str(error))
-    comment_tokens = []
-    try:
-        comment_tokens = [
-            token.start[0]
-            for token in tokenize.generate_tokens(io.StringIO(source).readline)
-            if token.type == tokenize.COMMENT
-        ]
-    except (tokenize.TokenError, IndentationError, SyntaxError) as error:
-        comment_tokens = [str(error)]
-    check("single_file_source_has_no_comment_tokens", not comment_tokens, comment_tokens[:20])
-    check(
-        "exact_default_controls",
-        REQUIRED_DEFAULT_BUTTONS == set(EXTERNAL_REQUIREMENT_SPEC.get("default_buttons", []))
-        and len(REQUIRED_DEFAULT_BUTTONS) == 8,
-        sorted(REQUIRED_DEFAULT_BUTTONS),
-    )
-    check(
-        "capture_toggle_contract",
-        REQUIRED_CAPTURE_TOGGLES == tuple(EXTERNAL_REQUIREMENT_SPEC.get("capture_toggles", [])),
-        REQUIRED_CAPTURE_TOGGLES,
-    )
-    keyboard = normalize_action({"kind": "key", "vk": 65, "semantic_key": "move_left", "duration": 0.12})
-    combo = normalize_action({"kind": "key_combo", "keys": [0x11, 0x10, 65], "duration": 0.15})
-    pad = normalize_action({"kind": "gamepad_button", "button": "a", "duration": 0.11})
-    axis = normalize_action({"kind": "gamepad_axis", "axis": "left_stick", "x": 0.75, "y": -0.25, "duration": 0.08})
-    check(
-        "keyboard_and_xinput_actions_are_normalized",
-        bool(keyboard and combo and pad and axis),
-        {"keyboard": keyboard, "combo": combo, "pad": pad, "axis": axis},
-    )
-    check(
-        "control_action_families_are_distinct",
-        len({action_family_key(value) for value in (keyboard, combo, pad, axis)}) == 4,
-        [action_family_key(value) for value in (keyboard, combo, pad, axis)],
-    )
-    profile = CapabilityProfile(
-        {
-            "capability_level": 4,
-            "keyboard_enabled": True,
-            "gamepad_enabled": True,
-            "continuous_control_required": True,
-            "required_input_modalities": ["vision", "keyboard", "gamepad", "continuous_control"],
-            "game_type": "racing",
-            "minimum_frame_rate": 20,
-            "required_action_frequency": 20,
-            "maximum_action_frequency": 60,
-        }
-    )
-    denied = profile.evaluate(
-        {
-            "capture_fps": 60,
-            "available_action_frequency": 60,
-            "keyboard_execution": True,
-            "gamepad_execution": False,
-            "continuous_control": False,
-        }
-    )
-    allowed = profile.evaluate(
-        {
-            "capture_fps": 60,
-            "available_action_frequency": 60,
-            "keyboard_execution": True,
-            "gamepad_execution": True,
-            "continuous_control": True,
-        }
-    )
-    check(
-        "capability_profile_fails_closed_without_xinput",
-        not denied["allowed"] and allowed["allowed"],
-        {"denied": denied, "allowed": allowed},
-    )
-    hub = PerceptionEvidenceHub(8, 5.0)
-    key_a = runtime_isolation_key("game-a", "session-a", {"hwnd": 101, "process_created": 1001}, 1)
-    key_b = runtime_isolation_key("game-b", "session-b", {"hwnd": 202, "process_created": 2002}, 1)
-    hub.publish(key_a, {"texts": ["胜利"]})
-    hub.publish(key_b, {"texts": ["失败"]})
-    rejected_global = False
-    try:
-        hub.latest(None)
-    except ValueError:
-        rejected_global = True
-    check(
-        "perception_evidence_is_exact_key_only",
-        hub.latest(key_a).get("texts") == ["胜利"] and hub.latest(key_b).get("texts") == ["失败"] and rejected_global,
-    )
-    tracker = CrossFrameObjectTracker(history=4, maximum_scenes=8, ttl_seconds=5.0)
-    tracker_now = time.monotonic()
-    first = tracker.update(key_a, [{"class": "button", "bbox": [0.1, 0.1, 0.2, 0.2]}], tracker_now)[0]["track_id"]
-    second = tracker.update(key_b, [{"class": "button", "bbox": [0.1, 0.1, 0.2, 0.2]}], tracker_now)[0]["track_id"]
-    tracker.clear(key_a)
-    check(
-        "object_tracker_is_session_isolated",
-        first != second and len(tracker) == 1,
-        {"first": first, "second": second, "remaining": len(tracker)},
-    )
-    dispatcher = UiDispatcher(4, 8, 16)
-    for index in range(40):
-        dispatcher.post_callback(lambda index=index: index, "status", index, "session", False)
-    dispatcher.post_callback(lambda: "stop", "escape_stop", 41, "session", True)
-    queued = dispatcher.drain(100)
-    immutable = all(isinstance(event, UiEvent) and isinstance(event.payload, tuple) for event in queued)
-    callback_count = sum(1 for event in queued if dispatcher.resolve_callback(event) is not None)
-    check(
-        "bounded_immutable_ui_events_with_coalescing",
-        immutable
-        and len(queued) <= 8
-        and callback_count <= 2
-        and len(dispatcher.callbacks) <= 16
-        and bool(queued)
-        and queued[0].kind == "escape_stop",
-        {
-            "events": len(queued),
-            "callbacks": callback_count,
-            "first_kind": queued[0].kind if queued else "",
-            "dropped": dict(dispatcher.dropped),
-        },
-    )
-    ttl = BoundedTTLMap(4, 60.0)
-    for index in range(12):
-        ttl[str(index)] = index
-    check("active_learning_resume_is_bounded", len(ttl) <= 4, len(ttl))
-    query = bytes((index * 17) % 256 for index in range(FEATURE_LEN))
-    items = [bytes((index * 17 + offset * 13) % 256 for index in range(FEATURE_LEN)) for offset in range(7)]
-    scalar = [feature_distance(query, value) for value in items]
-    batched = batch_feature_distances(query, items, 64)
-    check(
-        "chunked_feature_distances_match_scalar",
-        len(batched) == len(scalar) and all(abs(a - b) <= 1e-5 for a, b in zip(scalar, batched)),
-        {"scalar": scalar, "batched": batched},
-    )
-    for index in range(POOL_BOUNDARIES_MAX + 40):
-        _pool_boundaries(640 + index, 360, 64, 36)
-    check(
-        "pool_boundaries_is_bounded",
-        len(FEATURE_ENGINE.pool_boundaries) <= POOL_BOUNDARIES_MAX,
-        len(FEATURE_ENGINE.pool_boundaries),
-    )
-    sqlite_ok = False
-    with tempfile.TemporaryDirectory(prefix="ugai ?#% ") as folder:
-        database_path = Path(folder) / "data ?#%.db"
-        writable = ThreadLocalSQLite(database_path)
-        writable.execute("CREATE TABLE probe(value INTEGER)")
-        writable.execute("INSERT INTO probe(value) VALUES(7)")
-        writable.commit()
-        writable.close()
-        readonly = ThreadLocalSQLite(database_path, True)
-        sqlite_ok = readonly.execute("SELECT value FROM probe").fetchone()[0] == 7
-        readonly.close()
-    check("sqlite_readonly_uri_encodes_reserved_path_characters", sqlite_ok)
-    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
-    app_node = classes.get("App")
-    app_bases = [ast.unparse(base) for base in app_node.bases] if app_node is not None else ["missing"]
-    services = {"AppUiService", "AppLifecycleService", "AppModeService", "AppStorageService"}
-    check(
-        "app_uses_composition_not_mixins",
-        app_node is not None
-        and not app_bases
-        and services.issubset(classes)
-        and not any(name.endswith("Mixin") and name.startswith("App") for name in classes),
-        {"bases": app_bases, "services": sorted(services.intersection(classes))},
-    )
-    app_init = None
-    if app_node is not None:
-        app_init = next(
-            (node for node in app_node.body if isinstance(node, ast.FunctionDef) and node.name == "__init__"),
-            None,
-        )
-    service_attributes = set()
-    if app_init is not None:
-        for node in ast.walk(app_init):
-            targets = []
-            if isinstance(node, ast.Assign):
-                targets = node.targets
-            elif isinstance(node, ast.AnnAssign):
-                targets = [node.target]
-            for target_node in targets:
-                if (
-                    isinstance(target_node, ast.Attribute)
-                    and isinstance(target_node.value, ast.Name)
-                    and target_node.value.id == "self"
-                ):
-                    service_attributes.add(target_node.attr)
-    required_service_attributes = {
-        "mode_service",
-        "storage_service",
-        "window_service",
-        "ui_dispatcher",
-        "shutdown_service",
-    }
-    check(
-        "explicit_service_attributes",
-        required_service_attributes.issubset(service_attributes),
-        sorted(service_attributes.intersection(required_service_attributes)),
-    )
-    app_dynamic_forwarders = (
-        [node.name for node in app_node.body if isinstance(node, ast.FunctionDef) and node.name == "__getattr__"]
-        if app_node is not None
-        else ["missing"]
-    )
-    check("app_has_no_dynamic_service_forwarding", not app_dynamic_forwarders, app_dynamic_forwarders)
-    parent_map = {}
-    for node in ast.walk(tree):
-        for child in ast.iter_child_nodes(node):
-            parent_map[child] = node
-
-    def function_name(node):
-        names = []
-        current = node
-        while current is not None:
-            if isinstance(current, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                names.append(current.name)
-            current = parent_map.get(current)
-        return ".".join(reversed(names))
-
-    target_functions = {
-        "WindowSelectionDialog.open",
-        "build_offline_policy_models",
-        "AppModeService._rank_action_candidates_base",
-        "run_windows_smoke_test",
-        "OfflineVisionRuntime._train_game_specific_vision",
-        "ReviewController.build_experiences",
-    }
-    target_lengths = {}
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            name = function_name(node)
-            if name in target_functions:
-                target_lengths[name] = safe_int(node.end_lineno, node.lineno) - node.lineno + 1
-    check(
-        "priority_functions_are_split",
-        set(target_lengths) == target_functions and max(target_lengths.values(), default=1000) <= 100,
-        target_lengths,
-    )
-    raw_sleeps = []
-    fetch_all_calls = []
-    success_modal_calls = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        if isinstance(node.func.value, ast.Name) and node.func.value.id == "time" and node.func.attr == "sleep":
-            raw_sleeps.append((node.lineno, function_name(node)))
-        if node.func.attr == "fetchall":
-            fetch_all_calls.append(node.lineno)
-        if node.func.attr == "show_info":
-            call_site = function_name(node)
-            if call_site not in {"AppUiService.show_info", "App.show_info"}:
-                success_modal_calls.append((node.lineno, call_site))
-    check(
-        "runtime_waits_are_interruptible",
-        raw_sleeps == [(raw_sleeps[0][0], "interruptible_wait")] if raw_sleeps else False,
-        raw_sleeps,
-    )
-    check("unbounded_fetchall_removed", not fetch_all_calls, fetch_all_calls)
-    check("success_messages_do_not_use_modal_dialogs", not success_modal_calls, success_modal_calls)
-    check(
-        "visual_hash_is_persisted_and_indexed",
-        DATABASE_SCHEMA_VERSION >= 13
-        and "visual_hash TEXT NOT NULL" in source
-        and "idx_samples_game_visual_hash" in source
-        and "GROUP BY visual_hash" in source,
-    )
-    immutable_protocol_types = {
-        "CandidateScores",
-        "CapturedFrame",
-        "ModeResult",
-        "VisionTrainingSample",
-        "FrameComputationKey",
-    }
-    check(
-        "core_protocols_use_slotted_data_classes",
-        immutable_protocol_types.issubset(classes)
-        and all("__slots__" in globals()[name].__dict__ for name in immutable_protocol_types),
-        sorted(immutable_protocol_types.intersection(classes)),
-    )
-    check(
-        "worker_protocol_uses_enums",
-        {item.value for item in WorkerMessageKind}
-        == {"ready", "progress", "status", "line", "result", "error"}
-        and {item.value for item in WorkerStage}
-        == {"READY", "STARTING", "RUNNING", "COMPLETED", "FAILED"},
-    )
-    mutable_cache_names = {
-        "POOL_BOUNDARIES",
-        "FEATURE_DISTANCE_WEIGHTS_ARRAY",
-        "OFFLINE_POLICY_TRAINING_CACHE",
-        "_RUNTIME_LOCK_MANIFEST_CACHE",
-        "_BUILD_HASH",
-    }
-    module_assignments = set()
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            targets = node.targets
-        elif isinstance(node, ast.AnnAssign):
-            targets = [node.target]
-        else:
-            targets = []
-        module_assignments.update(target.id for target in targets if isinstance(target, ast.Name))
-    remaining_mutable_caches = mutable_cache_names.intersection(module_assignments)
-    check(
-        "mutable_runtime_caches_have_lifecycle_owners",
-        not remaining_mutable_caches
-        and isinstance(RUNTIME_REPOSITORY, RuntimeRepository)
-        and isinstance(FEATURE_ENGINE, FeatureEngine)
-        and isinstance(POLICY_TRAINING_CACHE, TrainingCache),
-        sorted(remaining_mutable_caches),
-    )
-    frame_key_fields = tuple(FrameComputationKey.__dataclass_fields__)
-    check(
-        "frame_cache_uses_complete_bounded_key",
-        frame_key_fields == ("session_id", "window_identity", "frame_timestamp", "feature_version")
-        and FEATURE_ENGINE.frame_cache.maximum > 0,
-        {"fields": frame_key_fields, "capacity": FEATURE_ENGINE.frame_cache.maximum},
-    )
-    parents = {}
-    for node in ast.walk(tree):
-        for child in ast.iter_child_nodes(node):
-            parents[child] = node
-
-    def qualified(node):
-        names = []
-        current = parents.get(node)
-        while current is not None:
-            if isinstance(current, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                names.append(current.name)
-            current = parents.get(current)
-        return ".".join(reversed(names))
-
-    allowed_boundaries = {
-        "review_process_main",
-        "runtime_install_worker",
-        "run_gui",
-        "_capture_process_main",
-        "KeyboardMonitor._run",
-        "KeyboardMonitor._run.callback",
-        "MouseMonitor._run",
-        "FrameBuffer._run",
-        "PhaseRunner.run",
-        "DataStoreSampleMixin._writer_loop",
-        "AppUiService.ui",
-        "AppLifecycleService.run_background.worker",
-        "AppLifecycleService.process_ui_queue",
-        "AppLifecycleService.worker_entry",
-        "install_global_hooks.sys_hook",
-        "startup_error.close",
-        "show_acknowledge_only_startup.close",
-        "ai_worker_main",
-        "AIWorkerClient.__init__.acceptor",
-        "AIWorkerClient._failed",
-        "OCRMonitor._run",
-        "ManagedTask.start.runner",
-        "logic_contract_suite.worker",
-    }
-    broad = []
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.ExceptHandler)
-            and isinstance(node.type, ast.Name)
-            and node.type.id in {"Exception", "BaseException"}
-        ):
-            name = qualified(node)
-            if not (
-                name in allowed_boundaries
-                or name.startswith("run_windows_smoke_test")
-                or name.startswith("run_window_contract_test")
-                or name.startswith("run_runtime_e2e_test")
-                or name.startswith("run_static_contract_tests")
-            ):
-                broad.append((node.lineno, name, node.type.id))
-    check("broad_exceptions_only_at_process_thread_tk_or_test_boundaries", not broad, broad[:40])
-    check(
-        "programming_errors_not_generic_recoverable",
-        TypeError not in RECOVERABLE_ERRORS
-        and AttributeError not in RECOVERABLE_ERRORS
-        and ArithmeticError not in RECOVERABLE_ERRORS,
-        [item.__name__ for item in RECOVERABLE_ERRORS],
-    )
-    obsolete_tokens = ("import " + "struct", "self." + "ui_queue", "critical_" + "ui_queue")
-    check("obsolete_state_removed", all(token not in source for token in obsolete_tokens))
-    PERCEPTION_EVIDENCE_HUB.clear()
-    PERCEPTION_EVIDENCE_HUB.publish(key_b, {"texts": ["胜利"]})
-    isolated_policy = TaskAgentPolicy({"game_id": "game-a", "perception_key": key_a})
-    foreign_terminal = TerminalEvidenceFusion.classify(isolated_policy, bytes(FEATURE_LEN))
-    PERCEPTION_EVIDENCE_HUB.publish(key_a, {"texts": ["胜利"]})
-    own_terminal = TerminalEvidenceFusion.classify(isolated_policy, bytes(FEATURE_LEN))
-    PERCEPTION_EVIDENCE_HUB.clear()
-    check(
-        "terminal_fusion_has_no_cross_window_fallback",
-        "ocr:success" not in foreign_terminal.get("evidence", [])
-        and "ocr:success" in own_terminal.get("evidence", []),
-        {"foreign": foreign_terminal.get("evidence", []), "own": own_terminal.get("evidence", [])},
-    )
-    released_leases = []
-    lease_book = InputLeaseBook(
-        lambda kind, values: released_leases.append((str(kind), tuple(values))),
-        maximum=8,
-    ).start()
-    expiring_token = lease_book.acquire("keys", (0x11, 65), 0.05)
-    expiry_deadline = time.monotonic() + 0.50
-    while not released_leases and time.monotonic() < expiry_deadline:
-        interruptible_wait(None, 0.01)
-    renewed_token = lease_book.acquire("gamepad", ("a",), 0.08)
-    renewed = lease_book.renew(renewed_token, 0.20)
-    released = lease_book.release(renewed_token)
-    lease_book.close(0.5)
-    check(
-        "input_leases_expire_and_release_in_reverse_safe_payloads",
-        bool(expiring_token)
-        and renewed
-        and released
-        and ("keys", (0x11, 65)) in released_leases
-        and ("gamepad", ("a",)) in released_leases,
-        released_leases,
-    )
-    lines = source.splitlines()
-    check(
-        "source_readability",
-        max((len(line) for line in lines), default=0) <= 300
-        and sum(1 for line in lines if len(line) > 120) <= 120
-        and sum(1 for line in lines if ";" in line) <= 60,
-        {
-            "maximum": max((len(line) for line in lines), default=0),
-            "over_120": sum(1 for line in lines if len(line) > 120),
-            "semicolon_lines": sum(1 for line in lines if ";" in line),
-        },
-    )
-    result = {
-        "test": "static-contract",
-        "version": STATIC_CONTRACT_VERSION,
-        "status": "passed" if not failures else "failed",
-        "checks": checks,
-        "failures": failures,
-    }
-    sys.stdout.write(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-    return 0 if not failures else 1
 
 
-def run_strict_requirement_tests(path=None):
-    sys.stderr.write("--strict-self-test已重命名为--static-contract-test；静态契约测试不能替代Windows 11实机严格验收\n")
-    return 2
 
 
 def show_acknowledge_only_startup(message):
@@ -42759,159 +41446,10 @@ class GuiNamespace:
     scrollable_frame = staticmethod(scrollable_frame)
 
 
-class AcceptanceNamespace:
-    run_static_contract_tests = staticmethod(run_static_contract_tests)
-    run_runtime_e2e_test = staticmethod(run_runtime_e2e_test)
-    run_window_contract_test = staticmethod(run_window_contract_test)
-    run_acceptance_test = staticmethod(run_acceptance_test)
 
 
-class RealHardwareReleaseGate:
-    ROLES = ("low_end_cpu", "nvidia_cuda", "amd_or_intel_directml")
-    REQUIRED_CASES = (
-        "dpi_100",
-        "dpi_125",
-        "dpi_150",
-        "dpi_200",
-        "multi_monitor_negative_coordinates",
-        "ldplayer_window",
-        "ordinary_window",
-        "administrator_integrity_difference",
-        "window_minimized",
-        "window_occluded",
-        "window_recreated",
-        "usb_gamepad_unplug",
-        "escape_starting",
-        "escape_running",
-        "escape_stopping",
-        "network_interruption",
-        "runtime_download_interruption",
-    )
-    ROLE_CASES = {
-        "low_end_cpu": ("memory_pressure", "below_20_fps", "no_discrete_gpu", "cpu_safe_backend"),
-        "nvidia_cuda": ("cuda_execution", "vram_pressure", "driver_reset", "gpu_fault_cpu_recovery"),
-        "amd_or_intel_directml": (
-            "directml_execution",
-            "shared_vram",
-            "operator_compatibility",
-            "gpu_fault_cpu_recovery",
-        ),
-    }
-
-    def __init__(self, base, build_hash=None):
-        self.base = Path(base).resolve()
-        self.build_hash = str(build_hash or current_build_hash())
-        self.directory = self.base / "audit" / "release_evidence"
-
-    @staticmethod
-    def _passed_cases(value):
-        cases = value.get("cases", {}) if isinstance(value.get("cases"), dict) else {}
-        result = {str(name) for name, status in cases.items() if status is True or status == "passed"}
-        result.update(str(name) for name in value.get("passed_cases", []) if str(name))
-        return result
-
-    def evaluate(self):
-        records = []
-        failures = []
-        if self.directory.exists():
-            for path in sorted(self.directory.glob("*.json")):
-                try:
-                    value = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
-                    failures.append(path.name + ":" + type(error).__name__)
-                    continue
-                if not isinstance(value, dict):
-                    failures.append(path.name + ":invalid_record")
-                    continue
-                value = dict(value)
-                value["evidence_file"] = path.name
-                records.append(value)
-        valid = []
-        machine_ids = set()
-        role_records = {}
-        for value in records:
-            role = str(value.get("role", ""))
-            machine_id = str(value.get("machine_fingerprint") or value.get("machine_id") or "")
-            cases = self._passed_cases(value)
-            record_failures = []
-            if role not in self.ROLES:
-                record_failures.append("unknown_role")
-            if not machine_id or machine_id in machine_ids:
-                record_failures.append("missing_or_duplicate_machine")
-            if str(value.get("build_hash", "")) != self.build_hash:
-                record_failures.append("build_hash_mismatch")
-            if value.get("real_windows_11") is not True or safe_int(value.get("windows_build"), 0) < 22000:
-                record_failures.append("not_real_windows_11")
-            if str(value.get("architecture", "")).casefold() != RUNTIME_ARCH_X64:
-                record_failures.append("not_x64")
-            required = set(self.REQUIRED_CASES) | set(self.ROLE_CASES.get(role, ()))
-            missing = sorted(required - cases)
-            if missing:
-                record_failures.append("missing_cases:" + ",".join(missing))
-            if value.get("all_inputs_released_after_exit") is not True:
-                record_failures.append("input_release_not_proven")
-            if value.get("raw_measurements_attached") is not True:
-                record_failures.append("raw_measurements_missing")
-            value["gate_failures"] = record_failures
-            if record_failures:
-                failures.append(value.get("evidence_file", machine_id or role) + ":" + "|".join(record_failures))
-                continue
-            machine_ids.add(machine_id)
-            role_records[role] = value
-            valid.append(value)
-        missing_roles = sorted(set(self.ROLES) - set(role_records))
-        if missing_roles:
-            failures.append("missing_roles:" + ",".join(missing_roles))
-        result = {
-            "schema_version": 1,
-            "build_hash": self.build_hash,
-            "strict_pass": not failures and len(machine_ids) >= 3 and not missing_roles,
-            "independent_machine_count": len(machine_ids),
-            "roles": sorted(role_records),
-            "required_roles": list(self.ROLES),
-            "records": valid,
-            "failures": failures,
-            "fail_closed": True,
-        }
-        output = self.base / "audit" / "real_hardware_release_gate.json"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_json_write(output, result)
-        return result
 
 
-def strict_acceptance_gate(path):
-    if os.name != "nt" or not path:
-        sys.stdout.write(
-            json.dumps(
-                {"strict_pass": False, "failures": ["必须在Windows 11 x64实机并提供验收目录"]},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            + "\n"
-        )
-        return 1
-    if native_windows_architecture() != RUNTIME_ARCH_X64:
-        sys.stdout.write(
-            json.dumps(
-                {"strict_pass": False, "failures": ["ARM64缺少完整锁和实机证据，不宣称严格支持"]},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            + "\n"
-        )
-        return 1
-    report = AcceptanceReport(path)
-    contract_result = report.strict_passed()
-    hardware_result = RealHardwareReleaseGate(path, report.data.get("build_hash")).evaluate()
-    result = bool(contract_result and hardware_result.get("strict_pass"))
-    report.data["real_hardware_release_gate"] = hardware_result
-    report.data["strict_pass"] = result
-    if not hardware_result.get("strict_pass"):
-        failures = list(report.data.get("failures", []))
-        failures.append("三台独立Windows 11 x64真实硬件发布证据不完整")
-        report.data["failures"] = list(dict.fromkeys(failures))
-    sys.stdout.write(json.dumps(report.data, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-    return 0 if result else 1
 
 
 class CommandLineProtocolError(RuntimeError):
@@ -42925,20 +41463,9 @@ class StrictArgumentParser(argparse.ArgumentParser):
 
 def _legacy_cli_arguments(argv):
     values = [str(value) for value in argv]
-    mappings = {
-        "--logic-test": ["test", "logic"],
-        "--fault-injection-test": ["test", "fault"],
-        "--static-contract-test": ["test", "static"],
-        "--strict-self-test": ["test", "strict-self"],
-        "--self-test": ["test", "self"],
-    }
-    for flag, replacement in mappings.items():
-        if flag in values:
-            return replacement
     worker_mappings = {
         "--ai-worker": ("ai-worker", 5),
         "--runtime-install-worker": ("runtime-install-worker", 1),
-        "--runtime-installer-test-worker": ("runtime-installer-test-worker", 2),
     }
     for flag, (command, count) in worker_mappings.items():
         if flag in values:
@@ -42947,18 +41474,6 @@ def _legacy_cli_arguments(argv):
             if len(arguments) != count:
                 raise CommandLineProtocolError(flag + "参数数量无效")
             return [command, *arguments]
-    acceptance_mappings = {
-        "--windows-smoke-test": "windows-smoke",
-        "--runtime-e2e-test": "runtime-e2e",
-        "--window-contract-test": "window-contract",
-        "--acceptance-test": "all",
-        "--strict-acceptance": "strict",
-    }
-    for flag, mode in acceptance_mappings.items():
-        if flag in values:
-            index = values.index(flag)
-            target = values[index + 1] if index + 1 < len(values) and not values[index + 1].startswith("--") else ""
-            return ["acceptance", mode, *([target] if target else [])]
     return values
 
 
@@ -42975,14 +41490,6 @@ def build_cli_parser():
     ai.add_argument("protocol", type=int)
     runtime = commands.add_parser("runtime-install-worker")
     runtime.add_argument("request")
-    runtime_test = commands.add_parser("runtime-installer-test-worker")
-    runtime_test.add_argument("request")
-    runtime_test.add_argument("mode", choices=("STARTING", "RUNNING", "STOPPING"))
-    tests = commands.add_parser("test")
-    tests.add_argument("kind", choices=("logic", "fault", "static", "replay", "generalization", "self", "strict-self"))
-    acceptance = commands.add_parser("acceptance")
-    acceptance.add_argument("kind", choices=("windows-smoke", "runtime-e2e", "window-contract", "all", "strict"))
-    acceptance.add_argument("path", nargs="?", default="")
     return parser
 
 
@@ -50098,7 +48605,7 @@ class ExperienceReplayPortfolio:
         return [item for item in deduplicated if cls._dedup_key(item) in selected]
 
     @classmethod
-    def build(cls, experiences, limit=MAX_TRAINING_SAMPLES):
+    def _base_build_strict(cls, experiences, limit=MAX_TRAINING_SAMPLES):
         raw = [item for item in experiences or [] if isinstance(item, dict)]
         deduplicated = cls.deduplicate(raw, limit)
         buckets = {name: [] for name in cls.categories}
@@ -50246,6 +48753,10 @@ class ExperienceReplayPortfolio:
                 "cross_game_value",
             ],
         }
+
+    @classmethod
+    def build(cls, experiences, limit=MAX_TRAINING_SAMPLES):
+        return _strict_portfolio_build(cls, experiences, limit)
 
 
 _ONLINE_ACCEPTANCE_LOCK = threading.RLock()
@@ -50882,328 +49393,12 @@ def validate_source_contracts_once(path=None):
     return True
 
 
-def generalization_contract_suite():
-    fingerprint = model_evaluation_fingerprint("train_game", ["training_checksum"])
-    manifest = {
-        "schema_version": GENERALIZATION_BENCHMARK_SCHEMA_VERSION,
-        "benchmark_id": "frozen_real_benchmark",
-        "frozen": True,
-        "required_genres": list(GENERALIZATION_REQUIRED_GENRES),
-        "split_policy": {
-            "train_game_ids": ["train_game"],
-            "level_1_game_ids": ["train_game_visual"],
-            "level_2_game_ids": ["train_game_tasks"],
-            "level_3_game_ids": ["unseen_same_genre"],
-            "level_4_game_ids": ["unseen_cross_genre"],
-        },
-        "files": [{"path": "episodes.jsonl", "sha256": "a" * 64, "bytes": 1}],
-        "record_contract": FixedGeneralizationBenchmark.contract(),
-    }
-    context = {
-        "evaluation_partition": "test",
-        "generalization_level": 3,
-        "game_type": "click_puzzle",
-        "resolution_id": "1920x1080",
-        "language": "zh-CN",
-        "ui_skin": "skin_b",
-        "popup_variant": "permission_popup",
-        "frame_rate_group": "30fps",
-        "input_delay_group": "120ms",
-        "benchmark_id": "frozen_real_benchmark",
-        "model_fingerprint": fingerprint,
-    }
-    real_row = {
-        "game_id": "unseen_same_genre",
-        "game_type": "click_puzzle",
-        "task_id": "unseen_level",
-        "episode_id": "real_episode_001",
-        "step_id": 0,
-        "done": True,
-        "success": True,
-        "failure": False,
-        "risk_class": "safe",
-        "action_released": True,
-        "frame_digest": "b" * 64,
-        "model_fingerprint": fingerprint,
-        "benchmark_metrics": {
-            "success": True,
-            "human_intervention": False,
-            "actions_to_success": 1,
-            "dangerous_action_false_release": 0,
-            "resolution_performance": 1.0,
-            "zero_shot_success": True,
-            "few_shot_success": True,
-            "inference_latency_p50_ms": 5.0,
-            "inference_latency_p95_ms": 8.0,
-            "inference_latency_p99_ms": 10.0,
-            "peak_cpu_percent": 20.0,
-            "peak_ram_bytes": 268435456,
-            "peak_vram_bytes": 0,
-        },
-        "context": context,
-        "provenance": {
-            "source_kind": "captured_video_replay",
-            "recording_sha256": "c" * 64,
-            "dataset_sample_id": "real_dataset_sample_001",
-        },
-    }
-    synthetic_row = dict(real_row)
-    synthetic_row["synthetic"] = True
-    manifest_valid = not FixedGeneralizationBenchmark.validate_manifest(manifest)
-    real_row_valid = not FixedGeneralizationBenchmark.validate_row(real_row, manifest, fingerprint)
-    synthetic_rejected = "synthetic_record_forbidden" in FixedGeneralizationBenchmark.validate_row(
-        synthetic_row, manifest, fingerprint
-    )
-    unavailable = GeneralizationEvaluator.evaluate([], [], [], "train_game", "click_puzzle")
-    unavailable_closed = bool(
-        unavailable.get("model_scope") == "single_game_model"
-        and unavailable.get("display_label") == "单游戏模型"
-        and all(
-            value.get("status") == "not_evaluated" and not value.get("claim_allowed")
-            for value in unavailable.get("levels", {}).values()
-        )
-    )
-    insufficient = GeneralizationEvaluator.evaluate(
-        [],
-        [real_row],
-        [],
-        "train_game",
-        "click_puzzle",
-        manifest,
-        {"verified": True, "errors": [], "path": "fixed_test_path"},
-    )
-    insufficient_closed = bool(
-        insufficient.get("levels", {}).get("3", {}).get("status") == "not_evaluated"
-        and insufficient.get("model_scope") == "single_game_model"
-    )
-    forged_single = (
-        generalization_model_scope(
-            {
-                "benchmark_verified": True,
-                "all_claimed_levels_safe": True,
-                "levels": {"3": {"claim_allowed": True}, "4": {"claim_allowed": False}},
-            }
-        )
-        == "single_game_model"
-    )
-    dual_level_gate = (
-        generalization_model_scope(
-            {
-                "benchmark_verified": True,
-                "all_claimed_levels_safe": True,
-                "levels": {"3": {"claim_allowed": True}, "4": {"claim_allowed": True}},
-            }
-        )
-        == "general_model"
-    )
-    with tempfile.TemporaryDirectory(prefix="uga-generalization-contract-") as temporary:
-        root = FixedGeneralizationBenchmark.materialize_contract(temporary)
-        contract_materialized = (
-            all((root / name).is_file() for name in ("benchmark_contract.json", "manifest.example.json", "README.txt"))
-            and not (root / "manifest.json").exists()
-        )
-    semantic_model = SharedSemanticEncoder.train([])
-    encoder = semantic_encoder_from_model(semantic_model)
-    start_vector = encoder.encode("Start button", 16)
-    begin_vector = encoder.encode("开始按钮", 16)
-    unrelated_vector = encoder.encode("defeat enemy", 16)
-    cosine = lambda first, second: sum(a * b for a, b in zip(first, second)) / (
-        math.sqrt(sum(a * a for a in first)) * math.sqrt(sum(b * b for b in second)) or 1.0
-    )
-    semantic = cosine(start_vector, begin_vector) > cosine(start_vector, unrelated_vector)
-    passed = all(
-        (
-            manifest_valid,
-            real_row_valid,
-            synthetic_rejected,
-            unavailable_closed,
-            insufficient_closed,
-            forged_single,
-            dual_level_gate,
-            contract_materialized,
-            semantic,
-        )
-    )
-    return passed, {
-        "manifest_valid": manifest_valid,
-        "real_record_schema_valid": real_row_valid,
-        "synthetic_record_rejected": synthetic_rejected,
-        "missing_benchmark_fail_closed": unavailable_closed,
-        "insufficient_real_data_not_evaluated": insufficient_closed,
-        "level_3_without_level_4_is_single_game": forged_single,
-        "level_3_and_4_gate_required": dual_level_gate,
-        "contract_materialized_without_fake_dataset": contract_materialized,
-        "semantic_alignment": semantic,
-        "model_scope": insufficient.get("model_scope"),
-        "level_3": insufficient.get("levels", {}).get("3", {}),
-    }
 
 
-def run_generalization_contract_tests():
-    passed, checks = generalization_contract_suite()
-    result = {"test": "generalization-contract", "status": "passed" if passed else "failed", "checks": checks}
-    sys.stdout.write(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-    return 0 if passed else 1
 
 
-def replay_contract_suite():
-    actions = [
-        (
-            "e_click",
-            "click_button",
-            {
-                "action_type": "click",
-                "target": {"class": "button", "instance": "primary"},
-                "parameters": {"button": "left"},
-                "risk_class": "safe",
-            },
-            {"kind": "click", "button": "left", "path": [[0.2, 0.15]], "duration": 0.1},
-        ),
-        (
-            "e_drag",
-            "drag_item",
-            {
-                "action_type": "drag",
-                "target": {"class": "item", "instance": "tile"},
-                "parameters": {"button": "left"},
-                "risk_class": "safe",
-            },
-            {"kind": "drag", "button": "left", "path": [[0.2, 0.3], [0.6, 0.7]], "duration": 0.45},
-        ),
-        (
-            "e_hover",
-            "inspect_target",
-            {
-                "action_type": "hover",
-                "target": {"class": "card", "instance": "unknown"},
-                "parameters": {},
-                "risk_class": "safe",
-            },
-            {"kind": "hover", "path": [[0.5, 0.5]], "duration": 0.25},
-        ),
-        (
-            "e_blocked",
-            "confirm_purchase",
-            {
-                "action_type": "click",
-                "target": {"class": "purchase_button", "instance": "confirm"},
-                "parameters": {"button": "left"},
-                "risk_class": "irreversible",
-            },
-            {"kind": "click", "button": "left", "path": [[0.8, 0.8]], "duration": 0.1},
-        ),
-    ]
-    experiences = []
-    for index, (episode, skill, semantic_source, grounded) in enumerate(actions):
-        semantic = normalize_semantic_action(semantic_source)
-        experiences.append(
-            {
-                "episode_id": episode,
-                "task_id": "task_" + str(index),
-                "step_id": 0,
-                "observation_t": {
-                    "visual_digest": hashlib.sha256((episode + "before").encode()).hexdigest(),
-                    "objects": [
-                        {
-                            "class": semantic_source["target"]["class"],
-                            "instance": semantic_source["target"]["instance"],
-                            "bbox": [0.1, 0.1, 0.2, 0.1],
-                            "confidence": 0.9,
-                        }
-                    ],
-                    "scene_graph": {"edges": []},
-                    "internal_state": {"loading": episode == "e_hover"},
-                },
-                "observation_t+1": {
-                    "visual_digest": hashlib.sha256((episode + "after").encode()).hexdigest(),
-                    "objects": [],
-                    "internal_state": {"loading": False},
-                },
-                "semantic_action": semantic,
-                "grounded_action": grounded,
-                "skill_key": skill,
-                "expected_decision": skill,
-                "reward_components": {"progress": 0.2 if index < 3 else 0.0},
-                "terminal_state": "neutral",
-                "safety_decision": {
-                    "allowed": index < 3,
-                    "reason": "human_confirmation_required" if index == 3 else "safe",
-                },
-            }
-        )
-    bundles = build_anonymized_replay_bundles(experiences, "test_model")
-    evaluations = [ReplayEvaluator.evaluate(bundle) for bundle in bundles]
-    required = (
-        "frame_digest",
-        "semantic_objects",
-        "scene_graph",
-        "task_id",
-        "selected_action",
-        "grounded_action",
-        "reward_components",
-        "terminal_evidence",
-        "model_version",
-        "expected_decision",
-    )
-    fields_present = all(
-        all(all(key in step for key in required) for step in bundle.get("steps", [])) for bundle in bundles
-    )
-    blocked = next(bundle for bundle in bundles if bundle.get("episode_id") == "e_blocked")
-    false_release = json.loads(json.dumps(blocked, ensure_ascii=False))
-    false_release["steps"][0]["safety_decision"] = {"allowed": True}
-    checksum_source = dict(false_release)
-    checksum_source.pop("checksum", None)
-    false_release["checksum"] = hashlib.sha256(canonical_bytes(checksum_source)).hexdigest()
-    unsafe_result = ReplayEvaluator.evaluate(false_release)
-    unsafe_detected = bool(
-        not unsafe_result.get("passed") and unsafe_result.get("dangerous_action_false_release_count") == 1
-    )
-    action_diversity = (
-        len(
-            {
-                step.get("semantic_action", {}).get("action_type")
-                for bundle in bundles
-                for step in bundle.get("steps", [])
-            }
-        )
-        >= 3
-    )
-    passed = bool(
-        len(bundles) == 4
-        and all(value.get("passed") for value in evaluations)
-        and fields_present
-        and unsafe_detected
-        and action_diversity
-    )
-    return passed, {
-        "bundle_count": len(bundles),
-        "evaluations": evaluations,
-        "required_fields": fields_present,
-        "unsafe_false_release_detected": unsafe_detected,
-        "action_type_diversity": action_diversity,
-        "unsafe_probe": {
-            "observed": bool(unsafe_result.get("passed")),
-            "expected": False,
-            "assertion_passed": unsafe_detected,
-            "details": {
-                "dangerous_action_false_release_count": safe_int(
-                    unsafe_result.get("dangerous_action_false_release_count"), 0
-                ),
-                "checksum_valid": bool(unsafe_result.get("checksum_valid")),
-            },
-        },
-    }
 
 
-def run_replay_contract_tests():
-    passed, checks = replay_contract_suite()
-    result = {
-        "test": "trajectory-replay",
-        "status": "passed" if passed and checks.get("required_fields") else "failed",
-        "checks": checks,
-    }
-    sys.stdout.write(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-    return 0 if result["status"] == "passed" else 1
 
 
 DEFAULT_OBSERVATION_ENCODER = ObjectCentricObservationEncoder()
@@ -52317,10 +50512,6 @@ def _strict_ack_worker(self, value):
     return self.worker_ack_version
 
 
-ResourceGovernor.sample_once = _strict_governor_sample_once
-ResourceGovernor._update_state_locked = _strict_governor_update_state
-ResourceGovernor.plan_envelope = _strict_plan_envelope
-ResourceGovernor.acknowledge_worker = _strict_ack_worker
 RESOURCE_GOVERNOR.plan_version = 1
 RESOURCE_GOVERNOR.plan_reason = "startup"
 RESOURCE_GOVERNOR.worker_ack_version = 0
@@ -52335,30 +50526,25 @@ RESOURCE_GOVERNOR._last_snapshot = StrictHardwareSnapshot(
 )
 
 
-_ORIGINAL_APP_INIT_STRICT = App.__init__
 def _strict_app_init(self, *args, **kwargs):
-    _ORIGINAL_APP_INIT_STRICT(self, *args, **kwargs)
+    self._base_init_strict(*args, **kwargs)
     self.window_runtime = WindowRuntimeCoordinator(self.api)
     self._runtime_migration_lock = threading.RLock()
     self._runtime_migration_active = False
     self._runtime_last_reconcile = 0.0
     self._worker_ack_version = 0
-App.__init__ = _strict_app_init
 
 
-_ORIGINAL_WINDOW_COMMIT_STRICT = WindowSelectionController._commit_selection
 def _strict_window_commit(self, item, source_mode, rect):
-    result = _ORIGINAL_WINDOW_COMMIT_STRICT(self, item, source_mode, rect)
+    result = self._base_commit_selection_strict(item, source_mode, rect)
     coordinator = getattr(self.app, "window_runtime", None)
     if coordinator is not None and isinstance(self.app.selected_window, dict):
         state = coordinator.publish_selection(self.app.selected_window, reason="window_selected")
         self.app.window_generation = state.generation
         self.app.selected_window = coordinator.target_snapshot()
     return result
-WindowSelectionController._commit_selection = _strict_window_commit
 
 
-_ORIGINAL_REQUIRE_WINDOW_STRICT = App.require_window
 def _strict_require_window(self, foreground=False):
     if not self.selected_window:
         raise RuntimeError("请先点击“选择窗口”按钮选择目标窗口")
@@ -52371,11 +50557,9 @@ def _strict_require_window(self, foreground=False):
         self.selected_window = target
         self.window_generation = safe_int(target.get("window_generation"), self.window_generation, 0)
         return target
-    return _ORIGINAL_REQUIRE_WINDOW_STRICT(self, foreground)
-App.require_window = _strict_require_window
+    return self._base_require_window_strict(foreground)
 
 
-_ORIGINAL_MODE_SESSION_INIT_STRICT = ModeSession.__init__
 def _strict_mode_session_init(self, app, target):
     coordinator = getattr(app, "window_runtime", None)
     if coordinator is not None and coordinator.snapshot() is not None:
@@ -52388,14 +50572,12 @@ def _strict_mode_session_init(self, app, target):
             ),
         }
         target = coordinator.target_snapshot(extra)
-    _ORIGINAL_MODE_SESSION_INIT_STRICT(self, app, target)
+    self._base_init_strict(app, target)
     self.window_runtime = coordinator
-ModeSession.__init__ = _strict_mode_session_init
 
 
-_ORIGINAL_FRAME_BUFFER_INIT_STRICT = FrameBuffer.__init__
 def _strict_frame_buffer_init(self, bridge, target, *args, **kwargs):
-    _ORIGINAL_FRAME_BUFFER_INIT_STRICT(self, bridge, target, *args, **kwargs)
+    self._base_init_strict(bridge, target, *args, **kwargs)
     with WINDOW_RUNTIME_REGISTRY_LOCK:
         self.window_runtime = WINDOW_RUNTIME_REGISTRY.get(safe_int(self.target.get("hwnd"), 0))
     if self.window_runtime is not None:
@@ -52410,13 +50592,12 @@ def _strict_frame_buffer_init(self, bridge, target, *args, **kwargs):
                 self.window_generation,
             )
             self.target["window_key"] = self.isolation_key
-FrameBuffer.__init__ = _strict_frame_buffer_init
 
 
 def _strict_frame_geometry_ready(self):
     coordinator = getattr(self, "window_runtime", None)
     if coordinator is None:
-        return True if not hasattr(self, "_legacy_geometry_ready") else self._legacy_geometry_ready()
+        return self._base_geometry_ready_strict()
     with coordinator.geometry_lock:
         fresh_target = coordinator.target_snapshot({"game_id": self.game_id, "session_id": self.session_id})
         if fresh_target:
@@ -52486,11 +50667,8 @@ def _strict_frame_geometry_ready(self):
         return False
 
 
-FrameBuffer._legacy_geometry_ready = FrameBuffer._geometry_ready
-FrameBuffer._geometry_ready = _strict_frame_geometry_ready
 
 
-_ORIGINAL_GEOMETRY_UPDATED_STRICT = ModeSession._geometry_updated
 def _strict_geometry_updated(self, target, calibration):
     coordinator = getattr(self, "window_runtime", None)
     if coordinator is not None:
@@ -52515,8 +50693,7 @@ def _strict_geometry_updated(self, target, calibration):
             execution = getattr(getattr(self.app, "training_controller", None), "execution", None)
             if execution is not None and hasattr(execution, "target"):
                 execution.target = dict(self.target)
-    return _ORIGINAL_GEOMETRY_UPDATED_STRICT(self, target, calibration)
-ModeSession._geometry_updated = _strict_geometry_updated
+    return self._base_geometry_updated_strict(target, calibration)
 
 
 def _refresh_training_window_state(execution):
@@ -52565,19 +50742,15 @@ def _refresh_training_window_state(execution):
     return True
 
 
-_ORIGINAL_TRAINING_PREFLIGHT_STRICT = TrainingExecution.preflight
 def _strict_training_preflight(self):
-    result = _ORIGINAL_TRAINING_PREFLIGHT_STRICT(self)
+    result = self._base_preflight_strict()
     _refresh_training_window_state(self)
     return result
-TrainingExecution.preflight = _strict_training_preflight
 
 
-_ORIGINAL_ASSERT_SNAPSHOT_STRICT = TrainingExecution.assert_training_snapshot
 def _strict_assert_snapshot(self, force=False):
     _refresh_training_window_state(self)
-    return _ORIGINAL_ASSERT_SNAPSHOT_STRICT(self, force)
-TrainingExecution.assert_training_snapshot = _strict_assert_snapshot
+    return self._base_assert_training_snapshot_strict(force)
 
 
 class ShadowLearningGate:
@@ -52637,17 +50810,14 @@ class ShadowLearningGate:
 
 
 SHADOW_LEARNING_GATE = ShadowLearningGate()
-_ORIGINAL_CHOOSE_ACTION_STRICT = TrainingExecution.choose_action
 def _strict_choose_action(self, captured, temporal):
     _refresh_training_window_state(self)
-    selection = _ORIGINAL_CHOOSE_ACTION_STRICT(self, captured, temporal)
+    selection = self._base_choose_action_strict(captured, temporal)
     if selection is not None and not SHADOW_LEARNING_GATE.allow(self, captured, temporal, selection):
         return None
     return selection
-TrainingExecution.choose_action = _strict_choose_action
 
 
-_ORIGINAL_EXECUTE_SELECTED_STRICT = TrainingExecution.execute_selected_action
 def _strict_execute_selected(self, selection):
     _refresh_training_window_state(self)
     coordinator = getattr(self.host, "window_runtime", None)
@@ -52655,8 +50825,7 @@ def _strict_execute_selected(self, selection):
     if state is not None and not state.input_eligible:
         self.host.api.block_input()
         raise InputStopped("窗口新generation尚未完成连续有效帧确认")
-    return _ORIGINAL_EXECUTE_SELECTED_STRICT(self, selection)
-TrainingExecution.execute_selected_action = _strict_execute_selected
+    return self._base_execute_selected_action_strict(selection)
 
 
 class ModelInstanceRegistry:
@@ -52860,19 +51029,16 @@ def _strict_reconcile_runtime_plan(self):
     ).start()
 
 
-_ORIGINAL_PERIODIC_REFRESH_STRICT = App.periodic_refresh
 def _strict_periodic_refresh(self):
     try:
         _strict_reconcile_runtime_plan(self)
     except RECOVERABLE_ERRORS as error:
         self._log_error("RUNTIME_PLAN_RECONCILE_FAILED", error)
-    return _ORIGINAL_PERIODIC_REFRESH_STRICT(self)
-App.periodic_refresh = _strict_periodic_refresh
+    return self._base_periodic_refresh_strict()
 
 
-_ORIGINAL_UPDATE_RUNTIME_STATUS_STRICT = App._update_runtime_status
 def _strict_update_runtime_status(self):
-    result = _ORIGINAL_UPDATE_RUNTIME_STATUS_STRICT(self)
+    result = self._base_update_runtime_status_strict()
     try:
         accepted = False
         lower = 0.0
@@ -52896,13 +51062,11 @@ def _strict_update_runtime_status(self):
     except RECOVERABLE_ERRORS:
         pass
     return result
-App._update_runtime_status = _strict_update_runtime_status
 
 
-_ORIGINAL_PORTFOLIO_BUILD_STRICT = ExperienceReplayPortfolio.build.__func__
 @classmethod
 def _strict_portfolio_build(cls, experiences, limit=MAX_TRAINING_SAMPLES):
-    result = _ORIGINAL_PORTFOLIO_BUILD_STRICT(cls, experiences, limit)
+    result = cls._base_build_strict(experiences, limit)
     manifest = result.get("immutable_training_manifest", {}) if isinstance(result, dict) else {}
     if isinstance(manifest, dict):
         manifest["adjacent_frames_kept_together"] = True
@@ -52918,688 +51082,12 @@ def _strict_portfolio_build(cls, experiences, limit=MAX_TRAINING_SAMPLES):
         if leaks:
             manifest["split_status"] = "failed"
     return result
-ExperienceReplayPortfolio.build = _strict_portfolio_build
 
 
-def storage_transaction_contract_suite():
-    details = {}
-    passed = False
-    with tempfile.TemporaryDirectory(prefix="ugai-storage-contract-") as folder:
-        base = Path(folder)
-        store = DataStore(base)
-        try:
-            first = {
-                "id": "contract-delete-game-0001",
-                "name": "Delete",
-                "created": 1.0,
-                "needs_review": False,
-                "last_review": None,
-            }
-            second = {
-                "id": "contract-keep-game-00002",
-                "name": "Keep",
-                "created": 2.0,
-                "needs_review": False,
-                "last_review": None,
-            }
-            store.replace_games([first, second], first["id"])
-            shared_relative = Path("models/tensors/shared-contract.safetensors")
-            unique_relative = Path("models/tensors/unique-contract.safetensors")
-            for relative in (shared_relative, unique_relative):
-                path = base / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(relative.as_posix().encode("utf-8"))
-
-            def model_payload(game_id, tensor_path):
-                raw = json.dumps(
-                    {
-                        "game_id": game_id,
-                        "tensor_bundle": {"relative_path": tensor_path.as_posix()},
-                    },
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                return zlib.compress(raw, 9)
-
-            rows = (
-                (first["id"], "complete", unique_relative),
-                (first["id"], "partial", shared_relative),
-                (second["id"], "complete", shared_relative),
-            )
-            for game_id, slot, tensor_path in rows:
-                payload = model_payload(game_id, tensor_path)
-                store.db.execute(
-                    "INSERT INTO models("
-                    "game_id,slot,saved,created,prototype_count,validation,payload,checksum"
-                    ") VALUES(?,?,?,?,?,?,?,?)",
-                    (
-                        game_id,
-                        slot,
-                        1.0,
-                        1.0,
-                        0,
-                        "{}",
-                        payload,
-                        hashlib.sha256(payload).hexdigest(),
-                    ),
-                )
-            store.db.commit()
-            digest = hashlib.sha256(first["id"].encode("utf-8")).hexdigest()
-            replay = base / "replays" / digest[:24] / "bundle.json.z"
-            replay.parent.mkdir(parents=True, exist_ok=True)
-            replay.write_bytes(b"bundle")
-            deletion = store.replace_games([second], second["id"])
-            shared_tensor_retained = (base / shared_relative).exists()
-            deletion_passed = bool(
-                first["id"] in deletion.get("deleted_games", [])
-                and not (base / unique_relative).exists()
-                and shared_tensor_retained
-                and not replay.exists()
-                and store.selected_game()["id"] == second["id"]
-            )
-            rollback_game = {
-                "id": "contract-rollback-game-3",
-                "name": "Rollback",
-                "created": 3.0,
-                "needs_review": False,
-                "last_review": None,
-            }
-            store.replace_games([second, rollback_game], rollback_game["id"])
-            rollback_digest = hashlib.sha256(
-                rollback_game["id"].encode("utf-8")
-            ).hexdigest()
-            rollback_asset = base / "replays" / rollback_digest[:24] / "bundle.json.z"
-            rollback_asset.parent.mkdir(parents=True, exist_ok=True)
-            rollback_asset.write_bytes(b"rollback")
-            store.db.execute(
-                "CREATE TRIGGER contract_fail_game_delete BEFORE DELETE ON games "
-                "WHEN OLD.id='contract-rollback-game-3' "
-                "BEGIN SELECT RAISE(ABORT,'forced'); END"
-            )
-            store.db.commit()
-            rollback_failed = False
-            try:
-                store.replace_games([second], second["id"])
-            except sqlite3.Error:
-                rollback_failed = True
-            store.db.execute("DROP TRIGGER contract_fail_game_delete")
-            store.db.commit()
-            rollback_passed = bool(
-                rollback_failed
-                and rollback_asset.exists()
-                and any(
-                    item["id"] == rollback_game["id"]
-                    for item in store.games()
-                )
-            )
-            regions = [
-                {
-                    "id": "region-a",
-                    "region_norm": [0.1, 0.1, 0.2, 0.1],
-                    "goal_relation": "higher_better",
-                    "relation_config": {"preference": "higher_better"},
-                },
-                {
-                    "id": "region-b",
-                    "region_norm": [0.5, 0.1, 0.2, 0.1],
-                    "goal_relation": "greater_than_region",
-                    "relation_config": {
-                        "preference": "greater_than_region",
-                        "compare_region_id": "region-a",
-                    },
-                },
-            ]
-            store.replace_ocr_regions(rollback_game["id"], regions)
-            store.db.execute(
-                "CREATE TRIGGER contract_fail_ocr_insert BEFORE INSERT ON ocr_regions "
-                "WHEN NEW.id='region-fail' BEGIN SELECT RAISE(ABORT,'forced'); END"
-            )
-            store.db.commit()
-            ocr_failed = False
-            try:
-                store.replace_ocr_regions(
-                    rollback_game["id"],
-                    [
-                        {
-                            "id": "region-ok",
-                            "region_norm": [0.2, 0.2, 0.2, 0.1],
-                            "goal_relation": "keep_same",
-                            "relation_config": {},
-                        },
-                        {
-                            "id": "region-fail",
-                            "region_norm": [0.5, 0.2, 0.2, 0.1],
-                            "goal_relation": "keep_same",
-                            "relation_config": {},
-                        },
-                    ],
-                )
-            except sqlite3.Error:
-                ocr_failed = True
-            store.db.execute("DROP TRIGGER contract_fail_ocr_insert")
-            store.db.commit()
-            remaining_regions = sorted(
-                item["id"]
-                for item in store.list_ocr_regions(rollback_game["id"], False)
-            )
-            ocr_passed = bool(
-                ocr_failed
-                and remaining_regions == ["region-a", "region-b"]
-            )
-            delete_all = store.replace_games([], None)
-            nullable_passed = bool(
-                not store.games()
-                and store.selected_game() is None
-                and delete_all.get("selected_game") is None
-            )
-            passed = bool(
-                deletion_passed
-                and rollback_passed
-                and ocr_passed
-                and nullable_passed
-            )
-            details = {
-                "two_phase_delete": {
-                    "observed": deletion_passed,
-                    "expected": True,
-                    "assertion_passed": deletion_passed,
-                    "deleted_asset_count": safe_int(
-                        deletion.get("deleted_asset_count"), 0
-                    ),
-                    "shared_tensor_retained": shared_tensor_retained,
-                },
-                "delete_rollback": {
-                    "observed": rollback_failed,
-                    "expected": True,
-                    "assertion_passed": rollback_passed,
-                },
-                "ocr_replace_rollback": {
-                    "observed": ocr_failed,
-                    "expected": True,
-                    "assertion_passed": ocr_passed,
-                    "remaining_regions": remaining_regions,
-                },
-                "nullable_selected_game": {
-                    "observed": store.selected_game(),
-                    "expected": None,
-                    "assertion_passed": nullable_passed,
-                },
-            }
-        finally:
-            store.close(5.0)
-    details["assertion_passed"] = passed
-    return passed, details
 
 
-def numeric_priority_contract_suite():
-    checks = {}
-
-    def record(name, condition, evidence=None):
-        checks[str(name)] = {"passed": bool(condition), "evidence": evidence}
-
-    def region(region_id, priority, preference, config=None):
-        relation_config = dict(config or {})
-        relation_config["preference"] = preference
-        return {
-            "id": region_id,
-            "priority": priority,
-            "created": float(priority),
-            "enabled": True,
-            "region_norm": [0.05 + priority * 0.2, 0.1, 0.15, 0.1],
-            "goal_relation": preference,
-            "relation_config": relation_config,
-        }
-
-    first = region("first", 0, NumericPreference.NOW_HIGHER.value)
-    second = region("second", 1, NumericPreference.NOW_LOWER.value)
-    high_result = compare_numeric_snapshots_detailed(
-        [first, second],
-        {"first": 10.0, "second": 10.0},
-        {"first": 11.0, "second": 1000.0},
-    )
-    next_result = compare_numeric_snapshots_detailed(
-        [first, second],
-        {"first": 10.0, "second": 10.0},
-        {"first": 10.0, "second": 9.0},
-    )
-    equal_result = compare_numeric_snapshots_detailed(
-        [first, second],
-        {"first": 10.0, "second": 10.0},
-        {"first": 10.0, "second": 10.0},
-    )
-    invalid_result = compare_numeric_snapshots_detailed(
-        [first, second],
-        {"first": 10.0, "second": 10.0},
-        {"first": {"valid": False}, "second": 9.0},
-    )
-    record(
-        "numeric_high_priority_short_circuit",
-        high_result.get("winning_region_id") == "first" and high_result.get("reward", 0.0) > 0.0,
-        high_result,
-    )
-    record(
-        "numeric_equal_high_priority_checks_next",
-        next_result.get("winning_region_id") == "second" and next_result.get("reward", 0.0) > 0.0,
-        next_result,
-    )
-    record(
-        "numeric_all_equal_zero",
-        equal_result.get("status") == "all_equal" and equal_result.get("reward") == 0.0,
-        equal_result,
-    )
-    record(
-        "numeric_invalid_ocr_zero_and_no_fallthrough",
-        invalid_result.get("status") == "unreadable_or_recovered"
-        and invalid_result.get("reward") == 0.0,
-        invalid_result,
-    )
-
-    preference_cases = {
-        NumericPreference.NOW_HIGHER.value: (10.0, 12.0, 8.0, {}),
-        NumericPreference.NOW_LOWER.value: (10.0, 8.0, 12.0, {}),
-        NumericPreference.POSITIVE_DELTA_HIGHER.value: (10.0, 15.0, 8.0, {}),
-        NumericPreference.POSITIVE_DELTA_LOWER.value: (100.0, 101.0, 99.0, {}),
-        NumericPreference.NEGATIVE_DELTA_HIGHER.value: (10.0, 5.0, 12.0, {}),
-        NumericPreference.NEGATIVE_DELTA_LOWER.value: (100.0, 99.0, 101.0, {}),
-        NumericPreference.ABS_DELTA_HIGHER.value: (100.0, 200.0, 101.0, {}),
-        NumericPreference.ABS_DELTA_LOWER.value: (100.0, 101.0, 200.0, {}),
-        NumericPreference.FIXED_DISTANCE_HIGHER.value: (10.0, 20.0, 10.0, {"fixed_value": 10.0}),
-        NumericPreference.FIXED_DISTANCE_LOWER.value: (20.0, 10.0, 30.0, {"fixed_value": 10.0}),
-        NumericPreference.REGION_DIFF_HIGHER.value: (5.0, 10.0, 0.0, {"compare_region_id": "target"}),
-        NumericPreference.REGION_DIFF_LOWER.value: (5.0, 0.0, 10.0, {"compare_region_id": "target"}),
-        NumericPreference.REGION_ABS_DIFF_HIGHER.value: (
-            10.0,
-            15.0,
-            11.0,
-            {"compare_region_id": "target"},
-        ),
-        NumericPreference.REGION_ABS_DIFF_LOWER.value: (
-            15.0,
-            5.0,
-            20.0,
-            {"compare_region_id": "target"},
-        ),
-    }
-    preference_evidence = {}
-    preference_passed = True
-    for preference, case in preference_cases.items():
-        old_value, preferred_value, contrary_value, config = case
-        subject = region("subject", 0, preference, config)
-        target = region("target", 1, NumericPreference.KEEP_SAME.value)
-        regions = [subject, target] if preference in NUMERIC_COMPARISON_RELATIONS else [subject]
-        before = {"subject": old_value, "target": 5.0}
-        preferred = {"subject": preferred_value, "target": 5.0}
-        contrary = {"subject": contrary_value, "target": 5.0}
-        preferred_reward = compare_numeric_snapshots(regions, before, preferred)
-        contrary_reward = compare_numeric_snapshots(regions, before, contrary)
-        equal_reward = compare_numeric_snapshots(regions, before, before)
-        invalid_reward = compare_numeric_snapshots(
-            regions,
-            before,
-            {"subject": {"valid": False}, "target": 5.0},
-        )
-        if preference in {
-            NumericPreference.ABS_DELTA_HIGHER.value,
-            NumericPreference.ABS_DELTA_LOWER.value,
-            NumericPreference.REGION_ABS_DIFF_HIGHER.value,
-            NumericPreference.REGION_ABS_DIFF_LOWER.value,
-        }:
-            direction_passed = preferred_reward > contrary_reward and preferred_reward > 0.0
-        else:
-            direction_passed = preferred_reward > 0.0 and contrary_reward <= 0.0
-        case_passed = direction_passed and equal_reward == 0.0 and invalid_reward == 0.0
-        preference_passed = preference_passed and case_passed
-        preference_evidence[preference] = {
-            "preferred": preferred_reward,
-            "contrary": contrary_reward,
-            "equal": equal_reward,
-            "invalid": invalid_reward,
-            "passed": case_passed,
-        }
-    record(
-        "all_fourteen_numeric_preferences",
-        preference_passed and set(preference_cases) == set(NUMERIC_REQUIRED_PREFERENCES),
-        preference_evidence,
-    )
-
-    reordered = reorder_numeric_regions(
-        [region("r1", 0, NumericPreference.NOW_HIGHER.value),
-         region("r2", 1, NumericPreference.NOW_HIGHER.value),
-         region("r3", 2, NumericPreference.NOW_HIGHER.value)],
-        2,
-        0,
-    )
-    record(
-        "numeric_list_reorder_updates_priority",
-        [item["id"] for item in reordered] == ["r3", "r1", "r2"]
-        and [item["priority"] for item in reordered] == [0, 1, 2],
-        reordered,
-    )
-    referring = region(
-        "referring",
-        1,
-        NumericPreference.REGION_DIFF_HIGHER.value,
-        {"compare_region_id": "deleted"},
-    )
-    cleaned = clean_numeric_region_references(
-        [region("deleted", 0, NumericPreference.NOW_HIGHER.value), referring],
-        "deleted",
-    )
-    clean_config = cleaned[0].get("relation_config", {}) if cleaned else {}
-    record(
-        "numeric_delete_cleans_cross_region_reference",
-        len(cleaned) == 1
-        and clean_config.get("compare_region_id") == ""
-        and clean_config.get("preference") == NumericPreference.KEEP_SAME.value,
-        cleaned,
-    )
-
-    class FakeStatus:
-        def __init__(self):
-            self.values = []
-
-        def set(self, value):
-            self.values.append(str(value))
-
-    class FakeRoot:
-        def update_idletasks(self):
-            return None
-
-    class FakeApi:
-        def __init__(self):
-            self.capture_count = 0
-
-        def capture_gray(self, target, include_cursor, allow_fallback, preview):
-            self.capture_count += 1
-            return {"capture_valid": True, "preview_rgb": bytes(PREVIEW_W * PREVIEW_H * 3)}
-
-    class FakeApp:
-        pass
-
-    fake_app = FakeApp()
-    fake_app.mode = None
-    fake_app.api = FakeApi()
-    fake_app.status = FakeStatus()
-    fake_app.root = FakeRoot()
-    fake_app.require_ai_runtime = lambda: True
-    fake_app.require_game = lambda: {"id": "g"}
-    fake_app.require_window = lambda foreground=False: {"hwnd": 1}
-    fake_app.show_error = lambda message: (_ for _ in ()).throw(AssertionError(message))
-    ui = AppUiService(fake_app)
-    editor_calls = []
-    original_editor = globals()["NumericRegionEditor"]
-    globals()["NumericRegionEditor"] = lambda app, frame: editor_calls.append((app, frame))
-    try:
-        ui.open_numeric_region_dialog()
-    finally:
-        globals()["NumericRegionEditor"] = original_editor
-    record(
-        "numeric_button_single_capture_direct_editor",
-        ui.api.capture_count == 1 and len(editor_calls) == 1,
-        {"capture_count": ui.api.capture_count, "editor_count": len(editor_calls)},
-    )
-
-    storage_details = {}
-    with tempfile.TemporaryDirectory(prefix="ugai-numeric-priority-") as folder:
-        base = Path(folder)
-        game_id = "numeric-game"
-        store = DataStore(base)
-        try:
-            store.replace_games(
-                [{"id": game_id, "name": "Numeric", "created": 1.0}],
-                game_id,
-            )
-            saved_regions = [
-                region("r1", 0, NumericPreference.NOW_HIGHER.value),
-                region(
-                    "r2",
-                    1,
-                    NumericPreference.FIXED_DISTANCE_LOWER.value,
-                    {"fixed_value": 100.0},
-                ),
-                region(
-                    "r3",
-                    2,
-                    NumericPreference.REGION_ABS_DIFF_HIGHER.value,
-                    {"compare_region_id": "r1"},
-                ),
-            ]
-            store.replace_ocr_regions(game_id, saved_regions)
-            initial = store.list_ocr_regions(game_id, False)
-            dragged = reorder_numeric_regions(initial, 2, 0)
-            store.replace_ocr_regions(game_id, dragged)
-            after_drag = store.list_ocr_regions(game_id, False)
-            store.save_ocr_region(
-                game_id,
-                region("r4", 3, NumericPreference.NOW_LOWER.value),
-            )
-            after_append = store.list_ocr_regions(game_id, False)
-            store.close(5.0)
-            store = DataStore(base)
-            after_restart = store.list_ocr_regions(game_id, False)
-            persisted_r2 = next(item for item in after_restart if item["id"] == "r2")
-            persisted_r3 = next(item for item in after_restart if item["id"] == "r3")
-            storage_details = {
-                "initial": [item["id"] for item in initial],
-                "after_drag": [item["id"] for item in after_drag],
-                "after_append": [item["id"] for item in after_append],
-                "after_restart": [item["id"] for item in after_restart],
-                "priorities": [item["priority"] for item in after_restart],
-                "fixed_value": persisted_r2["relation_config"].get("fixed_value"),
-                "compare_region_id": persisted_r3["relation_config"].get("compare_region_id"),
-            }
-        finally:
-            store.close(5.0)
-    storage_passed = bool(
-        storage_details.get("initial") == ["r1", "r2", "r3"]
-        and storage_details.get("after_drag") == ["r3", "r1", "r2"]
-        and storage_details.get("after_append") == ["r3", "r1", "r2", "r4"]
-        and storage_details.get("after_restart") == ["r3", "r1", "r2", "r4"]
-        and storage_details.get("priorities") == [0, 1, 2, 3]
-        and storage_details.get("fixed_value") == 100.0
-        and storage_details.get("compare_region_id") == "r1"
-    )
-    record("numeric_priority_persistence_and_append", storage_passed, storage_details)
-
-    migration_details = {}
-    with tempfile.TemporaryDirectory(prefix="ugai-numeric-migration-") as folder:
-        base = Path(folder)
-        db_path = base / "universal_game_ai.db"
-        connection = sqlite3.connect(db_path)
-        connection.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
-        connection.execute("INSERT INTO meta(key,value) VALUES('schema_version','14')")
-        connection.execute(
-            "CREATE TABLE games(id TEXT PRIMARY KEY,name TEXT NOT NULL COLLATE NOCASE UNIQUE,"
-            "created REAL NOT NULL,needs_review INTEGER NOT NULL DEFAULT 0,last_review REAL)"
-        )
-        connection.execute("INSERT INTO games VALUES('g','Legacy',1,0,NULL)")
-        connection.execute(
-            "CREATE TABLE ocr_regions(id TEXT PRIMARY KEY,game_id TEXT NOT NULL,created REAL NOT NULL,"
-            "updated REAL NOT NULL,region_norm TEXT NOT NULL,region_type TEXT NOT NULL,"
-            "number_format TEXT NOT NULL,goal_relation TEXT NOT NULL,relation_config TEXT NOT NULL,"
-            "target_min REAL,target_max REAL,special_value REAL,special_meaning TEXT NOT NULL,"
-            "reset_meaning TEXT NOT NULL,unit TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,"
-            "last_text TEXT NOT NULL,last_value REAL,last_confidence REAL NOT NULL DEFAULT 0,"
-            "stable_frames INTEGER NOT NULL DEFAULT 0,checksum TEXT NOT NULL)"
-        )
-        for index, region_id in enumerate(("r1", "r2", "r3")):
-            connection.execute(
-                "INSERT INTO ocr_regions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    region_id,
-                    "g",
-                    1.0,
-                    10.0 + index * 0.000001,
-                    "[0.1,0.1,0.2,0.1]",
-                    "number",
-                    "auto",
-                    "higher_better",
-                    '{"preference":"higher_better"}',
-                    None,
-                    None,
-                    None,
-                    "uncertain",
-                    "uncertain",
-                    "",
-                    1,
-                    "",
-                    None,
-                    0.0,
-                    0,
-                    "legacy",
-                ),
-            )
-        connection.commit()
-        connection.close()
-        store = DataStore(base)
-        try:
-            migrated = store.list_ocr_regions("g", False)
-            schema_version = store.db.execute(
-                "SELECT value FROM meta WHERE key='schema_version'"
-            ).fetchone()[0]
-            migration_details = {
-                "ids": [item["id"] for item in migrated],
-                "priorities": [item["priority"] for item in migrated],
-                "schema_version": schema_version,
-            }
-        finally:
-            store.close(5.0)
-    migration_passed = bool(
-        migration_details.get("ids") == ["r1", "r2", "r3"]
-        and migration_details.get("priorities") == [0, 1, 2]
-        and migration_details.get("schema_version") == str(DATABASE_SCHEMA_VERSION)
-    )
-    record("numeric_priority_migration_from_v14", migration_passed, migration_details)
-    return all(item["passed"] for item in checks.values()), checks
 
 
-_ORIGINAL_LOGIC_SUITE_STRICT = logic_contract_suite
-def logic_contract_suite():
-    passed, checks = _ORIGINAL_LOGIC_SUITE_STRICT()
-    def record(name, condition, evidence=None):
-        checks[str(name)] = {"passed": bool(condition), "evidence": evidence}
-    class DummyBridge:
-        def client_rect(self, hwnd): return (0, 0, 1280, 720)
-        def dpi_for_window(self, hwnd): return 96
-        def block_input(self): return None
-        def release_all_buttons(self): return None
-    coordinator = WindowRuntimeCoordinator(DummyBridge())
-    first = coordinator.publish_selection(
-        {
-            "hwnd": 1,
-            "pid": 2,
-            "process_created": 3,
-            "class": "x",
-            "process_path": "x",
-            "selected_rect": [0, 0, 1280, 720],
-            "selected_dpi": 96,
-        }
-    )
-    second = coordinator.commit_geometry(
-        coordinator.target_snapshot(),
-        (10, -20, 1600, 900),
-        144,
-        {"passed": True},
-        3,
-    )
-    first_evidence = {
-        name: getattr(first, name)
-        for name in first.__dataclass_fields__
-    }
-    second_evidence = {
-        name: getattr(second, name)
-        for name in second.__dataclass_fields__
-    }
-    record(
-        "unique_window_runtime_state",
-        first.generation + 1 == second.generation
-        and second.client_rect == (10, -20, 1600, 900)
-        and second.dpi == 144,
-        {"first": first_evidence, "second": second_evidence},
-    )
-    fake = StrictHardwareSnapshot(
-        cpu_percent=0,
-        process_cpu_percent=0,
-        available_ram=1024**3,
-        process_rss=0,
-        gpu_backend="windows-x64-directml",
-        gpu_utilization=0,
-        free_vram=256 * 1024**2,
-        capture_p95_ms=0,
-        queue_ratio=0,
-        queue_oldest_ms=0,
-        disk_write_p95_ms=0,
-        total_ram=64 * 1024**3,
-        total_vram=8 * 1024**3,
-        tested_peak_vram=2 * 1024**3,
-    )
-    limits = _effective_resource_thresholds(fake)
-    record(
-        "dynamic_resource_thresholds",
-        limits["ram_red"] >= int(64 * 1024**3 * 0.08)
-        and limits["vram_red"] >= int(8 * 1024**3 * 0.10),
-        limits,
-    )
-    envelope = RESOURCE_GOVERNOR.plan_envelope()
-    protocol_fields = (
-        "plan_version",
-        "plan_reason",
-        "requested_backend",
-        "requested_model_tier",
-        "worker_ack_version",
-        "applied_backend",
-        "applied_model_tier",
-    )
-    record(
-        "worker_plan_ack_protocol",
-        all(key in envelope for key in protocol_fields),
-        envelope,
-    )
-    samples = [
-        {
-            "game_id": "g1",
-            "task_id": "t",
-            "session": "s1",
-            "context": {
-                "save_id": "save",
-                "level_id": "l",
-                "resolution": "1280x720",
-                "ui_skin": "a",
-                "popup_type": "none",
-                "frame_rate_group": "60",
-                "input_latency_group": "low",
-            },
-            "action_t": "click",
-            "observation_t": {"visual_digest": str(index)},
-        }
-        for index in range(3)
-    ]
-    key_count = len(
-        {ExperienceReplayPortfolio._group_key(item) for item in samples}
-    )
-    record(
-        "independent_dataset_grouping",
-        key_count == 1,
-        {"group": ExperienceReplayPortfolio._group_key(samples[0])},
-    )
-    tier_contract = all(
-        name in MODEL_TIER_SPECS
-        for name in ("Tiny", "Base", "Large")
-    )
-    record(
-        "tier_specific_model_instances",
-        tier_contract and AI_WORKER_PROTOCOL_VERSION >= 6,
-        {
-            "tiers": list(MODEL_TIER_SPECS),
-            "protocol": AI_WORKER_PROTOCOL_VERSION,
-        },
-    )
-    tracking_passed, tracking_evidence = numeric_tracking_reacquisition_contract()
-    record("numeric_region_hard_reacquisition", tracking_passed, tracking_evidence)
-    numeric_passed, numeric_evidence = numeric_priority_contract_suite()
-    record("numeric_priority_and_preference_contracts", numeric_passed, numeric_evidence)
-    storage_passed, storage_evidence = storage_transaction_contract_suite()
-    record("transactional_game_and_ocr_storage", storage_passed, storage_evidence)
-    return all(item["passed"] for item in checks.values()), checks
 
 
 def parse_cli(argv=None):
@@ -53649,28 +51137,6 @@ def dispatch_cli(arguments):
     if command == "runtime-install-worker":
         request = _validated_worker_path(arguments.request, "运行库请求文件", True)
         return runtime_install_worker(str(request))
-    if command == "runtime-installer-test-worker":
-        request = _validated_worker_path(arguments.request, "运行库测试请求文件", True)
-        return runtime_installer_test_worker(str(request), arguments.mode)
-    if command == "test":
-        return {
-            "logic": run_logic_contract_tests,
-            "fault": run_fault_injection_tests,
-            "static": run_static_contract_tests,
-            "replay": run_replay_contract_tests,
-            "generalization": run_generalization_contract_tests,
-            "self": run_self_test,
-            "strict-self": run_strict_requirement_tests,
-        }[arguments.kind]()
-    if command == "acceptance":
-        target = str(arguments.path or "")
-        return {
-            "windows-smoke": run_windows_smoke_test,
-            "runtime-e2e": run_runtime_e2e_test,
-            "window-contract": run_window_contract_test,
-            "all": run_acceptance_test,
-            "strict": strict_acceptance_gate,
-        }[arguments.kind](target or None)
     if command != "gui":
         raise CommandLineProtocolError("未知命令：" + command)
     return None
