@@ -70,7 +70,7 @@ COARSE_LEN = COARSE_W * COARSE_H * FEATURE_CHANNELS
 SQUARED_DIFF = tuple(value * value for value in range(-255, 256))
 FEATURE_ALGORITHM_VERSION = 4
 ACTION_ALGORITHM_VERSION = 6
-DATABASE_SCHEMA_VERSION = 14
+DATABASE_SCHEMA_VERSION = 15
 MODEL_SCHEMA_VERSION = 5
 POLICY_MODEL_SCHEMA_VERSION = 7
 DEFAULT_POLICY_SCORE_WEIGHTS = {"bc": 60.0, "q": 45.0, "success": 35.0, "risk": 45.0, "ood": 55.0}
@@ -674,7 +674,7 @@ class ModeId(str, Enum):
     COLLECT = "collect"
     UPGRADE = "upgrade"
     AI = "ai"
-    QUIZ = "quiz"
+    NUMERIC = "numeric"
 
 
 class ModeResultStatus(str, Enum):
@@ -683,14 +683,6 @@ class ModeResultStatus(str, Enum):
     FAILED = "failed"
 
 
-class QuizQuestionType(str, Enum):
-    ACTION = "action"
-    EPISODE_RESULT = "episode_result"
-    REGION_IS_NUMERIC = "region_is_numeric"
-    OCR_CONFIRMATION = "ocr_confirmation"
-    OCR_CORRECTION = "ocr_correction"
-    NUMERIC_RELATION = "numeric_relation"
-    CONTEXT_RULE = "context_rule"
 
 
 class NumericGoalRelation(str, Enum):
@@ -699,28 +691,6 @@ class NumericGoalRelation(str, Enum):
     IRRELEVANT = "irrelevant"
     CONTEXT_DEPENDENT = "context_dependent"
     UNCERTAIN = "uncertain"
-
-
-@dataclass(slots=True)
-class QuizQuestion:
-    question_id: str
-    question_type: str
-    title: str
-    frame: dict
-    options: list
-    highlighted_regions: list = field(default_factory=list)
-    metadata: dict = field(default_factory=dict)
-
-    def to_dict(self):
-        return {
-            "question_id": str(self.question_id),
-            "question_type": str(self.question_type),
-            "title": str(self.title),
-            "frame": dict(self.frame) if isinstance(self.frame, dict) else {},
-            "options": [dict(value) for value in self.options if isinstance(value, dict)],
-            "highlighted_regions": [dict(value) for value in self.highlighted_regions if isinstance(value, dict)],
-            "metadata": dict(self.metadata) if isinstance(self.metadata, dict) else {},
-        }
 
 
 class WorkerMessageKind(str, Enum):
@@ -803,7 +773,7 @@ class UserMessageCatalog:
         return f"数据库、WAL与SHM恢复备份已保存到：{path}"
 
 
-MODE_LABELS = {ModeId.COLLECT: "人", ModeId.UPGRADE: "升级", ModeId.AI: "AI", ModeId.QUIZ: "数"}
+MODE_LABELS = {ModeId.COLLECT: "人", ModeId.UPGRADE: "升级", ModeId.AI: "AI", ModeId.NUMERIC: "数"}
 MODE_BY_LABEL = {label: mode.value for mode, label in MODE_LABELS.items()}
 
 
@@ -830,7 +800,7 @@ MODE_SPECS = {
     ModeId.COLLECT.value: {"requires": ("runtime", "game", "window"), "runner": "collect"},
     ModeId.UPGRADE.value: {"requires": ("runtime", "game", "samples"), "runner": "upgrade"},
     ModeId.AI.value: {"requires": ("runtime", "game", "window", "model"), "runner": "ai"},
-    ModeId.QUIZ.value: {"requires": ("runtime", "game", "window"), "runner": "quiz"},
+    ModeId.NUMERIC.value: {"requires": ("runtime", "game", "window"), "runner": "numeric_region_editor"},
 }
 WRITER_BATCH_SIZE = 64
 MAX_PENDING_SAMPLES = 512
@@ -1327,7 +1297,7 @@ class RuntimePlanSet:
     collect: RuntimePlan
     ai: RuntimePlan
     upgrade: RuntimePlan
-    quiz: RuntimePlan
+    numeric: RuntimePlan
 
     def for_mode(self, value):
         mode = normalize_mode_id(value)
@@ -1335,8 +1305,8 @@ class RuntimePlanSet:
             return self.collect
         if mode == ModeId.UPGRADE.value:
             return self.upgrade
-        if mode == ModeId.QUIZ.value:
-            return self.quiz
+        if mode == ModeId.NUMERIC.value:
+            return self.numeric
         return self.ai
 
     def to_dict(self):
@@ -1344,7 +1314,7 @@ class RuntimePlanSet:
             ModeId.COLLECT.value: self.collect.to_dict(),
             ModeId.AI.value: self.ai.to_dict(),
             ModeId.UPGRADE.value: self.upgrade.to_dict(),
-            ModeId.QUIZ.value: self.quiz.to_dict(),
+            ModeId.NUMERIC.value: self.numeric.to_dict(),
         }
 
 
@@ -2280,7 +2250,7 @@ class ResourceGovernor:
             ocr_interval = max(ocr_interval, 16)
             training_batch = policy_batch
             vision_batch = max(vision_batch, 8)
-        elif mode == ModeId.QUIZ.value:
+        elif mode == ModeId.NUMERIC.value:
             capture = max(8, min(capture, 20))
             motion_capture = capture
             semantic_interval = 1
@@ -2366,7 +2336,7 @@ class ResourceGovernor:
             collect=self._plan_for_state(state, backend, ModeId.COLLECT.value),
             ai=self._plan_for_state(state, backend, ModeId.AI.value),
             upgrade=self._plan_for_state(state, backend, ModeId.UPGRADE.value),
-            quiz=self._plan_for_state(state, backend, ModeId.QUIZ.value),
+            numeric=self._plan_for_state(state, backend, ModeId.NUMERIC.value),
         )
 
     @contextmanager
@@ -13845,7 +13815,7 @@ class ModeSession:
         self.target.setdefault("game_id", str(game.get("id", "")) if isinstance(game, dict) else "")
         self.target.setdefault(
             "session_id",
-            str(getattr(app, "mode_session_id", "") or getattr(app, "ask_session_id", "") or uuid.uuid4().hex),
+            str(getattr(app, "mode_session_id", "") or uuid.uuid4().hex),
         )
         self.target.setdefault("window_generation", safe_int(getattr(app, "window_generation", 0), 0, 0))
         self.isolation_key = runtime_isolation_key(
@@ -13958,7 +13928,6 @@ class ModeSession:
         return False
 
 
-NUMERIC_REGION_QUESTION_CACHE = BoundedTTLMap(maximum=4096, ttl_seconds=6 * 3600.0)
 
 
 def _valid_norm_rect(value):
@@ -13970,470 +13939,16 @@ def _valid_norm_rect(value):
     return norm
 
 
-def numeric_region_cache_key(game_id, candidate):
-    bbox = _valid_norm_rect((candidate or {}).get("bbox") or (candidate or {}).get("region_norm")) or [0, 0, 0, 0]
-    attributes = (candidate or {}).get("attributes") if isinstance((candidate or {}).get("attributes"), dict) else {}
-    track_id = str(attributes.get("track_id") or (candidate or {}).get("track_id") or "")
-    quantized = ",".join(str(round(value, 2)) for value in bbox)
-    return str(game_id) + "|" + (track_id if track_id else quantized)
 
 
-def mark_numeric_region_asked(game_id, candidate):
-    NUMERIC_REGION_QUESTION_CACHE[numeric_region_cache_key(game_id, candidate)] = time.time()
 
 
-def build_numeric_region_candidates(frame, game_id, store, ocr_runtime=None, maximum=1):
-    """Build high-information numeric-region candidates without changing the main UI surface."""
-    item = frame if isinstance(frame, dict) else {}
-    existing = []
-    try:
-        existing = store.list_ocr_regions(game_id, False) if store is not None else []
-    except RECOVERABLE_ERRORS:
-        existing = []
-    raw = []
-    for target in item.get("semantic_targets", []) if isinstance(item.get("semantic_targets"), list) else []:
-        if not isinstance(target, dict):
-            continue
-        bbox = _valid_norm_rect(target.get("bbox") or target.get("region_norm"))
-        if bbox is None:
-            continue
-        text = str(target.get("text", "")).strip()
-        parsed = parse_ocr_number(text) if text else {"valid": False, "confidence": 0.0}
-        object_class = str(target.get("class", target.get("generic_class", ""))).casefold()
-        digit_like = sum(character.isdigit() or character in "OoIlBSZ.,:/%+-" for character in text)
-        text_ratio = digit_like / max(1, len(text.replace(" ", ""))) if text else 0.0
-        numeric_probability = max(
-            0.98 if object_class == "number" else 0.80 if object_class == "meter" else 0.0,
-            0.92 if parsed.get("valid") else min(0.80, text_ratio),
-        )
-        if numeric_probability < 0.46 and object_class not in {"number", "meter"}:
-            continue
-        raw.append(
-            {
-                "bbox": bbox,
-                "text": text,
-                "parsed": parsed,
-                "confidence": safe_float(target.get("confidence", 0.0), 0.0, 0.0, 1.0),
-                "class": object_class or "unknown",
-                "attributes": dict(target.get("attributes", {})) if isinstance(target.get("attributes"), dict) else {},
-                "numeric_probability": numeric_probability,
-                "source": str(target.get("source", "semantic_target")),
-            }
-        )
-    for definition in existing:
-        bbox = _valid_norm_rect(definition.get("region_norm"))
-        if bbox is None:
-            continue
-        relation = str(definition.get("goal_relation", "uncertain"))
-        region_type = str(definition.get("region_type", "uncertain"))
-        confidence = safe_float(definition.get("last_confidence", 0.0), 0.0, 0.0, 1.0)
-        stable = safe_int(definition.get("stable_frames", 0), 0, 0, 1000)
-        needs_review = region_type == "uncertain" or relation == "uncertain" or confidence < 0.65 or stable < 3
-        if not needs_review:
-            continue
-        text = str(definition.get("last_text", ""))
-        raw.append(
-            {
-                "bbox": bbox,
-                "text": text,
-                "parsed": parse_ocr_number(text, definition.get("number_format", "auto")),
-                "confidence": confidence,
-                "class": "number" if region_type == "number" else region_type,
-                "attributes": {"region_id": definition.get("id"), "stable_frames": stable},
-                "numeric_probability": 0.96 if region_type == "number" else 0.66,
-                "source": "existing_ocr_region",
-                "definition": dict(definition),
-            }
-        )
-    deduplicated = []
-    for candidate in sorted(raw, key=lambda value: value.get("numeric_probability", 0.0), reverse=True):
-        if any(_rect_iou(candidate["bbox"], old["bbox"]) >= 0.72 for old in deduplicated):
-            continue
-        deduplicated.append(candidate)
-    for candidate in deduplicated[:8]:
-        if ocr_runtime is not None and getattr(ocr_runtime, "ready", False):
-            try:
-                recognized = ocr_runtime.recognize_region(item, candidate["bbox"])
-                recognized_text = str(recognized.get("text", "")).strip()
-                if recognized_text or not candidate.get("text"):
-                    candidate["text"] = recognized_text
-                    candidate["confidence"] = safe_float(recognized.get("confidence", 0.0), 0.0, 0.0, 1.0)
-                    candidate["parsed"] = parse_ocr_number(recognized_text)
-            except RECOVERABLE_ERRORS:
-                pass
-        overlap = max((_rect_iou(candidate["bbox"], value.get("region_norm", [])) for value in existing), default=0.0)
-        stable_frames = safe_int((candidate.get("attributes") or {}).get("stable_frames", 0), 0, 0, 1000)
-        temporal_stability = min(1.0, stable_frames / 5.0)
-        if (candidate.get("attributes") or {}).get("track_id"):
-            temporal_stability = max(temporal_stability, 0.65)
-        region_novelty = 1.0 if overlap < 0.20 else 0.35 if overlap < 0.70 else 0.0
-        policy_relevance = max(
-            safe_float(candidate.get("confidence", 0.0), 0.0, 0.0, 1.0),
-            0.85 if candidate.get("class") in {"number", "meter"} else 0.35,
-        )
-        parse_confidence = safe_float((candidate.get("parsed") or {}).get("confidence", 0.0), 0.0, 0.0, 1.0)
-        ocr_ambiguity = 1.0 - parse_confidence if candidate.get("text") else 0.85
-        score = (
-            2.0 * safe_float(candidate.get("numeric_probability", 0.0), 0.0)
-            + 1.5 * temporal_stability
-            + 1.2 * region_novelty
-            + 1.0 * policy_relevance
-            + 0.8 * ocr_ambiguity
-        )
-        if NUMERIC_REGION_QUESTION_CACHE.get(numeric_region_cache_key(game_id, candidate)) is not None:
-            score -= 4.0
-        candidate.update(
-            {
-                "score": round(score, 6),
-                "temporal_stability": temporal_stability,
-                "region_novelty": region_novelty,
-                "policy_relevance": policy_relevance,
-                "ocr_ambiguity": ocr_ambiguity,
-            }
-        )
-    ranked = sorted(deduplicated, key=lambda value: value.get("score", -999.0), reverse=True)
-    return [dict(value) for value in ranked[: max(0, int(maximum))] if value.get("score", -999.0) > 0.0]
 
 
-def action_quiz_question(frame, choices):
-    options = []
-    for index, entry in enumerate(list(choices)[:4]):
-        options.append(
-            {
-                "code": chr(65 + index),
-                "label": str(entry.get("guidance_label") or "动作" + chr(65 + index)),
-                "value": "choose",
-                "entry": dict(entry),
-            }
-        )
-    options.append({"code": "E", "label": "跳过（未标注）", "value": "skip", "entry": {}})
-    return QuizQuestion(
-        question_id="action|" + uuid.uuid4().hex,
-        question_type=QuizQuestionType.ACTION.value,
-        title="当前画面中，AI 应该执行哪个动作？",
-        frame=frame,
-        options=options,
-        metadata={"instruction": "先选择 A–D 动作或 E 跳过，再点击“提交”。"},
-    ).to_dict()
 
 
-def numeric_region_quiz_question(frame, candidate):
-    text = str(candidate.get("text", ""))
-    parsed = dict(candidate.get("parsed", {})) if isinstance(candidate.get("parsed"), dict) else {}
-    return QuizQuestion(
-        question_id="numeric_region|" + uuid.uuid4().hex,
-        question_type=QuizQuestionType.REGION_IS_NUMERIC.value,
-        title="橙色荧光框 N1 中的内容是否是数字或数值状态？",
-        frame=frame,
-        options=[
-            {"code": "A", "label": "是数字", "value": "number"},
-            {"code": "B", "label": "是数字与上限，例如 35/100", "value": "current_max"},
-            {"code": "C", "label": "是倒计时", "value": "countdown"},
-            {"code": "D", "label": "不是数字", "value": "not_numeric"},
-            {"code": "E", "label": "无法判断", "value": "uncertain"},
-        ],
-        highlighted_regions=[{"label": "N1", "bbox": list(candidate.get("bbox", [])), "color": "#ff8c00"}],
-        metadata={
-            "candidate": dict(candidate),
-            "recognized_text": text,
-            "parsed": parsed,
-            "instruction": "该问题用于监督对象类型、OCR 结果和数值目标语义。",
-        },
-    ).to_dict()
 
 
-class AskQuestionProducer:
-    def __init__(self, app, frame_buffer, prototypes, historical, sources, game_id, model_version):
-        self.app = app
-        self.frame_buffer = frame_buffer
-        self.prototypes = list(prototypes)
-        self.historical = list(historical)
-        self.sources = list(sources)
-        self.game_id = str(game_id)
-        self.model_version = str(model_version)
-        self.requests = queue.Queue(maxsize=1)
-        self.results = queue.Queue(maxsize=2)
-        self.stop_event = threading.Event()
-        self.thread = None
-        self.counter = 0
-
-    def start(self):
-        self.thread = threading.Thread(target=self._run, name="UniversalGameAI-TeachingQuestions", daemon=True)
-        self.thread.start()
-        return self
-
-    def request(self, recent_actions, state_since):
-        payload = {
-            "recent_actions": list(recent_actions)[-32:],
-            "recent_action_results": [],
-            "state_since": float(state_since),
-        }
-        try:
-            while True:
-                self.requests.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            self.requests.put_nowait(payload)
-        except queue.Full:
-            pass
-
-    def _put_result(self, value):
-        try:
-            while self.results.qsize() >= 1:
-                self.results.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            self.results.put_nowait(value)
-        except queue.Full:
-            pass
-
-    def _select_frame(self, payload):
-        frames = self.frame_buffer.snapshot(1.8)
-        usable = [frame for frame in frames if frame.get("usable_for_teaching")]
-        if not usable:
-            raise CaptureUnavailable(self.frame_buffer.last_error or "没有可用于指导的画面")
-        selected = usable[-1]
-        selected_ranked = []
-        selected_priority = float("inf")
-        selected_decision = {}
-        selected_fingerprint = ""
-        found_high_value = False
-        candidates = usable[-28:]
-        if not self.prototypes:
-            return selected, [], {}
-        for candidate_frame in candidates:
-            if self.stop_event.is_set() or self.app.should_stop():
-                raise InputStopped("指导题目生成已停止")
-            temporal = self.app.build_temporal_context(
-                self.frame_buffer, candidate_frame, payload["recent_actions"], payload["state_since"]
-            )
-            temporal.update(
-                {
-                    "previous_action_changed_frame": True,
-                    "object_signature": str(candidate_frame.get("object_signature", "")),
-                    "recent_action_results": payload.get("recent_action_results", []),
-                }
-            )
-            ranked = self.app.rank_action_candidates(
-                candidate_frame["f"],
-                self.prototypes,
-                "",
-                18,
-                temporal,
-                candidate_frame.get("coarse"),
-                candidate_frame.get("neural_f"),
-                candidate_frame.get("semantic_targets", []),
-            )
-            if not ranked:
-                priority = -4.0
-                decision = {"guidance_trigger": ["no_candidate"], "accepted": False}
-            else:
-                decision = self.app.evaluate_action_candidates(ranked)
-                gap = (
-                    (ranked[1]["score"] - ranked[0]["score"]) / max(1.0, abs(ranked[0]["score"]))
-                    if len(ranked) > 1
-                    else 10.0
-                )
-                trigger_count = len(decision.get("guidance_trigger", []))
-                novelty = 1.0 if candidate_frame.get("new_semantic_objects") else 0.0
-                priority = gap - 2.0 * trigger_count - 1.5 * novelty
-            reasons = high_value_question_reasons(candidate_frame, ranked, decision, temporal)
-            fingerprint = question_fingerprint(self.game_id, candidate_frame, ranked, decision)
-            if not reasons or HIGH_VALUE_QUESTION_CACHE.get(fingerprint) is not None:
-                continue
-            decision["high_value_reasons"] = reasons
-            decision["question_fingerprint"] = fingerprint
-            if priority < selected_priority:
-                found_high_value = True
-                selected_priority = priority
-                selected = candidate_frame
-                selected_ranked = ranked
-                selected_decision = decision
-                selected_fingerprint = fingerprint
-        if not found_high_value:
-            raise CaptureUnavailable("当前没有未回答的高价值问题；已跳过高置信、低风险或重复状态")
-        HIGH_VALUE_QUESTION_CACHE[selected_fingerprint] = {"asked": time.time(), "game_id": self.game_id}
-        return selected, selected_ranked, selected_decision
-
-    def _make_choices_base(self, question_frame, ranked):
-        choices = []
-        signatures = set()
-        for item in ranked[:6]:
-            semantic = normalize_semantic_action(
-                item.get("semantic_action") or item.get("proto", {}).get("semantic_action")
-            ) or semantic_action_from_coordinate(item.get("a"))
-            signature = semantic_action_signature(semantic)
-            if signature and signature not in signatures:
-                signatures.add(signature)
-                choices.append(
-                    {
-                        "a": semantic,
-                        "coordinate_action": normalize_action(item.get("a")),
-                        "repeat_policy": str(item["proto"].get("repeat_policy", "one_shot")),
-                        "cluster_id": item["cluster_id"],
-                        "risk_class": str(semantic.get("risk_class", "safe")),
-                        "policy_probability": safe_float(item.get("bc_probability", 0.0), 0.0),
-                        "value_probability": safe_float(item.get("success_probability", 0.0), 0.0),
-                        "risk_probability": safe_float(item.get("risk_probability", 0.0), 0.0),
-                    }
-                )
-            if len(choices) >= 3:
-                break
-        if not choices and self.historical:
-            query = question_frame.get("coarse")
-            if not isinstance(query, (bytes, bytearray)) or len(query) != COARSE_LEN:
-                query = coarse_feature(question_frame["f"])
-            rough = sorted((coarse_distance(query, item["coarse"]), item) for item in self.historical)[:20]
-            exact = sorted(
-                (
-                    dual_feature_distance(
-                        question_frame["f"], item["f"], question_frame.get("neural_f"), item.get("neural_f")
-                    ),
-                    item,
-                )
-                for _, item in rough
-            )
-            for _, item in exact:
-                semantic = normalize_semantic_action(
-                    item.get("semantic_action") or item.get("a")
-                ) or semantic_action_from_coordinate(item.get("a"))
-                signature = semantic_action_signature(semantic)
-                if signature and signature not in signatures:
-                    signatures.add(signature)
-                    choices.append(
-                        {
-                            "a": semantic,
-                            "coordinate_action": normalize_action(item.get("a")),
-                            "repeat_policy": item.get("repeat_policy", "one_shot"),
-                            "cluster_id": item["cluster_id"],
-                            "risk_class": str(semantic.get("risk_class", "safe")),
-                        }
-                    )
-                if len(choices) >= 2:
-                    break
-        seed_text = self.game_id + "|" + self.model_version + "|" + str(self.counter)
-        generator = random.Random(int(hashlib.sha256(seed_text.encode("utf-8", "replace")).hexdigest()[:16], 16))
-        distractors = list(self.sources)
-        generator.shuffle(distractors)
-        for entry in distractors:
-            semantic = normalize_semantic_action(entry.get("a")) or semantic_action_from_coordinate(entry.get("a"))
-            signature = semantic_action_signature(semantic)
-            if signature and signature not in signatures:
-                signatures.add(signature)
-                value = dict(entry)
-                value["a"] = semantic
-                value.setdefault("coordinate_action", normalize_action(semantic))
-                choices.append(value)
-            if len(choices) >= 4:
-                break
-        generator.shuffle(choices)
-        choices = choices[:4]
-        candidates = [
-            {
-                "cluster_id": entry.get("cluster_id", ""),
-                "canonical_action_signature": semantic_action_signature(entry["a"]),
-                "semantic_action": entry["a"],
-                "a": entry.get("coordinate_action") or normalize_action(entry["a"]),
-                "risk_class": entry.get("risk_class", "safe"),
-            }
-            for entry in choices
-        ]
-        return choices, candidates
-
-    def _make_choices(self, question_frame, ranked):
-        choices, _ = self._make_choices_base(question_frame, ranked)
-        return active_learning_alternatives(question_frame, ranked, choices)
-
-    def _run(self):
-        while not self.stop_event.is_set():
-            try:
-                payload = self.requests.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            try:
-                frame, ranked, decision = self._select_frame(payload)
-                choices, candidates = self._make_choices(frame, ranked)
-                action_question = action_quiz_question(frame, choices)
-                action_metadata = action_question.setdefault("metadata", {})
-                action_metadata["question_fingerprint"] = str(
-                    decision.get("question_fingerprint", "")
-                )
-                action_question["metadata"]["high_value_reasons"] = list(decision.get("high_value_reasons", []))
-                questions = [action_question]
-                numeric_candidates = []
-                should_ask_numeric = False
-                numeric_triggers = {
-                    "unknown_numeric_region",
-                    "low_ocr_confidence",
-                    "ocr_temporal_disagreement",
-                    "numeric_relation_unknown",
-                    "numeric_direction_conflict",
-                    "numeric_value_correlated_with_policy_uncertainty",
-                }
-                if numeric_triggers.intersection(set(decision.get("guidance_trigger", []))):
-                    should_ask_numeric = True
-                if should_ask_numeric:
-                    numeric_candidates = build_numeric_region_candidates(
-                        frame,
-                        self.game_id,
-                        self.app.store,
-                        getattr(self.app, "ocr_runtime", None),
-                        1,
-                    )
-                    if numeric_candidates:
-                        numeric_candidate = numeric_candidates[0]
-                        questions.append(numeric_region_quiz_question(frame, numeric_candidate))
-                        mark_numeric_region_asked(self.game_id, numeric_candidate)
-                        trigger_values = list(decision.get("guidance_trigger", []))
-                        if str(numeric_candidate.get("source")) != "existing_ocr_region":
-                            trigger_values.append("unknown_numeric_region")
-                        if safe_float((numeric_candidate.get("parsed") or {}).get("confidence", 0.0), 0.0) < 0.72:
-                            trigger_values.append("low_ocr_confidence")
-                        definition = (
-                            numeric_candidate.get("definition")
-                            if isinstance(numeric_candidate.get("definition"), dict)
-                            else {}
-                        )
-                        if str(definition.get("goal_relation", "uncertain")) == "uncertain":
-                            trigger_values.append("numeric_relation_unknown")
-                        decision["guidance_trigger"] = list(dict.fromkeys(trigger_values))
-                episode_reasons = episode_result_confirmation_required(frame, decision)
-                if episode_reasons:
-                    questions.append(episode_result_quiz_question(frame, episode_reasons))
-                self.counter += 1
-                self._put_result(
-                    {
-                        "frame": frame,
-                        "questions": questions,
-                        "choices": choices,
-                        "numeric_candidates": numeric_candidates,
-                        "candidates": candidates,
-                        "decision": decision,
-                        "guidance_trigger": decision.get("guidance_trigger", []),
-                        "error": "",
-                    }
-                )
-            except InputStopped:
-                break
-            except Exception as error:
-                self._put_result({"frame": None, "questions": [], "choices": [], "candidates": [], "error": str(error)})
-
-    def get_result(self, timeout=0.0):
-        try:
-            return self.results.get(timeout=max(0.0, float(timeout)))
-        except queue.Empty:
-            return None
-
-    def stop(self, timeout=1.0):
-        self.stop_event.set()
-        if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread() and timeout > 0:
-            self.thread.join(max(0.0, float(timeout)))
-        return not bool(self.thread and self.thread.is_alive())
-
-    def alive(self):
-        return bool(self.thread and self.thread.is_alive())
 
 
 class BoundedLRU:
@@ -15508,37 +15023,9 @@ def state_coverage_bucket(frame, context=None):
     return sorted(result or {"normal_start"})
 
 
-def question_fingerprint(game_id, frame, ranked=None, decision=None, question_type=QuizQuestionType.ACTION.value):
-    value = frame if isinstance(frame, dict) else {}
-    choices = []
-    for item in list(ranked or [])[:4]:
-        if not isinstance(item, dict):
-            continue
-        semantic = normalize_semantic_action(
-            item.get("semantic_action") or item.get("a")
-        ) or semantic_action_from_coordinate(item.get("a"))
-        choices.append(semantic_action_signature(semantic))
-    coarse = value.get("coarse")
-    if isinstance(coarse, (bytes, bytearray)):
-        state = feature_bytes(coarse)
-    elif feature_valid(value.get("f")):
-        state = coarse_feature(value.get("f"))
-    else:
-        state = b""
-    payload = {
-        "game_id": str(game_id),
-        "question_type": str(question_type),
-        "state": hashlib.sha256(
-            state + str(value.get("object_signature", "")).encode("utf-8", "replace")
-        ).hexdigest()[:24],
-        "choices": choices,
-        "triggers": sorted(str(item) for item in (decision or {}).get("guidance_trigger", [])),
-        "risk": str((decision or {}).get("risk_class", "")),
-    }
-    return hashlib.sha256(canonical_bytes(payload)).hexdigest()
 
 
-def high_value_question_reasons(frame, ranked, decision, temporal=None):
+def high_value_learning_reasons(frame, ranked, decision, temporal=None):
     value = decision if isinstance(decision, dict) else {}
     items = [item for item in ranked or [] if isinstance(item, dict)]
     reasons = set(str(item) for item in value.get("guidance_trigger", []) if str(item))
@@ -15588,44 +15075,8 @@ def high_value_question_reasons(frame, ranked, decision, temporal=None):
     return sorted(reasons)
 
 
-def episode_result_confirmation_required(frame, decision=None):
-    value = frame if isinstance(frame, dict) else {}
-    verdict = decision if isinstance(decision, dict) else {}
-    reasons = []
-    success = bool(value.get("success_detected") or verdict.get("success_detected"))
-    failure = bool(value.get("failure_detected") or verdict.get("failure_detected"))
-    if success and failure:
-        reasons.append("success_failure_conflict")
-    if value.get("ocr_unstable") or "ocr_temporal_disagreement" in set(verdict.get("guidance_trigger", [])):
-        reasons.append("ocr_unstable")
-    if value.get("settlement_animation") or value.get("animation_only"):
-        reasons.append("settlement_or_animation")
-    if verdict.get("predicted_success") and verdict.get("human_override"):
-        reasons.append("predicted_success_then_override")
-    semantic_text = " ".join(
-        str(item.get("text", ""))
-        for item in value.get("semantic_targets", [])
-        if isinstance(item, dict)
-    ).casefold()
-    obvious = any(token in semantic_text for token in ("胜利", "失败", "成功", "game over", "victory", "defeat"))
-    if verdict.get("terminal_candidate") and not obvious:
-        reasons.append("no_obvious_terminal_text")
-    return sorted(set(reasons))
 
 
-def episode_result_quiz_question(frame, reasons):
-    return QuizQuestion(
-        question_id="episode_result|" + uuid.uuid4().hex,
-        question_type=QuizQuestionType.EPISODE_RESULT.value,
-        title="本局结果是什么？",
-        frame=frame,
-        options=[
-            {"code": "A", "label": "成功", "value": "success"},
-            {"code": "B", "label": "失败", "value": "failure"},
-            {"code": "C", "label": "中断/无法判断", "value": "interrupted"},
-        ],
-        metadata={"required_reasons": list(reasons), "strong_episode_label": True},
-    ).to_dict()
 
 
 class CorrectiveLearningWorkflow:
@@ -16794,25 +16245,32 @@ class ExperienceBuilder:
 
     def _ocr_summary(self, start, end):
         matched = [
-            entry.get("event", {})
+            entry
             for entry in self.events
             if start <= safe_float(entry.get("created"), 0.0) <= end
         ]
         terminal = ""
-        progress = 0.0
         confidence = 0.0
-        numeric_progress = 0.0
         compact_events = []
-        for event in matched:
+        snapshots = {}
+        legacy_latest = None
+        reset = False
+        for entry in matched:
+            event = entry.get("event", {})
             if not isinstance(event, dict):
                 continue
+            created = safe_float(entry.get("created"), 0.0)
             compact_events.append(
                 {
                     key: event.get(key)
                     for key in (
+                        "frame_id",
                         "region_id",
+                        "priority",
                         "terminal",
-                        "progress",
+                        "snapshot_reward",
+                        "snapshot_status",
+                        "snapshot_winning_region_id",
                         "status",
                         "reset",
                         "numeric_value",
@@ -16827,18 +16285,28 @@ class ExperienceBuilder:
             confidence = max(confidence, safe_float(event.get("source_confidence", 0.0), 0.0, 0.0, 1.0))
             if event.get("terminal") in {"success", "failure"}:
                 terminal = str(event.get("terminal"))
-            event_progress = max(-1.0, min(1.0, safe_float(event.get("progress"), 0.0)))
-            if abs(event_progress) > abs(progress):
-                progress = event_progress
-            if abs(event_progress) > abs(numeric_progress) and finite_number(event.get("numeric_delta")):
-                numeric_progress = event_progress
+            reset = reset or bool(event.get("reset"))
+            frame_id = str(event.get("frame_id", ""))
+            if frame_id and finite_number(event.get("snapshot_reward")):
+                previous = snapshots.get(frame_id)
+                if previous is None or created >= previous[0]:
+                    snapshots[frame_id] = (created, event)
+            if legacy_latest is None or created >= legacy_latest[0]:
+                legacy_latest = (created, event)
+        if snapshots:
+            _, selected = max(snapshots.values(), key=lambda item: item[0])
+            progress = max(-1.0, min(1.0, safe_float(selected.get("snapshot_reward"), 0.0)))
+        elif legacy_latest is not None:
+            progress = max(-1.0, min(1.0, safe_float(legacy_latest[1].get("progress"), 0.0)))
+        else:
+            progress = 0.0
         return OcrTransitionSummary(
             tuple(compact_events),
             terminal,
             progress,
             confidence,
-            numeric_progress,
-            any(bool(event.get("reset")) for event in matched if isinstance(event, dict)),
+            progress,
+            reset,
         )
 
     def _build_episode(self, session, items, experience_offset):
@@ -20554,7 +20022,7 @@ class TrainingExecution:
         decision = self.host.evaluate_action_candidates(ranked)
         self.last_ranked_candidates = [dict(item) for item in ranked[:8] if isinstance(item, dict)]
         self.last_decision_snapshot = dict(decision)
-        self.last_decision_snapshot["high_value_reasons"] = high_value_question_reasons(
+        self.last_decision_snapshot["high_value_reasons"] = high_value_learning_reasons(
             captured, ranked, decision, temporal
         )
         if not decision.get("accepted"):
@@ -21251,1084 +20719,11 @@ class TrainingExecution:
         return self.finalize()
 
 
-class GuidanceWindow:
-    def __init__(self, app):
-        self.app = app
-
-    @staticmethod
-    def _ocr_confirmation_question(frame, source_question):
-        metadata = dict(source_question.get("metadata", {}))
-        recognized = str(metadata.get("recognized_text", ""))
-        display = recognized if recognized else "（未识别出文本）"
-        return QuizQuestion(
-            question_id="ocr_confirmation|" + uuid.uuid4().hex,
-            question_type=QuizQuestionType.OCR_CONFIRMATION.value,
-            title="系统识别为“" + display + "”，是否正确？",
-            frame=frame,
-            options=[
-                {"code": "A", "label": "完全正确", "value": "correct"},
-                {"code": "B", "label": "数值正确，但单位或符号不正确", "value": "value_correct_symbol_wrong"},
-                {"code": "C", "label": "识别错误", "value": "incorrect"},
-                {"code": "D", "label": "当前画面无法读清", "value": "unreadable"},
-                {"code": "E", "label": "跳过", "value": "skip"},
-            ],
-            highlighted_regions=list(source_question.get("highlighted_regions", [])),
-            metadata=metadata,
-        ).to_dict()
-
-    @staticmethod
-    def _ocr_correction_question(frame, source_question):
-        metadata = dict(source_question.get("metadata", {}))
-        metadata["correction_purpose"] = "ocr_value"
-        return QuizQuestion(
-            question_id="ocr_correction|" + uuid.uuid4().hex,
-            question_type=QuizQuestionType.OCR_CORRECTION.value,
-            title="请仅用屏幕数字键盘输入正确数值，然后选择处理方式。",
-            frame=frame,
-            options=[
-                {"code": "A", "label": "使用上方输入的数值", "value": "use_keypad"},
-                {"code": "B", "label": "当前画面无法读清", "value": "unreadable"},
-                {"code": "C", "label": "确认它不是数字", "value": "not_numeric"},
-                {"code": "D", "label": "保留原识别并标记低置信度", "value": "keep_low_confidence"},
-                {"code": "E", "label": "跳过", "value": "skip"},
-            ],
-            highlighted_regions=list(source_question.get("highlighted_regions", [])),
-            metadata=metadata,
-        ).to_dict()
-
-    @staticmethod
-    def _numeric_relation_question(frame, source_question):
-        metadata = dict(source_question.get("metadata", {}))
-        return QuizQuestion(
-            question_id="numeric_relation|" + uuid.uuid4().hex,
-            question_type=QuizQuestionType.NUMERIC_RELATION.value,
-            title="这个数值对当前任务意味着什么？",
-            frame=frame,
-            options=[
-                {"code": "A", "label": "通常越大越好", "value": NumericGoalRelation.HIGHER_BETTER.value},
-                {"code": "B", "label": "通常越小越好", "value": NumericGoalRelation.LOWER_BETTER.value},
-                {"code": "C", "label": "与任务好坏无关", "value": NumericGoalRelation.IRRELEVANT.value},
-                {"code": "D", "label": "取决于具体情况", "value": NumericGoalRelation.CONTEXT_DEPENDENT.value},
-                {"code": "E", "label": "不确定", "value": NumericGoalRelation.UNCERTAIN.value},
-            ],
-            highlighted_regions=list(source_question.get("highlighted_regions", [])),
-            metadata=metadata,
-        ).to_dict()
-
-    @staticmethod
-    def _context_rule_question(frame, source_question):
-        metadata = dict(source_question.get("metadata", {}))
-        return QuizQuestion(
-            question_id="numeric_context|" + uuid.uuid4().hex,
-            question_type=QuizQuestionType.CONTEXT_RULE.value,
-            title="请选择最符合该数值的具体规则。",
-            frame=frame,
-            options=[
-                {"code": "A", "label": "越接近某个值越好", "value": "near_target"},
-                {"code": "B", "label": "保持在一个范围内最好", "value": "in_range"},
-                {"code": "C", "label": "低于某个阈值表示危险", "value": "low_threshold_danger"},
-                {"code": "D", "label": "高于某个阈值表示成功", "value": "high_threshold_success"},
-                {"code": "E", "label": "在不同游戏阶段含义不同", "value": "phase_dependent"},
-                {"code": "F", "label": "它是资源值，例如生命值/体力", "value": "resource"},
-                {"code": "G", "label": "它是倒计时", "value": "countdown"},
-                {"code": "H", "label": "暂时不确定", "value": "uncertain"},
-            ],
-            highlighted_regions=list(source_question.get("highlighted_regions", [])),
-            metadata=metadata,
-        ).to_dict()
-
-    def open(self, prepared):
-        app = self.app
-        created = prepared.get("created")
-        try:
-            if app.mode != ModeId.QUIZ.value or app.stop_event is None or app.stop_event.is_set() or app.closing:
-                return
-            buffer = prepared["buffer"]
-            producer = prepared["producer"]
-            initial = prepared["packet"]
-            app.lifecycle.mark_running()
-            app.api.block_input()
-            app.set_input_status("已锁定")
-            app.status.set("数已开始：按当前题目选择结构化答案并点击“提交”；点击“结束数”或按ESC结束")
-            win = tk.Toplevel(app.root)
-            app.ask_window = win
-            win.title("数")
-            fit_window(win, 820, 780, 600, 460)
-            win.transient(app.root)
-            win.bind("<Unmap>", lambda event: buffer.set_preview_active(False))
-            win.bind("<Map>", lambda event: buffer.set_preview_active(True))
-            win.bind("<FocusOut>", lambda event: buffer.set_preview_active(False))
-            win.bind("<FocusIn>", lambda event: buffer.set_preview_active(True))
-            frame = scrollable_frame(win, 16, True)
-            title_var = tk.StringVar(value="等待题目")
-            instruction_var = tk.StringVar(value="所有问题必须先选择，再点击“提交”。")
-            ttk.Label(
-                frame,
-                textvariable=title_var,
-                font=("Microsoft YaHei UI", 14, "bold"),
-                wraplength=770,
-            ).pack(anchor="w")
-            ttk.Label(frame, textvariable=instruction_var, wraplength=770).pack(anchor="w", pady=(4, 10))
-            canvas = tk.Canvas(
-                frame,
-                width=ASK_CANVAS_W,
-                height=ASK_CANVAS_H,
-                bg="black",
-                highlightthickness=1,
-                highlightbackground="#777777",
-            )
-            canvas.pack()
-            preview_info = tk.StringVar(value="等待彩色教学预览")
-            ttk.Label(frame, textvariable=preview_info, wraplength=770).pack(anchor="w", fill="x", pady=(6, 0))
-            keypad_holder = ttk.Frame(frame)
-            keypad_holder.pack(fill="x", pady=(8, 0))
-            choice_frame = ttk.Frame(frame)
-            choice_frame.pack(fill="both", expand=True, pady=(8, 0))
-            tools = ttk.Frame(frame)
-            tools.pack(fill="x", pady=(8, 0))
-            submit_button = ttk.Button(tools, text="提交", state="disabled")
-            submit_button.pack(side="left", fill="x", expand=True, ipady=6)
-            end_button = ttk.Button(tools, text="结束数", command=lambda: app.close_ask(reason="completed"))
-            end_button.pack(side="left", padx=(8, 0), ipadx=18, ipady=6)
-            state = {
-                "frame": None,
-                "questions": [],
-                "question_index": 0,
-                "answers": [],
-                "candidates": [],
-                "guidance_trigger": [],
-                "image": None,
-                "locked": False,
-                "selected": None,
-                "recent_actions": deque(["<START>", "<START>"], maxlen=32),
-                "state_since": time.monotonic(),
-                "waiting": False,
-                "buttons": [],
-                "keypad": None,
-            }
-
-            def schedule(delay, callback):
-                if app.ask_window is None:
-                    return
-                holder = {"id": None}
-
-                def wrapped():
-                    app.ask_after_ids.discard(holder["id"])
-                    if app.ask_window is not None:
-                        callback()
-
-                holder["id"] = win.after(delay, wrapped)
-                app.ask_after_ids.add(holder["id"])
-
-            def current_question():
-                index = safe_int(state.get("question_index"), 0)
-                questions = state.get("questions", [])
-                return questions[index] if 0 <= index < len(questions) else None
-
-            def set_locked(value):
-                state["locked"] = bool(value)
-                for button in state.get("buttons", []):
-                    button.configure(state="disabled" if value else "normal")
-                submit_button.configure(
-                    state="normal" if not value and state.get("selected") is not None else "disabled"
-                )
-
-            def clear_keypad():
-                for child in keypad_holder.winfo_children():
-                    child.destroy()
-                state["keypad"] = None
-
-            def option_label(question, option):
-                label = str(option.get("label", ""))
-                if question.get("question_type") == QuizQuestionType.ACTION.value:
-                    entry = option.get("entry") if isinstance(option.get("entry"), dict) else {}
-                    if option.get("value") == "choose" and entry.get("a"):
-                        label = str(entry.get("guidance_label") or app.action_text(entry.get("a")))
-                return str(option.get("code", "?")) + ". " + label
-
-            def render_canvas(question):
-                question_frame = (
-                    question.get("frame")
-                    if isinstance(question.get("frame"), dict)
-                    else state.get("frame", {})
-                )
-                preview = preview_rgb_bytes(question_frame.get("preview_rgb")) or bytes(PREVIEW_W * PREVIEW_H * 3)
-                ppm = (
-                    b"P6\n"
-                    + str(PREVIEW_W).encode("ascii")
-                    + b" "
-                    + str(PREVIEW_H).encode("ascii")
-                    + b"\n255\n"
-                    + preview
-                )
-                image = tk.PhotoImage(data=base64.b64encode(ppm).decode("ascii"), format="PPM")
-                scaled = image.zoom(2, 2)
-                state["image"] = (image, scaled)
-                canvas.delete("all")
-                canvas.create_image(ASK_PREVIEW_X, ASK_PREVIEW_Y, image=scaled, anchor="nw")
-                if question.get("question_type") == QuizQuestionType.ACTION.value:
-                    colors = ("#00ffff", "#ffff00", "#ff66ff", "#66ff66")
-                    action_options = [value for value in question.get("options", []) if value.get("value") == "choose"]
-                    for index, option in enumerate(action_options[:4]):
-                        entry = option.get("entry") if isinstance(option.get("entry"), dict) else {}
-                        action = normalize_action(entry.get("coordinate_action")) or normalize_action(entry.get("a"))
-                        if not action or action["kind"] == "no_op":
-                            continue
-                        points = []
-                        for point in action.get("path") or []:
-                            cx, cy = PreviewCoordinateMapper.to_canvas(point)
-                            points.extend([cx, cy])
-                        color = colors[index]
-                        if len(points) >= 4:
-                            canvas.create_line(*points, fill=color, width=3, arrow="last")
-                        if len(points) >= 2:
-                            canvas.create_oval(
-                                points[-2] - 6,
-                                points[-1] - 6,
-                                points[-2] + 6,
-                                points[-1] + 6,
-                                outline=color,
-                                width=3,
-                            )
-                            canvas.create_text(
-                                points[-2] + 10,
-                                points[-1] - 10,
-                                text=option.get("code", chr(65 + index)),
-                                fill=color,
-                                font=("Microsoft YaHei UI", 12, "bold"),
-                                anchor="sw",
-                            )
-                for region in question.get("highlighted_regions", []):
-                    bbox = _valid_norm_rect(region.get("bbox") if isinstance(region, dict) else None)
-                    if bbox is None:
-                        continue
-                    color = str(region.get("color", "#ff8c00"))
-                    left = ASK_PREVIEW_X + bbox[0] * ASK_PREVIEW_W
-                    top = ASK_PREVIEW_Y + bbox[1] * ASK_PREVIEW_H
-                    right = left + bbox[2] * ASK_PREVIEW_W
-                    bottom = top + bbox[3] * ASK_PREVIEW_H
-                    canvas.create_rectangle(left, top, right, bottom, outline=color, width=4)
-                    canvas.create_text(
-                        left + 5,
-                        max(ASK_PREVIEW_Y + 5, top - 5),
-                        text=str(region.get("label", "N1")),
-                        fill=color,
-                        font=("Microsoft YaHei UI", 12, "bold"),
-                        anchor="sw",
-                    )
-                warnings = []
-                if question_frame.get("protected_or_black"):
-                    warnings.append("黑屏/受保护画面")
-                if question_frame.get("stale"):
-                    warnings.append("长时间重复")
-                if question_frame.get("backend_changed"):
-                    warnings.append("采集后端变化")
-                if not question_frame.get("backend_validated"):
-                    warnings.append("后端未验收")
-                if not question_frame.get("capture_valid"):
-                    warnings.append("画面无效")
-                stamp = time.strftime(
-                    "%Y-%m-%d %H:%M:%S",
-                    time.localtime(float(question_frame.get("wall_time", time.time()))),
-                )
-                preview_info.set(
-                    "采集时间："
-                    + stamp
-                    + "  后端："
-                    + str(question_frame.get("method", "未知"))
-                    + "  质量告警："
-                    + ("、".join(warnings) if warnings else "无")
-                )
-
-            def select_option(option, button):
-                if state["locked"]:
-                    return
-                state["selected"] = dict(option)
-                question = current_question() or {}
-                for widget, value in zip(state.get("buttons", []), question.get("options", [])):
-                    widget.configure(text=("✓ " if value is option else "") + option_label(question, value))
-                submit_button.configure(state="normal")
-                app.status.set("数中：已选择" + str(option.get("code", "")) + "，请点击“提交”")
-
-            def render_current_question():
-                question = current_question()
-                if question is None:
-                    return
-                state["selected"] = None
-                title_var.set(str(question.get("title", "请选择答案")))
-                metadata = question.get("metadata") if isinstance(question.get("metadata"), dict) else {}
-                instruction_var.set(str(metadata.get("instruction") or "所有问题必须先选择，再点击“提交”。"))
-                render_canvas(question)
-                clear_keypad()
-                if question.get("question_type") == QuizQuestionType.OCR_CORRECTION.value:
-                    initial_text = str(metadata.get("recognized_text", ""))
-                    keypad = ScreenNumericKeypad(keypad_holder, "屏幕数字键盘（不使用普通键盘文本框）", initial_text)
-                    keypad.frame.pack(fill="x")
-                    state["keypad"] = keypad
-                for child in choice_frame.winfo_children():
-                    child.destroy()
-                state["buttons"] = []
-                for option in question.get("options", []):
-                    button = ttk.Button(choice_frame, text=option_label(question, option))
-                    button.configure(command=lambda option=option, button=button: select_option(option, button))
-                    button.pack(fill="x", pady=3, ipady=5)
-                    state["buttons"].append(button)
-                set_locked(False)
-
-            def insert_followups(question, answer):
-                question_type = str(question.get("question_type", ""))
-                value = str(answer.get("value", ""))
-                followups = []
-                if (
-                    question_type == QuizQuestionType.REGION_IS_NUMERIC.value
-                    and value in {"number", "current_max", "countdown"}
-                ):
-                    metadata = dict(question.get("metadata", {}))
-                    metadata["region_type_answer"] = value
-                    source = dict(question)
-                    source["metadata"] = metadata
-                    followups.append(self._ocr_confirmation_question(question.get("frame", {}), source))
-                elif question_type == QuizQuestionType.OCR_CONFIRMATION.value:
-                    if value == "incorrect":
-                        followups.append(self._ocr_correction_question(question.get("frame", {}), question))
-                    if value not in {"skip"}:
-                        followups.append(self._numeric_relation_question(question.get("frame", {}), question))
-                elif (
-                    question_type == QuizQuestionType.NUMERIC_RELATION.value
-                    and value == NumericGoalRelation.CONTEXT_DEPENDENT.value
-                ):
-                    followups.append(self._context_rule_question(question.get("frame", {}), question))
-                if followups:
-                    index = state["question_index"] + 1
-                    state["questions"][index:index] = followups
-
-            def queue_group_answer():
-                if state["locked"] or app.ask_answer_queue is None:
-                    return
-                set_locked(True)
-                app.ask_answer_queue.put(
-                    {
-                        "kind": "quiz_group",
-                        "frame": state["frame"],
-                        "answers": list(state["answers"]),
-                        "candidates": list(state["candidates"]),
-                        "guidance_trigger": list(state["guidance_trigger"]),
-                        "recent_actions": list(state["recent_actions"]),
-                        "state_since": state["state_since"],
-                        "callback": finish_answer,
-                    }
-                )
-
-            def submit_answer():
-                question = current_question()
-                option = state.get("selected")
-                if question is None or option is None:
-                    win.bell()
-                    app.status.set("请先选择当前题目的答案，再点击“提交”")
-                    return
-                answer = {
-                    "question_id": str(question.get("question_id", "")),
-                    "question_type": str(question.get("question_type", "")),
-                    "code": str(option.get("code", "")),
-                    "label": str(option.get("label", "")),
-                    "value": str(option.get("value", "")),
-                    "entry": dict(option.get("entry", {})) if isinstance(option.get("entry"), dict) else {},
-                    "metadata": (
-                        dict(question.get("metadata", {}))
-                        if isinstance(question.get("metadata"), dict)
-                        else {}
-                    ),
-                    "highlighted_regions": list(question.get("highlighted_regions", [])),
-                }
-                if (
-                    question.get("question_type") == QuizQuestionType.OCR_CORRECTION.value
-                    and option.get("value") == "use_keypad"
-                ):
-                    keypad = state.get("keypad")
-                    try:
-                        answer["corrected_value"] = keypad.get_number()
-                        answer["corrected_text"] = str(keypad.value.get())
-                    except (ValueError, AttributeError) as error:
-                        win.bell()
-                        app.status.set(str(error))
-                        return
-                state["answers"].append(answer)
-                insert_followups(question, answer)
-                state["question_index"] += 1
-                if state["question_index"] < len(state["questions"]):
-                    render_current_question()
-                else:
-                    queue_group_answer()
-
-            submit_button.configure(command=submit_answer)
-            win.bind("<Return>", lambda event: submit_answer())
-
-            def apply_packet(packet):
-                if app.ask_window is None:
-                    return
-                state["waiting"] = False
-                state["frame"] = packet.get("frame") or {}
-                questions = [dict(value) for value in packet.get("questions", []) if isinstance(value, dict)]
-                if not questions:
-                    questions = [action_quiz_question(state["frame"], packet.get("choices", []))]
-                state["questions"] = questions
-                state["question_index"] = 0
-                state["answers"] = []
-                state["candidates"] = list(packet.get("candidates", []))
-                state["guidance_trigger"] = list(packet.get("guidance_trigger", []))
-                render_current_question()
-
-            def poll_question():
-                if app.ask_window is None or app.stop_event is None or app.stop_event.is_set():
-                    return
-                packet = producer.get_result(0.0)
-                if packet is None:
-                    schedule(45, poll_question)
-                    return
-                if packet.get("error"):
-                    app.status.set("数等待可用画面：" + str(packet["error"]))
-                    producer.request(state["recent_actions"], state["state_since"])
-                    schedule(160, poll_question)
-                    return
-                apply_packet(packet)
-
-            def request_question():
-                if app.ask_window is None or state["waiting"]:
-                    return
-                state["waiting"] = True
-                set_locked(True)
-                producer.request(state["recent_actions"], state["state_since"])
-                schedule(20, poll_question)
-
-            def finish_answer(result, error):
-                if app.ask_window is None:
-                    return
-                if error:
-                    app._fail_active_mode(error)
-                    return
-                if result and result.get("saved") and result.get("action"):
-                    state["recent_actions"].append(semantic_action_signature(result["action"]))
-                    state["state_since"] = time.monotonic()
-                counts = app.ask_counts or {}
-                app.status.set(
-                    "数中：动作保存"
-                    + str(counts.get("saved", 0))
-                    + "，重复"
-                    + str(counts.get("duplicates", 0))
-                    + "，跳过"
-                    + str(counts.get("skipped", 0))
-                    + "，数值监督"
-                    + str(counts.get("numeric_questions", 0))
-                    + "，OCR纠正"
-                    + str(counts.get("ocr_corrections", 0))
-                )
-                schedule(100, request_question)
-
-            def refuse_close():
-                win.bell()
-                win.lift()
-                win.focus_force()
-
-            win.protocol("WM_DELETE_WINDOW", refuse_close)
-            app.ask_escape_armed = not app.api.key_down(0x1B)
-
-            def poll_escape():
-                if app.ask_window is None:
-                    return
-                down = app.api.key_down(0x1B)
-                if not down:
-                    app.ask_escape_armed = True
-                elif app.ask_escape_armed:
-                    app.close_ask(reason="stopped")
-                    return
-                schedule(45, poll_escape)
-
-            apply_packet(initial)
-            poll_escape()
-            win.wait_visibility()
-            win.focus_force()
-        except RECOVERABLE_ERRORS as error:
-            app._fail_active_mode("数界面创建失败：" + str(error))
-        finally:
-            if created is not None:
-                created.set()
-
-def compile_numeric_supervision(app, game_id, frame, answers):
-    by_type = defaultdict(list)
-    for answer in answers or []:
-        if isinstance(answer, dict):
-            by_type[str(answer.get("question_type", ""))].append(answer)
-    region_answers = by_type.get(QuizQuestionType.REGION_IS_NUMERIC.value, [])
-    if not region_answers:
-        return {"ocr_values": [], "numeric_questions": 0, "ocr_corrections": 0, "numeric_relations": 0}
-    region_answer = region_answers[-1]
-    metadata = dict(region_answer.get("metadata", {})) if isinstance(region_answer.get("metadata"), dict) else {}
-    candidate = dict(metadata.get("candidate", {})) if isinstance(metadata.get("candidate"), dict) else {}
-    bbox = _valid_norm_rect(candidate.get("bbox") or candidate.get("region_norm"))
-    recognized_text = str(metadata.get("recognized_text", candidate.get("text", "")))
-    parsed = (
-        dict(metadata.get("parsed", {}))
-        if isinstance(metadata.get("parsed"), dict)
-        else parse_ocr_number(recognized_text)
-    )
-    region_value = str(region_answer.get("value", "uncertain"))
-    is_numeric = region_value in {"number", "current_max", "countdown"}
-    result = {"ocr_values": [], "numeric_questions": 1, "ocr_corrections": 0, "numeric_relations": 0}
-    if bbox is None:
-        return result
-    if not is_numeric:
-        app.store.append_guidance_event(
-            game_id,
-            "numeric_region_supervision",
-            {
-                "frame_digest": frame_digest(frame),
-                "bbox": bbox,
-                "is_numeric": False,
-                "region_answer": region_value,
-                "ocr_raw": recognized_text,
-                "human_confirmed": True,
-            },
-        )
-        return result
-    confirmation = (by_type.get(QuizQuestionType.OCR_CONFIRMATION.value) or [{}])[-1]
-    confirmation_value = str(confirmation.get("value", "skip"))
-    corrected_value = parsed.get("value") if parsed.get("valid") else None
-    corrected_text = str(parsed.get("normalized", recognized_text))
-    ocr_correct = confirmation_value == "correct"
-    confidence = 1.0 if confirmation_value in {"correct", "value_correct_symbol_wrong"} else 0.35
-    correction = (by_type.get(QuizQuestionType.OCR_CORRECTION.value) or [{}])[-1]
-    if correction:
-        result["ocr_corrections"] = 1
-        correction_value = str(correction.get("value", ""))
-        if correction_value == "use_keypad" and finite_number(correction.get("corrected_value")):
-            corrected_value = safe_float(correction.get("corrected_value"))
-            corrected_text = str(correction.get("corrected_text", corrected_value))
-            ocr_correct = False
-            confidence = 1.0
-        elif correction_value == "not_numeric":
-            app.store.append_guidance_event(
-                game_id,
-                "numeric_region_supervision",
-                {
-                    "frame_digest": frame_digest(frame),
-                    "bbox": bbox,
-                    "is_numeric": False,
-                    "region_answer": "corrected_not_numeric",
-                    "ocr_raw": recognized_text,
-                    "human_confirmed": True,
-                },
-            )
-            return result
-        elif correction_value in {"unreadable", "skip"}:
-            corrected_value = None
-            confidence = 0.0
-        elif correction_value == "keep_low_confidence":
-            confidence = min(confidence, 0.35)
-    relation_answer = (by_type.get(QuizQuestionType.NUMERIC_RELATION.value) or [{}])[-1]
-    relation = str(relation_answer.get("value", NumericGoalRelation.UNCERTAIN.value))
-    if relation_answer:
-        result["numeric_relations"] = 1
-    context_answer = (by_type.get(QuizQuestionType.CONTEXT_RULE.value) or [{}])[-1]
-    context_rule = str(context_answer.get("value", ""))
-    relation_config = {
-        "rule": context_rule,
-        "task_phase": str(frame.get("task_phase", "unknown")),
-        "subgoal_id": str(frame.get("subgoal_id", "")),
-        "human_confirmed": True,
-    }
-    if (
-        context_rule in {"low_threshold_danger", "high_threshold_success", "near_target"}
-        and finite_number(corrected_value)
-    ):
-        relation_config["threshold"] = safe_float(corrected_value)
-    if context_rule == "phase_dependent":
-        relation_config["phase_rules"] = {
-            str(frame.get("task_phase", "unknown")): NumericGoalRelation.UNCERTAIN.value
-        }
-    number_format = (
-        "time"
-        if region_value == "countdown"
-        else "current_max"
-        if region_value == "current_max"
-        else str(parsed.get("kind", "auto"))
-    )
-    if region_value == "countdown" and relation == NumericGoalRelation.UNCERTAIN.value:
-        relation = "countdown"
-    goal_relation = relation
-    if (
-        relation == NumericGoalRelation.CONTEXT_DEPENDENT.value
-        and context_rule in {"near_target", "in_range", "resource", "countdown"}
-    ):
-        goal_relation = relation
-    stable_frames = max(1, safe_int((candidate.get("attributes") or {}).get("stable_frames", 1), 1, 1, 1000))
-    saved_region = app.store.save_ocr_region(
-        game_id,
-        {
-            "region_norm": bbox,
-            "region_type": "number",
-            "number_format": number_format,
-            "goal_relation": goal_relation,
-            "relation_config": relation_config,
-            "target_min": relation_config.get("threshold") if context_rule == "near_target" else None,
-            "target_max": None,
-            "recognized_text": corrected_text,
-            "last_value": corrected_value,
-            "confidence": confidence,
-            "stable_frames": stable_frames,
-            "unit": str(parsed.get("unit", "")),
-        },
-    )
-    event_payload = {
-        "frame_digest": frame_digest(frame),
-        "region_id": saved_region["id"],
-        "bbox": bbox,
-        "is_numeric": True,
-        "region_type": region_value,
-        "ocr_raw": recognized_text,
-        "ocr_correct": ocr_correct,
-        "ocr_confirmation": confirmation_value,
-        "corrected_text": corrected_text,
-        "corrected_value": corrected_value,
-        "goal_relation": relation,
-        "context_rule": context_rule,
-        "relation_config": relation_config,
-        "human_confirmed": True,
-    }
-    app.store.append_guidance_event(game_id, "numeric_region_supervision", event_payload)
-    parsed_observation = parse_ocr_number(corrected_text, number_format) if corrected_text else {"valid": False}
-    app.store.append_ocr_observation(
-        game_id,
-        saved_region["id"],
-        recognized_text,
-        parsed_observation,
-        confidence,
-        stable_frames,
-        {
-            "status": "human_confirmed",
-            "numeric_value": corrected_value,
-            "progress": 0.0,
-            "terminal": "",
-            "reset": "",
-            "semantic_version": OCR_SEMANTIC_VERSION,
-        },
-    )
-    result["ocr_values"] = [
-        {
-            "region_id": saved_region["id"],
-            "value": corrected_value,
-            "text": corrected_text,
-            "confidence": confidence,
-            "goal_relation": relation,
-            "relation_config": relation_config,
-            "human_confirmed": True,
-        }
-    ]
-    return result
 
 
-def compile_episode_result_supervision(app, game_id, frame, answers):
-    matches = [
-        value
-        for value in answers or []
-        if isinstance(value, dict) and value.get("question_type") == QuizQuestionType.EPISODE_RESULT.value
-    ]
-    if not matches:
-        return {"episode_result": "", "episode_result_confirmed": False}
-    answer = matches[-1]
-    result = str(answer.get("value", "interrupted"))
-    if result not in {"success", "failure", "interrupted"}:
-        result = "interrupted"
-    payload = {
-        "frame_digest": frame_digest(frame),
-        "episode_result": result,
-        "human_confirmed": True,
-        "strong_episode_label": True,
-        "required_reasons": list((answer.get("metadata") or {}).get("required_reasons", [])),
-        "created": time.time(),
-    }
-    app.store.append_guidance_event(game_id, "episode_result_supervision", payload)
-    return {"episode_result": result, "episode_result_confirmed": True}
 
 
-class TeachingController:
-    def __init__(self, app):
-        self.app = app
 
-    def run(self):
-        app = self.app
-        game = app.require_game()
-        target = app.require_window(False)
-        samples, stats = app.store.load_samples(game["id"])
-        try:
-            model = app.store.load_model(game["id"])
-        except Exception:
-            model = None
-        app.active_model_runtime = model
-        prototypes = [
-            item
-            for item in (model.get("prototypes", []) if model else [])
-            if feature_valid(item.get("f")) and normalize_action(item.get("a"))
-        ]
-        historical = []
-        for index, item in enumerate(samples):
-            if index % 64 == 0 and app.should_stop():
-                raise InputStopped("数初始化已停止")
-            action = normalize_action(item.get("a"))
-            semantic = sample_semantic_action(item)
-            if feature_valid(item.get("f")) and action and semantic:
-                historical.append(
-                    {
-                        "id": str(item.get("checksum", uuid.uuid4().hex)),
-                        "f": item["f"],
-                        "neural_f": item.get("neural_f"),
-                        "coarse": (
-                            item.get("coarse")
-                            if isinstance(item.get("coarse"), (bytes, bytearray))
-                            and len(item.get("coarse")) == COARSE_LEN
-                            else coarse_feature(item["f"])
-                        ),
-                        "a": action,
-                        "semantic_action": semantic,
-                        "cluster_id": "history|" + semantic_action_signature(semantic),
-                        "canonical_action_signature": semantic_action_signature(semantic),
-                        "repeat_policy": str(item.get("repeat_policy", "one_shot")),
-                        "source": "sample",
-                    }
-                )
-        calibration = app.ensure_capture_calibration(target, MODE_LABELS[ModeId.QUIZ])
-        session_id = "teach|" + uuid.uuid4().hex
-        app.store.begin_learning_session(game["id"], session_id)
-        sources = []
-        for proto in prototypes:
-            sources.append(
-                {
-                    "a": normalize_semantic_action(proto.get("semantic_action"))
-                    or semantic_action_from_coordinate(proto["a"]),
-                    "coordinate_action": normalize_action(proto["a"]),
-                    "repeat_policy": str(proto.get("repeat_policy", "one_shot")),
-                    "cluster_id": str(proto.get("cluster_id", "")),
-                    "risk_class": str(proto.get("risk_class", "safe")),
-                }
-            )
-        for item in historical:
-            sources.append(
-                {
-                    "a": item["semantic_action"],
-                    "coordinate_action": item["a"],
-                    "repeat_policy": item.get("repeat_policy", "one_shot"),
-                    "cluster_id": item["cluster_id"],
-                    "risk_class": str(item["semantic_action"].get("risk_class", "safe")),
-                }
-            )
-        sources.extend(
-            {
-                "a": semantic_action_from_coordinate(action),
-                "coordinate_action": action,
-                "repeat_policy": "one_shot",
-                "cluster_id": "basic|" + semantic_action_signature(semantic_action_from_coordinate(action)),
-                "risk_class": "safe",
-            }
-            for action in app.basic_actions()
-        )
-        unique = []
-        seen = set()
-        for entry in sources:
-            signature = semantic_action_signature(entry["a"])
-            if signature and signature not in seen:
-                seen.add(signature)
-                unique.append(entry)
-        with ModeSession(app, target) as session:
-            buffer = session.start_frames(max(12.0, float(calibration.get("fps", 15.0))), 2.5, 0.1, "teaching")
-            model_version = str((model or {}).get("saved", (model or {}).get("created", "none")))
-            producer = AskQuestionProducer(
-                app, buffer, prototypes, historical, unique, game["id"], model_version
-            ).start()
-            session.add_resource("TeachingQuestionProducer", producer)
-            app.ask_session_id = session_id
-            app.ask_buffer = buffer
-            app.ask_producer = producer
-            app.ask_counts = {
-                "saved": 0,
-                "duplicates": 0,
-                "skipped": 0,
-                "action_questions": 0,
-                "numeric_questions": 0,
-                "ocr_corrections": 0,
-                "numeric_relations": 0,
-                "episode_results": 0,
-            }
-            answer_queue = queue.Queue()
-            app.ask_answer_queue = answer_queue
-            producer.request(deque(["<START>", "<START>"], maxlen=4), time.monotonic())
-            initial = None
-            deadline = time.monotonic() + 5.0
-            while initial is None and time.monotonic() < deadline and not app.should_stop():
-                packet = producer.get_result(0.15)
-                if packet and not packet.get("error") and packet.get("frame") is not None:
-                    initial = packet
-                elif packet and packet.get("error"):
-                    app.set_status("数初始化等待画面：" + str(packet["error"]))
-                    producer.request(deque(["<START>", "<START>"], maxlen=4), time.monotonic())
-            if app.should_stop():
-                raise InputStopped("数初始化已停止")
-            if initial is None:
-                raise CaptureUnavailable("数初始化未在限定时间内生成第一道题")
-            created = threading.Event()
-            app.ui(
-                lambda: app._create_ask_window(
-                    {
-                        "game": game,
-                        "target": target,
-                        "buffer": buffer,
-                        "producer": producer,
-                        "packet": initial,
-                        "created": created,
-                    }
-                )
-            )
-            while not created.wait(0.05):
-                if app.should_stop():
-                    raise InputStopped("数初始化已停止")
-            while not app.should_stop():
-                try:
-                    command = answer_queue.get(timeout=0.05)
-                except queue.Empty:
-                    continue
-                callback = command.get("callback")
-                try:
-                    kind = str(command.get("kind", ""))
-                    if kind != "quiz_group":
-                        raise RuntimeError("数主流程仅接受结构化题组，并要求每题选择后提交")
-                    frame = command.get("frame") or {}
-                    answers = [value for value in command.get("answers", []) if isinstance(value, dict)]
-                    recent_actions = command.get("recent_actions") or ["<START>", "<START>"]
-                    state_since = safe_float(command.get("state_since"), time.monotonic())
-                    candidates = list(command.get("candidates", []))
-                    guidance_trigger = list(command.get("guidance_trigger", []))
-                    numeric_result = compile_numeric_supervision(app, game["id"], frame, answers)
-                    episode_result = compile_episode_result_supervision(app, game["id"], frame, answers)
-                    for counter_name in ("numeric_questions", "ocr_corrections", "numeric_relations"):
-                        app.ask_counts[counter_name] += safe_int(numeric_result.get(counter_name), 0)
-                    if episode_result.get("episode_result_confirmed"):
-                        app.ask_counts["episode_results"] += 1
-                    action_answers = [
-                        value for value in answers if value.get("question_type") == QuizQuestionType.ACTION.value
-                    ]
-                    if not action_answers:
-                        raise RuntimeError("题组缺少动作监督答案")
-                    action_answer = action_answers[-1]
-                    app.ask_counts["action_questions"] += 1
-                    action_value = str(action_answer.get("value", "skip"))
-                    entry = dict(action_answer.get("entry", {})) if isinstance(action_answer.get("entry"), dict) else {}
-                    if action_value == "skip":
-                        app.ask_counts["skipped"] += 1
-                        rejection_context = {
-                            "session_id": session_id,
-                            "capture_method": frame.get("method", "unknown"),
-                            "task_phase": str(frame.get("task_phase", "unknown")),
-                            "should_wait": True,
-                            "guidance_reason": guidance_trigger,
-                            "failure_recovery": False,
-                            "human_override": True,
-                            "ocr_values": list(numeric_result.get("ocr_values", [])),
-                        }
-                        if feature_valid(frame.get("f")) and sample_rgb_valid(frame.get("rgb")) and candidates:
-                            app.store.append_rejection(
-                                game["id"],
-                                frame["f"],
-                                candidates,
-                                "teach_reason_wait_or_uncertain",
-                                frame.get("rgb"),
-                                frame.get("neural_f"),
-                                rejection_context,
-                            )
-                        result = {"saved": False, "action": None}
-                    elif action_value == "choose":
-                        if not frame.get("usable_for_teaching"):
-                            raise CaptureUnavailable("当前画面不可用于数")
-                        temporal = app.build_temporal_context(buffer, frame, recent_actions, state_since)
-                        temporal["previous_action_changed_frame"] = True
-                        policy = str(entry.get("repeat_policy", "one_shot"))
-                        context = app.sample_context(
-                            recent_actions[-1] if recent_actions else "",
-                            0,
-                            True,
-                            frame.get("motion_valid", False),
-                            session_id,
-                            frame.get("method", "unknown"),
-                            policy,
-                            temporal,
-                        )
-                        context.update(
-                            {
-                                "episode_id": session_id,
-                                "step_id": safe_int(app.ask_counts.get("saved"), 0),
-                                "action_delay": None,
-                                "human_override": True,
-                                "trajectory_schema_version": TRAJECTORY_SCHEMA_VERSION,
-                                "ocr_values": list(numeric_result.get("ocr_values", [])),
-                                "episode_result": str(episode_result.get("episode_result", "")),
-                                "episode_result_confirmed": bool(episode_result.get("episode_result_confirmed")),
-                                "terminal": str(episode_result.get("episode_result", "")),
-                                "state_coverage_buckets": state_coverage_bucket(frame, {"human_override": True}),
-                                "quiz_answers": [
-                                    {
-                                        "question_type": value.get("question_type"),
-                                        "value": value.get("value"),
-                                        "code": value.get("code"),
-                                    }
-                                    for value in answers
-                                ],
-                            }
-                        )
-                        semantic = normalize_semantic_action(entry.get("a")) or semantic_action_from_interaction(
-                            entry.get("coordinate_action") or entry.get("a"), frame.get("semantic_targets", [])
-                        )
-                        action = normalize_action(entry.get("coordinate_action")) or normalize_action(semantic)
-                        if not semantic or not action:
-                            raise RuntimeError("数动作无效")
-                        context.update(semantic_context_payload(frame, semantic))
-                        active_learning_label = str(entry.get("active_learning_label", ""))
-                        context.update(
-                            {
-                                "semantic_action": semantic,
-                                "grounded_action": action,
-                                "task_phase": str(frame.get("task_phase", "unknown")),
-                                "guidance_trigger": guidance_trigger,
-                                "user_target_identification": (
-                                    semantic.get("source")
-                                    if semantic.get("action_type") == "drag"
-                                    else semantic.get("target")
-                                ),
-                                "should_wait": active_learning_label == "wait",
-                                "terminal": "success" if active_learning_label == "task_complete" else "",
-                                "subgoal_completed": active_learning_label == "task_complete",
-                                "active_learning_label": active_learning_label,
-                                "failure_recovery": bool("failure" in "|".join(guidance_trigger)),
-                            }
-                        )
-                        app.store.append_guidance_event(
-                            game["id"],
-                            "supervision",
-                            {
-                                "task_id": context.get("task_id", "default"),
-                                "task_complete": active_learning_label == "task_complete",
-                                "target_object": context.get("user_target_identification"),
-                                "failure_state": active_learning_label == "failure_state",
-                                "preferred_action": semantic_action_signature(semantic),
-                                "object_change_label": active_learning_label == "object_changed",
-                                "reusable_skill": semantic_skill(semantic).skill_id,
-                                "guidance_trigger": guidance_trigger,
-                                "frame_lineage": context.get("data_lineage", {}),
-                                "ocr_values": context.get("ocr_values", []),
-                            },
-                        )
-                        saved = app.store.append_sample(
-                            game["id"],
-                            frame["f"],
-                            semantic,
-                            "teach_live",
-                            context,
-                            frame.get("rgb"),
-                            frame.get("neural_f"),
-                            3.0,
-                        )
-                        denied = [
-                            item
-                            for item in candidates
-                            if semantic_action_signature(item.get("semantic_action") or item.get("a"))
-                            != semantic_action_signature(semantic)
-                        ]
-                        if sample_rgb_valid(frame.get("rgb")) and denied:
-                            app.store.append_rejection(
-                                game["id"],
-                                frame["f"],
-                                denied,
-                                "teach_hard_negative",
-                                frame.get("rgb"),
-                                frame.get("neural_f"),
-                                {
-                                    "session_id": session_id,
-                                    "capture_method": frame.get("method", "unknown"),
-                                    "chosen_action": semantic_action_signature(semantic),
-                                    "task_phase": context.get("task_phase"),
-                                    "should_wait": False,
-                                    "failure_recovery": context.get("failure_recovery"),
-                                    "human_override": True,
-                                    "ocr_values": context.get("ocr_values", []),
-                                },
-                            )
-                        app.ask_counts["saved" if saved else "duplicates"] += 1
-                        result = {"saved": saved, "action": semantic}
-                    else:
-                        raise RuntimeError("动作题答案无效")
-                    if callback:
-                        app.ui(lambda callback=callback, result=result: callback(result, None))
-                except Exception as error:
-                    message = "数数据库或题目处理失败：" + str(error)
-                    if callback:
-                        app.ui(lambda callback=callback, message=message: callback(None, message))
-                    app.request_mode_stop("failed", message)
-                    break
-        status = app.lifecycle.snapshot()[3]
-        if status == "failed":
-            app.store.invalidate_learning_session(
-                game["id"], session_id, app.lifecycle.snapshot()[4] or "teaching_failed"
-            )
-        else:
-            app.store.validate_learning_session(game["id"], session_id)
-        counts = app.ask_counts if isinstance(app.ask_counts, dict) else {
-            "saved": 0,
-            "duplicates": 0,
-            "skipped": 0,
-            "action_questions": 0,
-            "numeric_questions": 0,
-            "ocr_corrections": 0,
-            "numeric_relations": 0,
-        }
-        summary = (
-            "数已结束：动作保存"
-            + str(counts.get("saved", 0))
-            + "，重复未保存"
-            + str(counts.get("duplicates", 0))
-            + "，跳过"
-            + str(counts.get("skipped", 0))
-            + "，数值问题"
-            + str(counts.get("numeric_questions", 0))
-            + "，OCR纠正"
-            + str(counts.get("ocr_corrections", 0))
-            + "，数值关系"
-            + str(counts.get("numeric_relations", 0))
-            + "；模型需要睡眠"
-        )
-        if status == "failed":
-            return ModeResult("failed", app.lifecycle.snapshot()[4] or summary)
-        final_status = status if status in {"completed", "stopped"} else "stopped"
-        reason = str(app.lifecycle.snapshot()[4] or "")
-        return ModeResult(
-            final_status,
-            summary,
-            {
-                "samples": stats.get("valid", 0),
-                "structured_questions_only": True,
-                "action_question": safe_int(counts.get("action_questions"), 0) >= 0,
-                "numeric_region_question": safe_int(counts.get("numeric_questions"), 0) >= 0,
-                "ocr_confirmation": True,
-                "numeric_relation_question": True,
-                "submit_required": True,
-                "finish_button": final_status == "completed" and "ESC" not in reason.upper(),
-                "escape_used": final_status == "stopped" and bool(app.escape_metrics.get("pressed")),
-                "action_questions": safe_int(counts.get("action_questions"), 0),
-                "numeric_questions": safe_int(counts.get("numeric_questions"), 0),
-                "ocr_corrections": safe_int(counts.get("ocr_corrections"), 0),
-                "numeric_relations": safe_int(counts.get("numeric_relations"), 0),
-                "question_options": ["A", "B", "C", "D", "E", "F", "G", "H"],
-                "submission_flow": ["select", "submit", "optional_followup"],
-            },
-        )
-
-    def create_window(self, prepared):
-        return GuidanceWindow(self.app).open(prepared)
 
 
 class GameRepository:
@@ -22710,9 +21105,7 @@ class DataStoreLifecycleMixin:
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS game_tasks(game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,task_id TEXT NOT NULL,updated REAL NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,payload TEXT NOT NULL,checksum TEXT NOT NULL,PRIMARY KEY(game_id,task_id))"
         )
-        self.db.execute(
-            "CREATE TABLE IF NOT EXISTS guidance_events(id INTEGER PRIMARY KEY AUTOINCREMENT,game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,created REAL NOT NULL,event_type TEXT NOT NULL,payload TEXT NOT NULL,checksum TEXT NOT NULL)"
-        )
+        self.db.execute("DROP TABLE IF EXISTS guidance_events")
         self.db.execute(
             "CREATE INDEX IF NOT EXISTS idx_game_tasks_game_enabled ON game_tasks(game_id,enabled,updated DESC)"
         )
@@ -22722,12 +21115,12 @@ class DataStoreLifecycleMixin:
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_capture_calibrations_saved ON capture_calibrations(saved DESC)")
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS ocr_regions(id TEXT PRIMARY KEY,game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,created REAL NOT NULL,"
-            "updated REAL NOT NULL,region_norm TEXT NOT NULL,region_type TEXT NOT NULL,number_format TEXT NOT NULL,goal_relation TEXT NOT NULL,relation_config TEXT NOT NULL DEFAULT '{}',target_min REAL,"
+            "updated REAL NOT NULL,priority INTEGER NOT NULL DEFAULT 0,region_norm TEXT NOT NULL,region_type TEXT NOT NULL,number_format TEXT NOT NULL,goal_relation TEXT NOT NULL,relation_config TEXT NOT NULL DEFAULT '{}',target_min REAL,"
             "target_max REAL,special_value REAL,special_meaning TEXT NOT NULL,reset_meaning TEXT NOT NULL,unit TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,"
             "last_text TEXT NOT NULL,last_value REAL,last_confidence REAL NOT NULL DEFAULT 0,stable_frames INTEGER NOT NULL DEFAULT 0,checksum TEXT NOT NULL)"
         )
         self.db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_ocr_regions_game_enabled ON ocr_regions(game_id,enabled,updated DESC)"
+            "CREATE INDEX IF NOT EXISTS idx_ocr_regions_game_enabled ON ocr_regions(game_id,enabled,priority ASC,created ASC)"
         )
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS ocr_observations("
@@ -22991,6 +21384,45 @@ class DataStoreLifecycleMixin:
                                 ),
                             )
                         version = 14
+                    elif version == 14:
+                        ocr_columns = self._columns("ocr_regions")
+                        if "priority" not in ocr_columns:
+                            self.db.execute(
+                                "ALTER TABLE ocr_regions ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+                            )
+                        game_rows = list(iter_rows(self.db.execute("SELECT id FROM games ORDER BY created ASC,id ASC"), 128))
+                        for game_row in game_rows:
+                            game_id = str(game_row["id"])
+                            region_rows = list(
+                                iter_rows(
+                                    self.db.execute(
+                                        "SELECT * FROM ocr_regions WHERE game_id=? ORDER BY created ASC,updated ASC,id ASC",
+                                        (game_id,),
+                                    ),
+                                    128,
+                                )
+                            )
+                            for priority, region_row in enumerate(region_rows):
+                                item = dict(region_row)
+                                item["priority"] = priority
+                                try:
+                                    item["relation_config"] = json.loads(item.get("relation_config") or "{}")
+                                except (json.JSONDecodeError, TypeError, ValueError):
+                                    item["relation_config"] = {}
+                                try:
+                                    item["region_norm"] = json.loads(item.get("region_norm") or "[]")
+                                except (json.JSONDecodeError, TypeError, ValueError):
+                                    item["region_norm"] = []
+                                checksum = hashlib.sha256(canonical_bytes(ocr_region_checksum_payload(item))).hexdigest()
+                                self.db.execute(
+                                    "UPDATE ocr_regions SET priority=?,checksum=? WHERE id=?",
+                                    (priority, checksum, str(item.get("id", ""))),
+                                )
+                        self.db.execute("DROP INDEX IF EXISTS idx_ocr_regions_game_enabled")
+                        self.db.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_ocr_regions_game_enabled ON ocr_regions(game_id,enabled,priority ASC,created ASC)"
+                        )
+                        version = 15
                     else:
                         raise RuntimeError("没有从数据库版本" + str(version) + "开始的迁移路径")
                     self.db.execute(
@@ -23756,7 +22188,6 @@ class DataStoreGameTaskMixin:
             for table, column in (
                 ("game_profiles", "payload"),
                 ("game_tasks", "payload"),
-                ("guidance_events", "payload"),
                 ("ocr_regions", "relation_config"),
                 ("ocr_observations", "semantic_event"),
             ):
@@ -25522,41 +23953,7 @@ class DataStoreSampleMixin:
         self.invalid_rows["rejections:" + str(gid)] = max(self.invalid_rows.get("rejections:" + str(gid), 0), invalid)
         return result
 
-    def append_guidance_event(self, gid, event_type, payload):
-        self._ensure_writable()
-        value = dict(payload) if isinstance(payload, dict) else {"value": payload}
-        value.setdefault("schema_version", 2)
-        value.setdefault("created", time.time())
-        raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        checksum = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-        with self.lock, self.db:
-            self.db.execute(
-                "INSERT INTO guidance_events(game_id,created,event_type,payload,checksum) VALUES(?,?,?,?,?)",
-                (str(gid), time.time(), str(event_type), raw, checksum),
-            )
-        return checksum
 
-    def load_guidance_events(self, gid, limit=2000):
-        with self.lock:
-            rows = list(
-                iter_rows(
-                    self.db.execute(
-                        "SELECT created,event_type,payload,checksum FROM guidance_events WHERE game_id=? ORDER BY created DESC,id DESC LIMIT ?",
-                        (str(gid), safe_int(limit, 2000, 1, 20000)),
-                    )
-                )
-            )
-        result = []
-        for row in rows:
-            try:
-                if hashlib.sha256(str(row["payload"]).encode("utf-8")).hexdigest() != str(row["checksum"]):
-                    raise ValueError("guidance checksum")
-                value = json.loads(row["payload"])
-                value.update({"event_type": row["event_type"], "created": row["created"]})
-                result.append(value)
-            except (ValueError, TypeError, json.JSONDecodeError) as error:
-                self.logger.write("GUIDANCE_EVENT_INVALID", error, game_id=str(gid))
-        return result
 
     def sample_stats(self, gid):
         self.sample_write_barrier()
@@ -26700,7 +25097,8 @@ class DataStoreWindowModelMixin:
             backups = list(
                 iter_rows(
                     self.db.execute(
-                        "SELECT id,created,prototype_count,validation,payload,checksum FROM model_backups WHERE game_id=? ORDER BY id DESC",
+                        "SELECT id,created,prototype_count,validation,payload,checksum "
+                        "FROM model_backups WHERE game_id=? ORDER BY id DESC",
                         (gid,),
                     )
                 )
@@ -26865,7 +25263,8 @@ class DataStoreOCRVisionMixin:
             raise ValueError("OCR区域必须位于确认内容区域内")
         existing = None
         requested_id = str(value.get("id", "")).strip()
-        for item in self.list_ocr_regions(gid, False):
+        current_regions = self.list_ocr_regions(gid, False)
+        for item in current_regions:
             if requested_id and str(item.get("id", "")) == requested_id:
                 existing = item
                 break
@@ -26874,17 +25273,28 @@ class DataStoreOCRVisionMixin:
                 break
         region_id = requested_id or (str(existing.get("id")) if existing else uuid.uuid4().hex)
         created = safe_float(existing.get("created"), time.time()) if existing else time.time()
+        priority = (
+            safe_int(existing.get("priority"), 0)
+            if existing
+            else max((safe_int(item.get("priority"), -1) for item in current_regions), default=-1) + 1
+        )
         now = time.time()
+        relation_config = normalize_relation_config(value.get("relation_config", {}))
+        relation = normalize_numeric_preference(
+            value.get("goal_relation", relation_config.get("preference", NumericPreference.KEEP_SAME.value))
+        )
+        relation_config["preference"] = relation
         row = {
             "id": region_id,
             "game_id": str(gid),
             "created": created,
             "updated": now,
+            "priority": priority,
             "region_norm": norm,
             "region_type": str(value.get("region_type", "uncertain")),
             "number_format": str(value.get("number_format", "auto")),
-            "goal_relation": str(value.get("goal_relation", "uncertain")),
-            "relation_config": normalize_relation_config(value.get("relation_config", {})),
+            "goal_relation": relation,
+            "relation_config": relation_config,
             "target_min": safe_float(value.get("target_min")) if finite_number(value.get("target_min")) else None,
             "target_max": safe_float(value.get("target_max")) if finite_number(value.get("target_max")) else None,
             "special_value": (
@@ -26903,10 +25313,10 @@ class DataStoreOCRVisionMixin:
         with self.lock, self.db:
             ocr_upsert_sql = (
                 "INSERT OR REPLACE INTO ocr_regions("
-                "id,game_id,created,updated,region_norm,region_type,number_format,"
+                "id,game_id,created,updated,priority,region_norm,region_type,number_format,"
                 "goal_relation,relation_config,target_min,target_max,special_value,special_meaning,"
                 "reset_meaning,unit,enabled,last_text,last_value,last_confidence,"
-                "stable_frames,checksum) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                "stable_frames,checksum) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             )
             self.db.execute(
                 ocr_upsert_sql,
@@ -26915,6 +25325,7 @@ class DataStoreOCRVisionMixin:
                     row["game_id"],
                     row["created"],
                     row["updated"],
+                    row["priority"],
                     json.dumps(norm, separators=(",", ":")),
                     row["region_type"],
                     row["number_format"],
@@ -26949,7 +25360,8 @@ class DataStoreOCRVisionMixin:
                 str(row["id"]): dict(row)
                 for row in iter_rows(
                     self.db.execute(
-                        "SELECT id,created,last_text,last_value,last_confidence,stable_frames FROM ocr_regions WHERE game_id=?",
+                        "SELECT id,created,priority,last_text,last_value,last_confidence,stable_frames "
+                        "FROM ocr_regions WHERE game_id=?",
                         (game_id,),
                     )
                 )
@@ -26971,13 +25383,17 @@ class DataStoreOCRVisionMixin:
                 raise ValueError("OCR区域必须位于确认内容区域内")
             existing = existing_rows.get(region_id, {})
             config = normalize_relation_config(value.get("relation_config", {}))
-            relation = str(value.get("goal_relation", config.get("preference", "uncertain")))
+            relation = normalize_numeric_preference(
+                value.get("goal_relation", config.get("preference", NumericPreference.KEEP_SAME.value))
+            )
+            config["preference"] = relation
             compare_id = str(config.get("compare_region_id", ""))
             row = {
                 "id": region_id,
                 "game_id": game_id,
                 "created": safe_float(existing.get("created"), safe_float(value.get("created"), now)),
-                "updated": now + index * 0.000001,
+                "updated": now,
+                "priority": index,
                 "region_norm": norm,
                 "region_type": str(value.get("region_type", "number")),
                 "number_format": str(value.get("number_format", "auto")),
@@ -27025,10 +25441,10 @@ class DataStoreOCRVisionMixin:
             row["checksum"] = hashlib.sha256(canonical_bytes(ocr_region_checksum_payload(row))).hexdigest()
         sql = (
             "INSERT INTO ocr_regions("
-            "id,game_id,created,updated,region_norm,region_type,number_format,"
+            "id,game_id,created,updated,priority,region_norm,region_type,number_format,"
             "goal_relation,relation_config,target_min,target_max,special_value,special_meaning,"
             "reset_meaning,unit,enabled,last_text,last_value,last_confidence,stable_frames,checksum) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         )
         with self.critical_transaction():
             self.db.execute("DELETE FROM ocr_regions WHERE game_id=?", (game_id,))
@@ -27040,6 +25456,7 @@ class DataStoreOCRVisionMixin:
                         row["game_id"],
                         row["created"],
                         row["updated"],
+                        row["priority"],
                         json.dumps(row["region_norm"], separators=(",", ":")),
                         row["region_type"],
                         row["number_format"],
@@ -27066,7 +25483,7 @@ class DataStoreOCRVisionMixin:
         query = (
             "SELECT * FROM ocr_regions WHERE game_id=?"
             + (" AND enabled=1" if enabled_only else "")
-            + " ORDER BY updated DESC"
+            + " ORDER BY priority ASC,created ASC,id ASC"
         )
         with self.lock:
             rows = list(iter_rows(self.db.execute(query, (str(gid),))))
@@ -28467,22 +26884,68 @@ class TaskSettingsDialog:
         win.focus_force()
 
 
+class NumericPreference(str, Enum):
+    KEEP_SAME = "keep_same"
+    NOW_HIGHER = "now_higher"
+    NOW_LOWER = "now_lower"
+    POSITIVE_DELTA_HIGHER = "positive_delta_higher"
+    POSITIVE_DELTA_LOWER = "positive_delta_lower"
+    NEGATIVE_DELTA_HIGHER = "negative_delta_higher"
+    NEGATIVE_DELTA_LOWER = "negative_delta_lower"
+    ABS_DELTA_HIGHER = "abs_delta_higher"
+    ABS_DELTA_LOWER = "abs_delta_lower"
+    FIXED_DISTANCE_HIGHER = "fixed_distance_higher"
+    FIXED_DISTANCE_LOWER = "fixed_distance_lower"
+    REGION_DIFF_HIGHER = "region_diff_higher"
+    REGION_DIFF_LOWER = "region_diff_lower"
+    REGION_ABS_DIFF_HIGHER = "region_abs_diff_higher"
+    REGION_ABS_DIFF_LOWER = "region_abs_diff_lower"
+
+
 NUMERIC_PREFERENCE_OPTIONS = OrderedDict(
     (
-        ("保持不变", "keep_same"),
-        ("越大越好", "higher_better"),
-        ("越小越好", "lower_better"),
-        ("增量越大越好", "increase_more_better"),
-        ("增量越小越好", "increase_less_better"),
-        ("减量越大越好", "decrease_more_better"),
-        ("减量越小越好", "decrease_less_better"),
-        ("大于另一个识别区域内的数字", "greater_than_region"),
-        ("小于另一个识别区域内的数字", "less_than_region"),
-        ("等于另一个识别区域内的数字", "equal_to_region"),
+        ("保持不变", NumericPreference.KEEP_SAME.value),
+        ("now越大越好", NumericPreference.NOW_HIGHER.value),
+        ("now越小越好", NumericPreference.NOW_LOWER.value),
+        ("当now-before>0时：now-before越大越好", NumericPreference.POSITIVE_DELTA_HIGHER.value),
+        ("当now-before>0时：now-before越小越好", NumericPreference.POSITIVE_DELTA_LOWER.value),
+        ("当before-now>0时：before-now越大越好", NumericPreference.NEGATIVE_DELTA_HIGHER.value),
+        ("当before-now>0时：before-now越小越好", NumericPreference.NEGATIVE_DELTA_LOWER.value),
+        ("当|now-before|≠0时：|now-before|越大越好", NumericPreference.ABS_DELTA_HIGHER.value),
+        ("当|now-before|≠0时：|now-before|越小越好", NumericPreference.ABS_DELTA_LOWER.value),
+        ("与固定值比较：|a-b|越大越好", NumericPreference.FIXED_DISTANCE_HIGHER.value),
+        ("与固定值比较：|a-b|越小越好", NumericPreference.FIXED_DISTANCE_LOWER.value),
+        ("与另一区域比较：a-b越大越好", NumericPreference.REGION_DIFF_HIGHER.value),
+        ("与另一区域比较：a-b越小越好", NumericPreference.REGION_DIFF_LOWER.value),
+        ("与另一区域比较：|a-b|越大越好", NumericPreference.REGION_ABS_DIFF_HIGHER.value),
+        ("与另一区域比较：|a-b|越小越好", NumericPreference.REGION_ABS_DIFF_LOWER.value),
     )
 )
 NUMERIC_PREFERENCE_LABELS = {value: label for label, value in NUMERIC_PREFERENCE_OPTIONS.items()}
-NUMERIC_COMPARISON_RELATIONS = {"greater_than_region", "less_than_region", "equal_to_region"}
+NUMERIC_LEGACY_PREFERENCE_MAP = {
+    "higher_better": NumericPreference.NOW_HIGHER.value,
+    "lower_better": NumericPreference.NOW_LOWER.value,
+    "increase_more_better": NumericPreference.POSITIVE_DELTA_HIGHER.value,
+    "increase_less_better": NumericPreference.POSITIVE_DELTA_LOWER.value,
+    "decrease_more_better": NumericPreference.NEGATIVE_DELTA_HIGHER.value,
+    "decrease_less_better": NumericPreference.NEGATIVE_DELTA_LOWER.value,
+    "greater_than_region": NumericPreference.REGION_DIFF_HIGHER.value,
+    "less_than_region": NumericPreference.REGION_DIFF_LOWER.value,
+    "equal_to_region": NumericPreference.REGION_ABS_DIFF_LOWER.value,
+}
+NUMERIC_FIXED_VALUE_RELATIONS = {
+    NumericPreference.FIXED_DISTANCE_HIGHER.value,
+    NumericPreference.FIXED_DISTANCE_LOWER.value,
+}
+NUMERIC_COMPARISON_RELATIONS = {
+    NumericPreference.REGION_DIFF_HIGHER.value,
+    NumericPreference.REGION_DIFF_LOWER.value,
+    NumericPreference.REGION_ABS_DIFF_HIGHER.value,
+    NumericPreference.REGION_ABS_DIFF_LOWER.value,
+}
+NUMERIC_REQUIRED_PREFERENCES = tuple(
+    preference.value for preference in NumericPreference if preference is not NumericPreference.KEEP_SAME
+)
 NUMERIC_OVERLAY_DEFAULT_COLOR = "#FFFFFF"
 NUMERIC_OVERLAY_DEFAULT_OPACITY = 0.50
 NUMERIC_TRACKING_TEMPLATE_W = 16
@@ -28494,6 +26957,204 @@ NUMERIC_TRACKING_GLOBAL_STRIDE_RATIO = 0.16
 NUMERIC_TRACKING_CONFIRM_FRAMES = 3
 NUMERIC_TRACKING_TEMPLATE_UPDATE_FRAMES = 6
 NUMERIC_TRACKING_PERSIST_FRAMES = 45
+NUMERIC_REWARD_STABLE_FRAMES = 2
+
+
+def normalize_numeric_preference(value):
+    token = str(value or NumericPreference.KEEP_SAME.value)
+    token = NUMERIC_LEGACY_PREFERENCE_MAP.get(token, token)
+    return token if token in NUMERIC_PREFERENCE_LABELS else NumericPreference.KEEP_SAME.value
+
+
+def numeric_snapshot_value(value):
+    if finite_number(value):
+        return safe_float(value)
+    if not isinstance(value, dict):
+        return None
+    if value.get("valid") is False:
+        return None
+    if value.get("occluded") or value.get("recovered") or value.get("temporal_disagreement"):
+        return None
+    if safe_int(value.get("stable_frames", NUMERIC_REWARD_STABLE_FRAMES), 0) < NUMERIC_REWARD_STABLE_FRAMES:
+        return None
+    number = value.get("value", value.get("numeric_value"))
+    return safe_float(number) if finite_number(number) else None
+
+
+def numeric_values_equal(first, second):
+    a = numeric_snapshot_value(first)
+    b = numeric_snapshot_value(second)
+    if a is None or b is None:
+        return False
+    tolerance = max(1e-6, max(abs(a), abs(b), 1.0) * 0.0005)
+    return abs(a - b) <= tolerance
+
+
+def _numeric_change_magnitude(before, now):
+    return min(1.0, abs(now - before) / max(1.0, abs(before), abs(now)))
+
+
+def _metric_preference_reward(before_metric, now_metric, higher_is_better):
+    if not finite_number(before_metric) or not finite_number(now_metric):
+        return 0.0
+    before_value = safe_float(before_metric)
+    now_value = safe_float(now_metric)
+    tolerance = max(1e-6, max(abs(before_value), abs(now_value), 1.0) * 0.0005)
+    difference = now_value - before_value
+    if abs(difference) <= tolerance:
+        return 0.0
+    magnitude = min(1.0, abs(difference) / max(1.0, abs(before_value), abs(now_value)))
+    direction = 1.0 if difference > 0 else -1.0
+    return magnitude * direction * (1.0 if higher_is_better else -1.0)
+
+
+def evaluate_numeric_preference(region, old_value, new_value, before_snapshot, now_snapshot):
+    old = numeric_snapshot_value(old_value)
+    new = numeric_snapshot_value(new_value)
+    if old is None or new is None:
+        return 0.0
+    config = normalize_relation_config(region.get("relation_config", {}))
+    relation = normalize_numeric_preference(
+        config.get("preference", region.get("goal_relation", NumericPreference.KEEP_SAME.value))
+    )
+    delta = new - old
+    tolerance = max(1e-6, max(abs(old), abs(new), 1.0) * 0.0005)
+    magnitude = _numeric_change_magnitude(old, new)
+    if relation == NumericPreference.KEEP_SAME.value:
+        return -magnitude if abs(delta) > tolerance else 0.0
+    if relation == NumericPreference.NOW_HIGHER.value:
+        return _metric_preference_reward(old, new, True)
+    if relation == NumericPreference.NOW_LOWER.value:
+        return _metric_preference_reward(old, new, False)
+    if relation == NumericPreference.POSITIVE_DELTA_HIGHER.value:
+        return magnitude if delta > tolerance else -magnitude
+    if relation == NumericPreference.POSITIVE_DELTA_LOWER.value:
+        return max(0.0, 1.0 - magnitude) if delta > tolerance else -magnitude
+    if relation == NumericPreference.NEGATIVE_DELTA_HIGHER.value:
+        return magnitude if delta < -tolerance else -magnitude
+    if relation == NumericPreference.NEGATIVE_DELTA_LOWER.value:
+        return max(0.0, 1.0 - magnitude) if delta < -tolerance else -magnitude
+    if relation == NumericPreference.ABS_DELTA_HIGHER.value:
+        return magnitude if abs(delta) > tolerance else 0.0
+    if relation == NumericPreference.ABS_DELTA_LOWER.value:
+        return max(0.0, 1.0 - magnitude) if abs(delta) > tolerance else 0.0
+    if relation in NUMERIC_FIXED_VALUE_RELATIONS:
+        fixed_value = config.get("fixed_value")
+        if not finite_number(fixed_value):
+            return 0.0
+        fixed = safe_float(fixed_value)
+        return _metric_preference_reward(
+            abs(old - fixed),
+            abs(new - fixed),
+            relation == NumericPreference.FIXED_DISTANCE_HIGHER.value,
+        )
+    if relation in NUMERIC_COMPARISON_RELATIONS:
+        target_id = str(config.get("compare_region_id", ""))
+        old_target = numeric_snapshot_value(before_snapshot.get(target_id))
+        new_target = numeric_snapshot_value(now_snapshot.get(target_id))
+        if not target_id or old_target is None or new_target is None:
+            return 0.0
+        before_metric = old - old_target
+        now_metric = new - new_target
+        if relation in {
+            NumericPreference.REGION_ABS_DIFF_HIGHER.value,
+            NumericPreference.REGION_ABS_DIFF_LOWER.value,
+        }:
+            before_metric = abs(before_metric)
+            now_metric = abs(now_metric)
+        return _metric_preference_reward(
+            before_metric,
+            now_metric,
+            relation in {
+                NumericPreference.REGION_DIFF_HIGHER.value,
+                NumericPreference.REGION_ABS_DIFF_HIGHER.value,
+            },
+        )
+    return 0.0
+
+
+def compare_numeric_snapshots_detailed(regions, before, now):
+    before_snapshot = dict(before) if isinstance(before, dict) else {}
+    now_snapshot = dict(now) if isinstance(now, dict) else {}
+    ordered = sorted(
+        (dict(region) for region in regions or [] if isinstance(region, dict) and region.get("enabled", True)),
+        key=lambda region: (
+            safe_int(region.get("priority"), 0),
+            safe_float(region.get("created"), 0.0),
+            str(region.get("id", "")),
+        ),
+    )
+    for region in ordered:
+        region_id = str(region.get("id", ""))
+        old_value = before_snapshot.get(region_id)
+        new_value = now_snapshot.get(region_id)
+        old_number = numeric_snapshot_value(old_value)
+        new_number = numeric_snapshot_value(new_value)
+        if old_number is None or new_number is None:
+            return {
+                "reward": 0.0,
+                "winning_region_id": "",
+                "status": "unreadable_or_recovered",
+                "priority": safe_int(region.get("priority"), 0),
+            }
+        if numeric_values_equal(old_value, new_value):
+            continue
+        reward = max(
+            -1.0,
+            min(1.0, evaluate_numeric_preference(region, old_value, new_value, before_snapshot, now_snapshot)),
+        )
+        return {
+            "reward": reward,
+            "winning_region_id": region_id,
+            "status": "lexicographic_difference",
+            "priority": safe_int(region.get("priority"), 0),
+            "before": old_number,
+            "now": new_number,
+            "preference": normalize_numeric_preference(
+                normalize_relation_config(region.get("relation_config", {})).get(
+                    "preference", region.get("goal_relation", NumericPreference.KEEP_SAME.value)
+                )
+            ),
+        }
+    return {"reward": 0.0, "winning_region_id": "", "status": "all_equal", "priority": None}
+
+
+def compare_numeric_snapshots(regions, before, now):
+    return safe_float(compare_numeric_snapshots_detailed(regions, before, now).get("reward"), 0.0, -1.0, 1.0)
+
+
+def reorder_numeric_regions(regions, source_index, target_index):
+    values = list(regions or [])
+    source = safe_int(source_index, -1)
+    target = safe_int(target_index, -1)
+    if source < 0 or source >= len(values) or target < 0 or target >= len(values) or source == target:
+        return values
+    item = values.pop(source)
+    values.insert(target, item)
+    for priority, region in enumerate(values):
+        if isinstance(region, dict):
+            region["priority"] = priority
+    return values
+
+
+def clean_numeric_region_references(regions, deleted_region_id):
+    deleted_id = str(deleted_region_id or "")
+    values = []
+    for region in regions or []:
+        if not isinstance(region, dict) or str(region.get("id", "")) == deleted_id:
+            continue
+        item = dict(region)
+        config = normalize_relation_config(item.get("relation_config", {}))
+        if str(config.get("compare_region_id", "")) == deleted_id:
+            config["compare_region_id"] = ""
+            if normalize_numeric_preference(config.get("preference")) in NUMERIC_COMPARISON_RELATIONS:
+                config["preference"] = NumericPreference.KEEP_SAME.value
+                item["goal_relation"] = NumericPreference.KEEP_SAME.value
+        item["relation_config"] = config
+        values.append(item)
+    for priority, item in enumerate(values):
+        item["priority"] = priority
+    return values
 
 
 def _valid_overlay_color(value):
@@ -28872,6 +27533,7 @@ class NumericRegionEditor:
         self.regions = [self._normalize_region(item) for item in app.store.list_ocr_regions(self.game["id"], False)]
         self.selected_id = self.regions[0]["id"] if self.regions else None
         self.drag_state = None
+        self.list_drag_state = None
         self.photo = None
         self.closed = False
         self.win = tk.Toplevel(app.root)
@@ -28901,15 +27563,16 @@ class NumericRegionEditor:
             0.0,
             1.0,
         )
-        preference = str(config.get("preference") or value.get("goal_relation") or "keep_same")
-        if preference not in NUMERIC_PREFERENCE_LABELS:
-            preference = "keep_same"
+        preference = normalize_numeric_preference(
+            config.get("preference") or value.get("goal_relation") or NumericPreference.KEEP_SAME.value
+        )
         config["preference"] = preference
         config["compare_region_id"] = str(config.get("compare_region_id", ""))
         value.update(
             {
                 "id": region_id,
                 "game_id": str(self.game["id"]),
+                "priority": safe_int(value.get("priority"), len(getattr(self, "regions", ())), 0),
                 "region_norm": _clamp_region_norm(value.get("region_norm")),
                 "region_type": "number",
                 "number_format": str(value.get("number_format", "auto")),
@@ -28930,6 +27593,9 @@ class NumericRegionEditor:
         self.listbox = tk.Listbox(left, width=28, exportselection=False)
         self.listbox.pack(fill="both", expand=True)
         self.listbox.bind("<<ListboxSelect>>", self._list_selected)
+        self.listbox.bind("<Button-1>", self._list_drag_press, add="+")
+        self.listbox.bind("<B1-Motion>", self._list_drag_motion, add="+")
+        self.listbox.bind("<ButtonRelease-1>", self._list_drag_release, add="+")
         tools = ttk.Frame(left)
         tools.pack(fill="x", pady=(8, 0))
         ttk.Button(tools, text="新建", command=self.new_region).grid(row=0, column=0, sticky="ew", padx=2)
@@ -28972,6 +27638,7 @@ class NumericRegionEditor:
         self.name_var = tk.StringVar()
         self.preference_var = tk.StringVar(value="保持不变")
         self.compare_var = tk.StringVar()
+        self.fixed_value_var = tk.StringVar()
         self.opacity_var = tk.DoubleVar(value=50.0)
         self.color_text = tk.StringVar(value=NUMERIC_OVERLAY_DEFAULT_COLOR)
         ttk.Label(form, text="名称").grid(row=0, column=0, sticky="w")
@@ -28983,7 +27650,7 @@ class NumericRegionEditor:
             textvariable=self.preference_var,
             values=list(NUMERIC_PREFERENCE_OPTIONS),
             state="readonly",
-            width=28,
+            width=34,
         )
         self.preference_box.grid(row=0, column=3, sticky="ew", padx=(6, 12))
         self.preference_box.bind("<<ComboboxSelected>>", lambda event: self._preference_changed())
@@ -28991,12 +27658,15 @@ class NumericRegionEditor:
         self.compare_box = ttk.Combobox(form, textvariable=self.compare_var, state="readonly", width=24)
         self.compare_box.grid(row=0, column=5, sticky="ew", padx=(6, 0))
 
-        ttk.Label(form, text="颜色").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(form, text="固定值").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.fixed_value_entry = ttk.Entry(form, textvariable=self.fixed_value_var, width=22)
+        self.fixed_value_entry.grid(row=1, column=1, sticky="ew", padx=(6, 12), pady=(8, 0))
+        ttk.Label(form, text="颜色").grid(row=1, column=2, sticky="w", pady=(8, 0))
         color_row = ttk.Frame(form)
-        color_row.grid(row=1, column=1, sticky="ew", padx=(6, 12), pady=(8, 0))
+        color_row.grid(row=1, column=3, sticky="ew", padx=(6, 12), pady=(8, 0))
         ttk.Label(color_row, textvariable=self.color_text, width=10).pack(side="left")
         ttk.Button(color_row, text="选择颜色", command=self.choose_color).pack(side="left", padx=(6, 0))
-        ttk.Label(form, text="透明度").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Label(form, text="透明度").grid(row=1, column=4, sticky="w", pady=(8, 0))
         self.opacity_scale = tk.Scale(
             form,
             from_=0,
@@ -29006,10 +27676,12 @@ class NumericRegionEditor:
             variable=self.opacity_var,
             showvalue=True,
             command=lambda value: self.apply_form(live=True),
-            length=260,
+            length=230,
         )
-        self.opacity_scale.grid(row=1, column=3, columnspan=2, sticky="ew", padx=(6, 12), pady=(8, 0))
-        ttk.Button(form, text="应用编辑", command=self.apply_form).grid(row=1, column=5, sticky="e", pady=(8, 0))
+        self.opacity_scale.grid(row=1, column=5, sticky="ew", padx=(6, 0), pady=(8, 0))
+        ttk.Button(form, text="应用编辑", command=self.apply_form).grid(
+            row=2, column=5, sticky="e", pady=(8, 0)
+        )
         for column in (1, 3, 5):
             form.columnconfigure(column, weight=1)
 
@@ -29034,6 +27706,7 @@ class NumericRegionEditor:
         self.listbox.delete(0, "end")
         selected_index = None
         for index, region in enumerate(self.regions):
+            region["priority"] = index
             label = self.display_name(region)
             preference = NUMERIC_PREFERENCE_LABELS.get(str(region.get("goal_relation")), "保持不变")
             self.listbox.insert("end", label + "  ·  " + preference)
@@ -29050,6 +27723,7 @@ class NumericRegionEditor:
             self.name_var.set("")
             self.preference_var.set("保持不变")
             self.compare_var.set("")
+            self.fixed_value_var.set("")
             self.color_text.set(NUMERIC_OVERLAY_DEFAULT_COLOR)
             self.opacity_var.set(50.0)
             self.compare_box.configure(values=(), state="disabled")
@@ -29058,6 +27732,9 @@ class NumericRegionEditor:
         self.name_var.set(str(config.get("display_name", "数字区域")))
         relation = str(config.get("preference", region.get("goal_relation", "keep_same")))
         self.preference_var.set(NUMERIC_PREFERENCE_LABELS.get(relation, "保持不变"))
+        self.fixed_value_var.set(
+            str(config.get("fixed_value")) if finite_number(config.get("fixed_value")) else ""
+        )
         self.color_text.set(_valid_overlay_color(config.get("overlay_color")))
         self.opacity_var.set(
             safe_float(config.get("overlay_opacity", NUMERIC_OVERLAY_DEFAULT_OPACITY), 0.5, 0.0, 1.0) * 100.0
@@ -29212,7 +27889,45 @@ class NumericRegionEditor:
         self._refresh_tracking_template(self.current())
         self.refresh_list()
 
+    def _list_drag_press(self, event):
+        if not self.regions:
+            self.list_drag_state = None
+            return
+        index = max(0, min(len(self.regions) - 1, safe_int(self.listbox.nearest(event.y), 0)))
+        self.list_drag_state = {
+            "source": index,
+            "selected_id": str(self.selected_id or ""),
+            "moved": False,
+        }
+
+    def _list_drag_motion(self, event):
+        state = self.list_drag_state
+        if not isinstance(state, dict) or not self.regions:
+            return
+        target = max(0, min(len(self.regions) - 1, safe_int(self.listbox.nearest(event.y), 0)))
+        source = safe_int(state.get("source"), -1)
+        if source < 0 or source == target:
+            return "break"
+        self.regions = reorder_numeric_regions(self.regions, source, target)
+        state["source"] = target
+        state["moved"] = True
+        self.selected_id = state.get("selected_id") or None
+        self.refresh_list()
+        return "break"
+
+    def _list_drag_release(self, event):
+        state = self.list_drag_state
+        self.list_drag_state = None
+        if isinstance(state, dict) and state.get("moved"):
+            self.selected_id = state.get("selected_id") or None
+            self.refresh_all()
+            return "break"
+        return None
+
     def _list_selected(self, event=None):
+        if isinstance(self.list_drag_state, dict) and self.list_drag_state.get("moved"):
+            self.selected_id = self.list_drag_state.get("selected_id") or None
+            return
         selection = self.listbox.curselection()
         if selection and selection[0] < len(self.regions):
             self.selected_id = str(self.regions[selection[0]].get("id"))
@@ -29230,12 +27945,13 @@ class NumericRegionEditor:
             {
                 "id": uuid.uuid4().hex,
                 "region_norm": [0.35 + offset, 0.42 + offset, 0.30, 0.16],
-                "goal_relation": "keep_same",
+                "priority": len(self.regions),
+                "goal_relation": NumericPreference.KEEP_SAME.value,
                 "relation_config": {
                     "display_name": "数字区域" + str(index),
                     "overlay_color": NUMERIC_OVERLAY_DEFAULT_COLOR,
                     "overlay_opacity": NUMERIC_OVERLAY_DEFAULT_OPACITY,
-                    "preference": "keep_same",
+                    "preference": NumericPreference.KEEP_SAME.value,
                     "compare_region_id": "",
                 },
             }
@@ -29259,24 +27975,24 @@ class NumericRegionEditor:
         if region is None:
             self.info.set("请先选择要删除的区域")
             return
-        self.regions = [item for item in self.regions if str(item.get("id")) != str(region.get("id"))]
-        for item in self.regions:
-            config = normalize_relation_config(item.get("relation_config", {}))
-            if str(config.get("compare_region_id")) == str(region.get("id")):
-                config["compare_region_id"] = ""
-                if str(config.get("preference")) in NUMERIC_COMPARISON_RELATIONS:
-                    config["preference"] = "keep_same"
-                    item["goal_relation"] = "keep_same"
-                item["relation_config"] = config
+        self.regions = clean_numeric_region_references(self.regions, region.get("id"))
         self.selected_id = self.regions[0]["id"] if self.regions else None
         self.refresh_all()
 
     def _preference_changed(self, update=True):
-        relation = NUMERIC_PREFERENCE_OPTIONS.get(self.preference_var.get(), "keep_same")
-        enabled = relation in NUMERIC_COMPARISON_RELATIONS and bool(getattr(self, "compare_target_by_display", {}))
-        self.compare_box.configure(state="readonly" if enabled else "disabled")
-        if not enabled:
+        relation = normalize_numeric_preference(
+            NUMERIC_PREFERENCE_OPTIONS.get(self.preference_var.get(), NumericPreference.KEEP_SAME.value)
+        )
+        compare_enabled = relation in NUMERIC_COMPARISON_RELATIONS and bool(
+            getattr(self, "compare_target_by_display", {})
+        )
+        fixed_enabled = relation in NUMERIC_FIXED_VALUE_RELATIONS
+        self.compare_box.configure(state="readonly" if compare_enabled else "disabled")
+        self.fixed_value_entry.configure(state="normal" if fixed_enabled else "disabled")
+        if not compare_enabled:
             self.compare_var.set("")
+        if not fixed_enabled:
+            self.fixed_value_var.set("")
         if update:
             self.apply_form(live=True)
 
@@ -29305,19 +28021,46 @@ class NumericRegionEditor:
         config["display_name"] = name[:80]
         config["overlay_color"] = _valid_overlay_color(self.color_text.get())
         config["overlay_opacity"] = safe_float(self.opacity_var.get(), 50.0, 0.0, 100.0) / 100.0
-        relation = NUMERIC_PREFERENCE_OPTIONS.get(self.preference_var.get(), "keep_same")
+        relation = normalize_numeric_preference(
+            NUMERIC_PREFERENCE_OPTIONS.get(self.preference_var.get(), NumericPreference.KEEP_SAME.value)
+        )
         config["preference"] = relation
         if relation in NUMERIC_COMPARISON_RELATIONS:
             target = getattr(self, "compare_target_by_display", {}).get(self.compare_var.get(), "")
             config["compare_region_id"] = str(target)
         else:
             config["compare_region_id"] = ""
+        if relation in NUMERIC_FIXED_VALUE_RELATIONS:
+            if finite_number(self.fixed_value_var.get()):
+                config["fixed_value"] = safe_float(self.fixed_value_var.get())
+            elif not live:
+                raise ValueError("与固定值比较时必须输入有效固定值")
+        else:
+            config.pop("fixed_value", None)
         region["goal_relation"] = relation
         region["relation_config"] = config
         if not live:
             self._refresh_tracking_template(region)
         self.refresh_list()
         self.refresh_canvas()
+
+    def _validate_regions(self):
+        ids = {str(region.get("id", "")) for region in self.regions}
+        for priority, region in enumerate(self.regions):
+            region["priority"] = priority
+            config = normalize_relation_config(region.get("relation_config", {}))
+            relation = normalize_numeric_preference(
+                config.get("preference", region.get("goal_relation", NumericPreference.KEEP_SAME.value))
+            )
+            config["preference"] = relation
+            if relation in NUMERIC_FIXED_VALUE_RELATIONS and not finite_number(config.get("fixed_value")):
+                raise ValueError(self.display_name(region) + " 必须设置有效固定值")
+            if relation in NUMERIC_COMPARISON_RELATIONS:
+                target_id = str(config.get("compare_region_id", ""))
+                if not target_id or target_id == str(region.get("id", "")) or target_id not in ids:
+                    raise ValueError(self.display_name(region) + " 必须选择有效的另一区域")
+            region["goal_relation"] = relation
+            region["relation_config"] = config
 
     def _refresh_tracking_template(self, region):
         if region is None:
@@ -29372,6 +28115,7 @@ class NumericRegionEditor:
             return
         try:
             self.apply_form(live=False)
+            self._validate_regions()
             for region in self.regions:
                 self._refresh_tracking_template(region)
             saved = self.app.store.replace_ocr_regions(self.game["id"], self.regions)
@@ -29452,7 +28196,7 @@ class AppUiService(AppServiceBase):
             ("游戏名称", self.open_game_dialog),
             ("选择窗口", self.open_window_dialog),
             (MODE_LABELS[ModeId.COLLECT], self.start_learning),
-            (MODE_LABELS[ModeId.QUIZ], self.start_ask),
+            (MODE_LABELS[ModeId.NUMERIC], self.open_numeric_region_dialog),
             (MODE_LABELS[ModeId.UPGRADE], self.start_sleep),
             (MODE_LABELS[ModeId.AI], self.start_training),
         ]
@@ -29678,7 +28422,7 @@ class AppUiService(AppServiceBase):
             return True
         token = str(key or "callback")
         critical = key is None or token in UiDispatcher.CRITICAL_KINDS
-        session_id = str(getattr(self, "mode_session_id", "") or getattr(self, "ask_session_id", "") or self.mode or "")
+        session_id = str(getattr(self, "mode_session_id", "") or self.mode or "")
         generation = 0
         if token.startswith("background:") or token.startswith("background_error:"):
             scope = token.split(":", 1)[1]
@@ -29711,21 +28455,6 @@ class AppUiService(AppServiceBase):
         except RECOVERABLE_ERRORS as error:
             record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
         return True
-
-    def _destroy_ask_window(self):
-        win = self.ask_window
-        self.ask_window = None
-        if win is not None:
-            for after_id in list(self.ask_after_ids):
-                try:
-                    win.after_cancel(after_id)
-                except RECOVERABLE_ERRORS as error:
-                    record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
-            self.ask_after_ids.clear()
-            try:
-                win.destroy()
-            except RECOVERABLE_ERRORS as error:
-                record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
 
     def _show_result_modal(self, title, text):
         if self.result_modal is not None:
@@ -30417,7 +29146,7 @@ class AppLifecycleService(AppServiceBase):
     def process_ui_queue(self):
         try:
             current_session = str(
-                getattr(self, "mode_session_id", "") or getattr(self, "ask_session_id", "") or self.mode or ""
+                getattr(self, "mode_session_id", "") or self.mode or ""
             )
             for event in self.ui_dispatcher.drain(300):
                 callback = self.ui_dispatcher.resolve_callback(event)
@@ -30694,11 +29423,6 @@ class AppLifecycleService(AppServiceBase):
         self.mode_thread = None
         self.active_session = None
         self.review_process = None
-        self.ask_buffer = None
-        self.ask_producer = None
-        self.ask_answer_queue = None
-        self.ask_session_id = None
-        self.ask_counts = None
         clear_runtime_isolation()
         self.mode_session_id = ""
         self.lifecycle.finish()
@@ -30840,7 +29564,7 @@ class AppLifecycleService(AppServiceBase):
             if self.storage_fault and normalize_mode_id(name) in {
                 ModeId.COLLECT.value,
                 ModeId.UPGRADE.value,
-                ModeId.QUIZ.value,
+                ModeId.NUMERIC.value,
             }:
                 raise RuntimeError(
                     self.store.read_only_reason or self.store.writer_error or "样本存储故障，相关模式已锁定"
@@ -30975,7 +29699,6 @@ class AppLifecycleService(AppServiceBase):
                 record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
 
         def apply_ui():
-            self._destroy_ask_window()
             self.set_input_status("已锁定：" + (str(reason) if reason else "停止请求"))
             self.status.set("正在停止，已阻止新的鼠标按下并释放全部鼠标键" + ("；" + str(reason) if reason else ""))
 
@@ -31024,7 +29747,6 @@ class AppLifecycleService(AppServiceBase):
                 self.runtime_installer.stop()
             except RECOVERABLE_ERRORS as error:
                 record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
-        self._destroy_ask_window()
         self.api.block_input()
         self.api.release_all_buttons()
         if self.result_modal is not None:
@@ -31065,11 +29787,6 @@ class AppLifecycleService(AppServiceBase):
         self.mode_thread = None
         self.active_session = None
         self.review_process = None
-        self.ask_buffer = None
-        self.ask_producer = None
-        self.ask_answer_queue = None
-        self.ask_session_id = None
-        self.ask_counts = None
         self.directory_prepare_thread = None
         self.directory_prepare_stop = None
         if self.directory_prepare_candidate is not None:
@@ -32878,23 +31595,8 @@ class AppModeService(AppServiceBase):
         )
         return result
 
-    def start_ask(self):
-        try:
-            self.require_ai_runtime()
-        except RECOVERABLE_ERRORS as error:
-            self.show_error(str(error))
-            return
-        self.start_worker(ModeId.QUIZ.value, self.teaching_controller.run, True)
 
-    def _create_ask_window(self, prepared):
-        return self.teaching_controller.create_window(prepared)
 
-    def close_ask(self, show_summary=True, wait_buffer=True, reason="completed"):
-        if self.mode != ModeId.QUIZ.value and self.ask_window is None:
-            return
-        status = "completed" if str(reason) == "completed" else "stopped"
-        text = "用户结束数" if status == "completed" else "数已停止"
-        self.request_mode_stop(status, text)
 
 
 class AppStorageService(AppServiceBase):
@@ -33868,8 +32570,6 @@ class App:
         return self.ui_service.ui(*args, **kwargs)
     def close_dialog(self, *args, **kwargs):
         return self.ui_service.close_dialog(*args, **kwargs)
-    def _destroy_ask_window(self, *args, **kwargs):
-        return self.ui_service._destroy_ask_window(*args, **kwargs)
     def _show_result_modal(self, *args, **kwargs):
         return self.ui_service._show_result_modal(*args, **kwargs)
     def show_error(self, *args, **kwargs):
@@ -33996,12 +32696,6 @@ class App:
         return self.mode_service._training_worker_impl(*args, **kwargs)
     def basic_actions(self, *args, **kwargs):
         return self.mode_service.basic_actions(*args, **kwargs)
-    def start_ask(self, *args, **kwargs):
-        return self.ui_service.open_numeric_region_dialog(*args, **kwargs)
-    def _create_ask_window(self, *args, **kwargs):
-        return self.mode_service._create_ask_window(*args, **kwargs)
-    def close_ask(self, *args, **kwargs):
-        return self.mode_service.close_ask(*args, **kwargs)
     def _restore_directory_display(self, *args, **kwargs):
         return self.storage_service._restore_directory_display(*args, **kwargs)
     def _try_open_local_data_directory(self, *args, **kwargs):
@@ -34102,15 +32796,7 @@ class App:
         self.controls = []
         self.control_buttons = {}
         self.stop_button = None
-        self.ask_window = None
-        self.ask_buffer = None
-        self.ask_producer = None
-        self.ask_answer_queue = None
-        self.ask_after_ids = set()
-        self.ask_escape_armed = False
         self.global_escape_armed = True
-        self.ask_session_id = None
-        self.ask_counts = None
         self.error_recent = {}
         self.result_modal = None
         self.result_modal_widget = None
@@ -34143,7 +32829,6 @@ class App:
         self.learning_controller = LearningController(self)
         self.review_controller = ReviewController(self)
         self.training_controller = TrainingController(self)
-        self.teaching_controller = TeachingController(self)
         self.status = tk.StringVar(value="请文件夹")
         self.header_status_text = tk.StringVar(value="当前：待配置")
         self.data_dir_text = tk.StringVar(value="未选择")
@@ -34199,7 +32884,7 @@ class App:
             self.storage_fault = bool(error) or bool(self.store.read_only)
             if error:
                 self.status.set("样本写入失败，学习与指导已锁定：" + str(error))
-                if self.mode in {ModeId.COLLECT.value, ModeId.QUIZ.value}:
+                if self.mode in {ModeId.COLLECT.value, ModeId.NUMERIC.value}:
                     self.request_mode_stop("failed", "样本写入失败")
             else:
                 self.status.set("样本写入线程已恢复")
@@ -34245,7 +32930,7 @@ class App:
             and window_ready
             and self.training_ready
             and not directory_busy,
-            MODE_LABELS[ModeId.QUIZ]: not running
+            MODE_LABELS[ModeId.NUMERIC]: not running
             and runtime_ready
             and game_ready
             and window_ready
@@ -34749,7 +33434,7 @@ class App:
                 "passed" if details.get("training_snapshot_checksum") and details.get("snapshot_guarded") else "failed",
                 details,
             )
-        elif normalize_mode_id(name) == ModeId.QUIZ.value:
+        elif normalize_mode_id(name) == ModeId.NUMERIC.value:
             for case, key in (
                 ("structured_questions_only", "structured_questions_only"),
                 ("action_question", "action_question"),
@@ -34759,16 +33444,16 @@ class App:
                 ("submit_required", "submit_required"),
             ):
                 self.record_acceptance_case(
-                    MODE_LABELS[ModeId.QUIZ], case, "passed" if details.get(key) else "failed", details
+                    MODE_LABELS[ModeId.NUMERIC], case, "passed" if details.get(key) else "failed", details
                 )
             self.record_acceptance_case(
-                MODE_LABELS[ModeId.QUIZ],
+                MODE_LABELS[ModeId.NUMERIC],
                 "finish_button",
                 "passed" if details.get("finish_button") else "pending",
                 details,
             )
             self.record_acceptance_case(
-                MODE_LABELS[ModeId.QUIZ], "escape", "passed" if details.get("escape_used") else "pending", details
+                MODE_LABELS[ModeId.NUMERIC], "escape", "passed" if details.get("escape_used") else "pending", details
             )
         if self.data_directory is not None:
             staging = (
@@ -35662,6 +34347,7 @@ class SemanticEventHub:
     def __init__(self):
         self.lock = threading.RLock()
         self.events = {}
+        self.snapshots = {}
 
     def publish(self, game_id, region_id, event):
         value = dict(event) if isinstance(event, dict) else {}
@@ -35671,38 +34357,51 @@ class SemanticEventHub:
         with self.lock:
             self.events[(str(game_id), str(region_id))] = value
 
+    def publish_snapshot(self, game_id, frame_id, event):
+        value = dict(event) if isinstance(event, dict) else {}
+        value["time"] = time.monotonic()
+        value["game_id"] = str(game_id)
+        value["frame_id"] = str(frame_id)
+        value["kind"] = "numeric_snapshot"
+        value["progress"] = max(-1.0, min(1.0, safe_float(value.get("progress"), 0.0)))
+        with self.lock:
+            self.snapshots[str(game_id)] = value
+
     def latest(self, game_id=None, max_age=1.5):
         now = time.monotonic()
         with self.lock:
-            values = [
+            snapshots = [
+                dict(value)
+                for key, value in self.snapshots.items()
+                if game_id is None or str(key) == str(game_id)
+            ]
+            events = [
                 dict(value)
                 for value in self.events.values()
                 if game_id is None or str(value.get("game_id")) == str(game_id)
             ]
-        values = [value for value in values if now - safe_float(value.get("time"), 0.0) <= float(max_age)]
-        if not values:
+        snapshots = [
+            value for value in snapshots if now - safe_float(value.get("time"), 0.0) <= float(max_age)
+        ]
+        if snapshots:
+            return max(snapshots, key=lambda value: safe_float(value.get("time"), 0.0))
+        events = [value for value in events if now - safe_float(value.get("time"), 0.0) <= float(max_age)]
+        if not events:
             return None
-        values.sort(
-            key=lambda value: (
-                1 if value.get("terminal") else 0,
-                abs(safe_float(value.get("progress"), 0.0)),
-                safe_float(value.get("time"), 0.0),
-            ),
-            reverse=True,
-        )
-        result = {"terminal": "", "progress": 0.0, "status": "neutral", "events": []}
-        for value in values:
-            result["events"].append(
-                {key: value.get(key) for key in ("region_id", "terminal", "progress", "status", "reset")}
-            )
-            if value.get("terminal") in {"success", "failure"}:
-                result["terminal"] = value["terminal"]
-                break
-            if abs(safe_float(value.get("progress"), 0.0)) > abs(result["progress"]):
-                result["progress"] = max(-1.0, min(1.0, safe_float(value.get("progress"), 0.0)))
-                result["status"] = str(value.get("status", "neutral"))
-        return result
-
+        latest = max(events, key=lambda value: safe_float(value.get("time"), 0.0))
+        return {
+            "terminal": str(latest.get("terminal", "")),
+            "progress": max(-1.0, min(1.0, safe_float(latest.get("progress"), 0.0))),
+            "status": str(latest.get("status", "neutral")),
+            "events": [
+                {
+                    key: latest.get(key)
+                    for key in ("region_id", "terminal", "progress", "status", "reset")
+                }
+            ],
+            "time": safe_float(latest.get("time"), 0.0),
+            "game_id": str(latest.get("game_id", "")),
+        }
 
 SEMANTIC_EVENT_HUB = SemanticEventHub()
 
@@ -40417,7 +39116,7 @@ class OfflineOCRRuntime:
         width = safe_int(frame.get("preview_width", PREVIEW_W), PREVIEW_W, 1, 8192)
         height = safe_int(frame.get("preview_height", PREVIEW_H), PREVIEW_H, 1, 8192)
         if preview is None:
-            raise RuntimeError("当前画面没有教学预览")
+            raise RuntimeError("当前画面没有可用OCR预览")
         regions = []
         changed = [
             list(value[:4])
@@ -41555,6 +40254,7 @@ def ocr_region_checksum_payload(item):
             "game_id",
             "created",
             "updated",
+            "priority",
             "region_norm",
             "region_type",
             "number_format",
@@ -42091,61 +40791,16 @@ class OCRMonitor:
         return bool(self.thread and self.thread.is_alive())
 
 def _evaluate_extended_numeric_preference(definition, parsed, runtime_context, event):
+    value = dict(event) if isinstance(event, dict) else {}
+    value["progress"] = 0.0
+    value["numeric_preference"] = normalize_numeric_preference(
+        normalize_relation_config(definition.get("relation_config", {})).get(
+            "preference", definition.get("goal_relation", NumericPreference.KEEP_SAME.value)
+        )
+    )
     if not isinstance(parsed, dict) or not parsed.get("valid") or not finite_number(parsed.get("value")):
-        return event
-    current = safe_float(parsed.get("value"))
-    previous = event.get("previous_numeric_value")
-    delta = current - safe_float(previous) if finite_number(previous) else None
-    relation = str(definition.get("goal_relation", "keep_same"))
-    config = normalize_relation_config(definition.get("relation_config", {}))
-    tolerance = max(1e-6, abs(current) * 0.0005)
-    if relation == "keep_same":
-        event["status"] = "stable_preferred"
-        if delta is not None:
-            event["progress"] = 0.25 if abs(delta) <= tolerance else -min(1.0, abs(delta) / max(1.0, abs(current)))
-    elif relation in {"increase_more_better", "increase_less_better", "decrease_more_better", "decrease_less_better"}:
-        event["status"] = relation
-        if delta is not None:
-            magnitude = min(1.0, abs(delta) / max(1.0, abs(safe_float(previous))))
-            if relation == "increase_more_better":
-                event["progress"] = magnitude if delta > tolerance else -magnitude if delta < -tolerance else 0.0
-            elif relation == "increase_less_better":
-                event["progress"] = (
-                    1.0 / (1.0 + magnitude * 10.0)
-                    if delta > tolerance
-                    else -1.0 if delta < -tolerance else 0.0
-                )
-            elif relation == "decrease_more_better":
-                event["progress"] = magnitude if delta < -tolerance else -magnitude if delta > tolerance else 0.0
-            else:
-                event["progress"] = (
-                    1.0 / (1.0 + magnitude * 10.0)
-                    if delta < -tolerance
-                    else -1.0 if delta > tolerance else 0.0
-                )
-    elif relation in NUMERIC_COMPARISON_RELATIONS:
-        region_values = runtime_context.get("region_values", {}) if isinstance(runtime_context, dict) else {}
-        target_id = str(config.get("compare_region_id", ""))
-        other = region_values.get(target_id)
-        if finite_number(other):
-            other_value = safe_float(other)
-            close = abs(current - other_value) <= max(1e-6, max(abs(current), abs(other_value), 1.0) * 0.001)
-            satisfied = (
-                current > other_value
-                if relation == "greater_than_region"
-                else current < other_value
-                if relation == "less_than_region"
-                else close
-            )
-            event["status"] = "comparison_satisfied" if satisfied else "comparison_unsatisfied"
-            event["progress"] = 1.0 if satisfied else -1.0
-            event["comparison_region_id"] = target_id
-            event["comparison_value"] = other_value
-        else:
-            event["status"] = "comparison_target_unreadable"
-            event["progress"] = 0.0
-    return event
-
+        value["status"] = "unreadable"
+    return value
 
 _ORIGINAL_OCR_SEMANTIC_EVALUATE = OCRSemanticEngine.evaluate
 
@@ -42163,8 +40818,18 @@ def _adaptive_ocr_monitor_run(self):
     try:
         game = self.app.require_game()
         definitions = [dict(item) for item in self.app.store.list_ocr_regions(game["id"], True)]
+        definitions.sort(
+            key=lambda item: (
+                safe_int(item.get("priority"), 0),
+                safe_float(item.get("created"), 0.0),
+                str(item.get("id", "")),
+            )
+        )
+        for priority, definition in enumerate(definitions):
+            definition["priority"] = priority
         if not definitions:
             return
+        previous_snapshot = {}
         states = {}
         for item in definitions:
             region_id = str(item["id"])
@@ -42194,6 +40859,7 @@ def _adaptive_ocr_monitor_run(self):
                     break
                 region_id = str(definition["id"])
                 state = states[region_id]
+                was_lost = state.get("lost", 0) > 0
                 ranked = _adaptive_region_candidates(frame, definition, state)
                 best_payload = None
                 best_quality = -10.0
@@ -42344,16 +41010,79 @@ def _adaptive_ocr_monitor_run(self):
                     "candidate_confirm_frames": state.get("pending_count", 0),
                     "lost_frames": state["lost"],
                     "tracking_distance": distance,
+                    "recovered": bool(was_lost and confident),
                 }
+            frame_id = str(
+                frame.get("frame_id")
+                or (str(game["id"]) + "|" + format(safe_float(frame.get("time"), time.time()), ".9f"))
+            )
+            current_snapshot = {}
+            for definition in definitions:
+                region_id = str(definition["id"])
+                item = observations.get(region_id)
+                if item is None:
+                    current_snapshot[region_id] = {
+                        "valid": False,
+                        "value": None,
+                        "stable_frames": 0,
+                        "occluded": True,
+                        "recovered": False,
+                        "frame_id": frame_id,
+                    }
+                    continue
+                parsed = item.get("parsed", {})
+                consensus = item.get("consensus", {})
+                stable_frames = safe_int(consensus.get("stable_frames"), 0)
+                valid = bool(
+                    isinstance(parsed, dict)
+                    and parsed.get("valid")
+                    and finite_number(parsed.get("value"))
+                    and stable_frames >= NUMERIC_REWARD_STABLE_FRAMES
+                    and not consensus.get("conflict")
+                    and not item.get("recovered")
+                    and safe_int(item.get("lost_frames"), 0) == 0
+                    and safe_int(item.get("candidate_confirm_frames"), 0) >= NUMERIC_TRACKING_CONFIRM_FRAMES
+                )
+                current_snapshot[region_id] = {
+                    "valid": valid,
+                    "value": safe_float(parsed.get("value")) if valid else None,
+                    "stable_frames": stable_frames,
+                    "occluded": safe_int(item.get("lost_frames"), 0) > 0,
+                    "recovered": bool(item.get("recovered")),
+                    "temporal_disagreement": bool(consensus.get("conflict")),
+                    "frame_id": frame_id,
+                }
+            comparison = (
+                compare_numeric_snapshots_detailed(definitions, previous_snapshot, current_snapshot)
+                if previous_snapshot
+                else {
+                    "reward": 0.0,
+                    "winning_region_id": "",
+                    "status": "initial_snapshot",
+                    "priority": None,
+                }
+            )
             region_values = {
-                region_id: item["parsed"].get("value")
-                for region_id, item in observations.items()
-                if isinstance(item.get("parsed"), dict)
-                and item["parsed"].get("valid")
-                and finite_number(item["parsed"].get("value"))
+                region_id: snapshot.get("value")
+                for region_id, snapshot in current_snapshot.items()
+                if snapshot.get("valid") and finite_number(snapshot.get("value"))
             }
-            for region_id, item in observations.items():
-                definition = item["definition"]
+            event_summaries = []
+            terminal = ""
+            for definition in definitions:
+                region_id = str(definition["id"])
+                item = observations.get(region_id)
+                if item is None:
+                    event_summaries.append(
+                        {
+                            "region_id": region_id,
+                            "priority": safe_int(definition.get("priority"), 0),
+                            "status": "unreadable",
+                            "terminal": "",
+                            "reset": "",
+                        }
+                    )
+                    continue
                 parsed = item["parsed"]
                 consensus = item["consensus"]
                 runtime_context = {
@@ -42367,6 +41096,7 @@ def _adaptive_ocr_monitor_run(self):
                     "candidate_confirm_frames": item["candidate_confirm_frames"],
                     "lost_frames": item["lost_frames"],
                     "tracking_distance": item["tracking_distance"],
+                    "frame_id": frame_id,
                 }
                 event = (
                     OCR_SEMANTIC_ENGINE.evaluate(definition, parsed, runtime_context)
@@ -42379,6 +41109,7 @@ def _adaptive_ocr_monitor_run(self):
                         "semantic_version": OCR_SEMANTIC_VERSION,
                     }
                 )
+                event["progress"] = 0.0
                 event["ocr_temporal_disagreement"] = bool(consensus.get("conflict"))
                 event["stable_frames"] = safe_int(consensus.get("stable_frames"), 0)
                 event["tracked_region_norm"] = item["tracked_norm"]
@@ -42386,10 +41117,28 @@ def _adaptive_ocr_monitor_run(self):
                 event["tracking_candidate_confirm_frames"] = item["candidate_confirm_frames"]
                 event["tracking_lost_frames"] = item["lost_frames"]
                 event["tracking_template_distance"] = item["tracking_distance"]
-                SEMANTIC_EVENT_HUB.publish(game["id"], region_id, event)
-                now = time.monotonic()
-                if now - self.last_saved[region_id] >= 0.8:
-                    self.last_saved[region_id] = now
+                event["tracking_recovered"] = bool(item.get("recovered"))
+                event["frame_id"] = frame_id
+                event["priority"] = safe_int(definition.get("priority"), 0)
+                event["snapshot_reward"] = safe_float(comparison.get("reward"), 0.0, -1.0, 1.0)
+                event["snapshot_status"] = str(comparison.get("status", "neutral"))
+                event["snapshot_winning_region_id"] = str(comparison.get("winning_region_id", ""))
+                event["snapshot_value"] = dict(current_snapshot.get(region_id, {}))
+                if not terminal and event.get("terminal") in {"success", "failure"}:
+                    terminal = str(event.get("terminal"))
+                event_summaries.append(
+                    {
+                        "region_id": region_id,
+                        "priority": event["priority"],
+                        "status": str(event.get("status", "neutral")),
+                        "terminal": str(event.get("terminal", "")),
+                        "reset": str(event.get("reset", "")),
+                        "valid": bool(current_snapshot.get(region_id, {}).get("valid")),
+                    }
+                )
+                saved_at = time.monotonic()
+                if saved_at - self.last_saved[region_id] >= 0.8:
+                    self.last_saved[region_id] = saved_at
                     self.app.store.append_ocr_observation(
                         game["id"],
                         region_id,
@@ -42399,6 +41148,20 @@ def _adaptive_ocr_monitor_run(self):
                         consensus.get("stable_frames", 0),
                         event,
                     )
+            snapshot_event = {
+                "terminal": terminal,
+                "progress": safe_float(comparison.get("reward"), 0.0, -1.0, 1.0),
+                "numeric_progress": safe_float(comparison.get("reward"), 0.0, -1.0, 1.0),
+                "status": str(comparison.get("status", "neutral")),
+                "winning_region_id": str(comparison.get("winning_region_id", "")),
+                "winning_priority": comparison.get("priority"),
+                "events": event_summaries,
+                "before_snapshot": previous_snapshot,
+                "now_snapshot": current_snapshot,
+                "frame_id": frame_id,
+            }
+            SEMANTIC_EVENT_HUB.publish_snapshot(game["id"], frame_id, snapshot_event)
+            previous_snapshot = current_snapshot
             self.stop_event.wait(0.18 if self.purpose == "training" else 0.3)
     finally:
         if self.app.store is not None:
@@ -43807,9 +42570,7 @@ def run_static_contract_tests(path=None):
         "KeyboardMonitor._run.callback",
         "MouseMonitor._run",
         "FrameBuffer._run",
-        "AskQuestionProducer._run",
         "PhaseRunner.run",
-        "TeachingController.run",
         "DataStoreSampleMixin._writer_loop",
         "AppUiService.ui",
         "AppLifecycleService.run_background.worker",
@@ -43990,8 +42751,6 @@ class TrainingNamespace:
     TaskAgentPolicy = TaskAgentPolicy
 
 
-class GuidanceNamespace:
-    TeachingController = TeachingController
 
 
 class GuiNamespace:
@@ -49938,15 +48697,9 @@ def register_active_learning_request(execution, frame, temporal, decision):
         "temporal": dict(temporal or {}),
         "information_score": information,
         "priority": information["score"],
-        "question_selection_rule": "ensemble_disagreement_then_risk_then_future_frequency",
+        "selection_rule": "ensemble_disagreement_then_risk_then_future_frequency",
         "safe_snapshot": True,
     }
-    store = getattr(getattr(execution, "host", None), "store", None)
-    if store is not None:
-        try:
-            store.append_guidance_event(game_id, "safe_resume_snapshot", ACTIVE_LEARNING_RESUME[game_id])
-        except (sqlite3.Error, OSError, ValueError, RuntimeError) as error:
-            record_cleanup_error("GUIDANCE_SNAPSHOT_PERSIST_FAILED", error, {"game_id": game_id})
     return ACTIVE_LEARNING_RESUME[game_id]
 
 
@@ -50585,7 +49338,7 @@ class TaskInductionEngine:
                         "automatic_inference": inferred,
                         "human_relation": human_relation,
                         "human_priority": bool(human_relation),
-                        "conflict_requires_new_quiz": conflict,
+                        "conflict_requires_review": conflict,
                     },
                 }
             )
@@ -53630,7 +52383,7 @@ def _strict_mode_session_init(self, app, target):
             "game_id": str((getattr(app, "selected_game", None) or {}).get("id", "")),
             "session_id": str(
                 getattr(app, "mode_session_id", "")
-                or getattr(app, "ask_session_id", "")
+               
                 or uuid.uuid4().hex
             ),
         }
@@ -54377,6 +53130,348 @@ def storage_transaction_contract_suite():
     return passed, details
 
 
+def numeric_priority_contract_suite():
+    checks = {}
+
+    def record(name, condition, evidence=None):
+        checks[str(name)] = {"passed": bool(condition), "evidence": evidence}
+
+    def region(region_id, priority, preference, config=None):
+        relation_config = dict(config or {})
+        relation_config["preference"] = preference
+        return {
+            "id": region_id,
+            "priority": priority,
+            "created": float(priority),
+            "enabled": True,
+            "region_norm": [0.05 + priority * 0.2, 0.1, 0.15, 0.1],
+            "goal_relation": preference,
+            "relation_config": relation_config,
+        }
+
+    first = region("first", 0, NumericPreference.NOW_HIGHER.value)
+    second = region("second", 1, NumericPreference.NOW_LOWER.value)
+    high_result = compare_numeric_snapshots_detailed(
+        [first, second],
+        {"first": 10.0, "second": 10.0},
+        {"first": 11.0, "second": 1000.0},
+    )
+    next_result = compare_numeric_snapshots_detailed(
+        [first, second],
+        {"first": 10.0, "second": 10.0},
+        {"first": 10.0, "second": 9.0},
+    )
+    equal_result = compare_numeric_snapshots_detailed(
+        [first, second],
+        {"first": 10.0, "second": 10.0},
+        {"first": 10.0, "second": 10.0},
+    )
+    invalid_result = compare_numeric_snapshots_detailed(
+        [first, second],
+        {"first": 10.0, "second": 10.0},
+        {"first": {"valid": False}, "second": 9.0},
+    )
+    record(
+        "numeric_high_priority_short_circuit",
+        high_result.get("winning_region_id") == "first" and high_result.get("reward", 0.0) > 0.0,
+        high_result,
+    )
+    record(
+        "numeric_equal_high_priority_checks_next",
+        next_result.get("winning_region_id") == "second" and next_result.get("reward", 0.0) > 0.0,
+        next_result,
+    )
+    record(
+        "numeric_all_equal_zero",
+        equal_result.get("status") == "all_equal" and equal_result.get("reward") == 0.0,
+        equal_result,
+    )
+    record(
+        "numeric_invalid_ocr_zero_and_no_fallthrough",
+        invalid_result.get("status") == "unreadable_or_recovered"
+        and invalid_result.get("reward") == 0.0,
+        invalid_result,
+    )
+
+    preference_cases = {
+        NumericPreference.NOW_HIGHER.value: (10.0, 12.0, 8.0, {}),
+        NumericPreference.NOW_LOWER.value: (10.0, 8.0, 12.0, {}),
+        NumericPreference.POSITIVE_DELTA_HIGHER.value: (10.0, 15.0, 8.0, {}),
+        NumericPreference.POSITIVE_DELTA_LOWER.value: (100.0, 101.0, 99.0, {}),
+        NumericPreference.NEGATIVE_DELTA_HIGHER.value: (10.0, 5.0, 12.0, {}),
+        NumericPreference.NEGATIVE_DELTA_LOWER.value: (100.0, 99.0, 101.0, {}),
+        NumericPreference.ABS_DELTA_HIGHER.value: (100.0, 200.0, 101.0, {}),
+        NumericPreference.ABS_DELTA_LOWER.value: (100.0, 101.0, 200.0, {}),
+        NumericPreference.FIXED_DISTANCE_HIGHER.value: (10.0, 20.0, 10.0, {"fixed_value": 10.0}),
+        NumericPreference.FIXED_DISTANCE_LOWER.value: (20.0, 10.0, 30.0, {"fixed_value": 10.0}),
+        NumericPreference.REGION_DIFF_HIGHER.value: (5.0, 10.0, 0.0, {"compare_region_id": "target"}),
+        NumericPreference.REGION_DIFF_LOWER.value: (5.0, 0.0, 10.0, {"compare_region_id": "target"}),
+        NumericPreference.REGION_ABS_DIFF_HIGHER.value: (
+            10.0,
+            15.0,
+            11.0,
+            {"compare_region_id": "target"},
+        ),
+        NumericPreference.REGION_ABS_DIFF_LOWER.value: (
+            15.0,
+            5.0,
+            20.0,
+            {"compare_region_id": "target"},
+        ),
+    }
+    preference_evidence = {}
+    preference_passed = True
+    for preference, case in preference_cases.items():
+        old_value, preferred_value, contrary_value, config = case
+        subject = region("subject", 0, preference, config)
+        target = region("target", 1, NumericPreference.KEEP_SAME.value)
+        regions = [subject, target] if preference in NUMERIC_COMPARISON_RELATIONS else [subject]
+        before = {"subject": old_value, "target": 5.0}
+        preferred = {"subject": preferred_value, "target": 5.0}
+        contrary = {"subject": contrary_value, "target": 5.0}
+        preferred_reward = compare_numeric_snapshots(regions, before, preferred)
+        contrary_reward = compare_numeric_snapshots(regions, before, contrary)
+        equal_reward = compare_numeric_snapshots(regions, before, before)
+        invalid_reward = compare_numeric_snapshots(
+            regions,
+            before,
+            {"subject": {"valid": False}, "target": 5.0},
+        )
+        if preference in {
+            NumericPreference.ABS_DELTA_HIGHER.value,
+            NumericPreference.ABS_DELTA_LOWER.value,
+            NumericPreference.REGION_ABS_DIFF_HIGHER.value,
+            NumericPreference.REGION_ABS_DIFF_LOWER.value,
+        }:
+            direction_passed = preferred_reward > contrary_reward and preferred_reward > 0.0
+        else:
+            direction_passed = preferred_reward > 0.0 and contrary_reward <= 0.0
+        case_passed = direction_passed and equal_reward == 0.0 and invalid_reward == 0.0
+        preference_passed = preference_passed and case_passed
+        preference_evidence[preference] = {
+            "preferred": preferred_reward,
+            "contrary": contrary_reward,
+            "equal": equal_reward,
+            "invalid": invalid_reward,
+            "passed": case_passed,
+        }
+    record(
+        "all_fourteen_numeric_preferences",
+        preference_passed and set(preference_cases) == set(NUMERIC_REQUIRED_PREFERENCES),
+        preference_evidence,
+    )
+
+    reordered = reorder_numeric_regions(
+        [region("r1", 0, NumericPreference.NOW_HIGHER.value),
+         region("r2", 1, NumericPreference.NOW_HIGHER.value),
+         region("r3", 2, NumericPreference.NOW_HIGHER.value)],
+        2,
+        0,
+    )
+    record(
+        "numeric_list_reorder_updates_priority",
+        [item["id"] for item in reordered] == ["r3", "r1", "r2"]
+        and [item["priority"] for item in reordered] == [0, 1, 2],
+        reordered,
+    )
+    referring = region(
+        "referring",
+        1,
+        NumericPreference.REGION_DIFF_HIGHER.value,
+        {"compare_region_id": "deleted"},
+    )
+    cleaned = clean_numeric_region_references(
+        [region("deleted", 0, NumericPreference.NOW_HIGHER.value), referring],
+        "deleted",
+    )
+    clean_config = cleaned[0].get("relation_config", {}) if cleaned else {}
+    record(
+        "numeric_delete_cleans_cross_region_reference",
+        len(cleaned) == 1
+        and clean_config.get("compare_region_id") == ""
+        and clean_config.get("preference") == NumericPreference.KEEP_SAME.value,
+        cleaned,
+    )
+
+    class FakeStatus:
+        def __init__(self):
+            self.values = []
+
+        def set(self, value):
+            self.values.append(str(value))
+
+    class FakeRoot:
+        def update_idletasks(self):
+            return None
+
+    class FakeApi:
+        def __init__(self):
+            self.capture_count = 0
+
+        def capture_gray(self, target, include_cursor, allow_fallback, preview):
+            self.capture_count += 1
+            return {"capture_valid": True, "preview_rgb": bytes(PREVIEW_W * PREVIEW_H * 3)}
+
+    class FakeApp:
+        pass
+
+    fake_app = FakeApp()
+    fake_app.mode = None
+    fake_app.api = FakeApi()
+    fake_app.status = FakeStatus()
+    fake_app.root = FakeRoot()
+    fake_app.require_ai_runtime = lambda: True
+    fake_app.require_game = lambda: {"id": "g"}
+    fake_app.require_window = lambda foreground=False: {"hwnd": 1}
+    fake_app.show_error = lambda message: (_ for _ in ()).throw(AssertionError(message))
+    ui = AppUiService(fake_app)
+    editor_calls = []
+    original_editor = globals()["NumericRegionEditor"]
+    globals()["NumericRegionEditor"] = lambda app, frame: editor_calls.append((app, frame))
+    try:
+        ui.open_numeric_region_dialog()
+    finally:
+        globals()["NumericRegionEditor"] = original_editor
+    record(
+        "numeric_button_single_capture_direct_editor",
+        ui.api.capture_count == 1 and len(editor_calls) == 1,
+        {"capture_count": ui.api.capture_count, "editor_count": len(editor_calls)},
+    )
+
+    storage_details = {}
+    with tempfile.TemporaryDirectory(prefix="ugai-numeric-priority-") as folder:
+        base = Path(folder)
+        game_id = "numeric-game"
+        store = DataStore(base)
+        try:
+            store.replace_games(
+                [{"id": game_id, "name": "Numeric", "created": 1.0}],
+                game_id,
+            )
+            saved_regions = [
+                region("r1", 0, NumericPreference.NOW_HIGHER.value),
+                region(
+                    "r2",
+                    1,
+                    NumericPreference.FIXED_DISTANCE_LOWER.value,
+                    {"fixed_value": 100.0},
+                ),
+                region(
+                    "r3",
+                    2,
+                    NumericPreference.REGION_ABS_DIFF_HIGHER.value,
+                    {"compare_region_id": "r1"},
+                ),
+            ]
+            store.replace_ocr_regions(game_id, saved_regions)
+            initial = store.list_ocr_regions(game_id, False)
+            dragged = reorder_numeric_regions(initial, 2, 0)
+            store.replace_ocr_regions(game_id, dragged)
+            after_drag = store.list_ocr_regions(game_id, False)
+            store.save_ocr_region(
+                game_id,
+                region("r4", 3, NumericPreference.NOW_LOWER.value),
+            )
+            after_append = store.list_ocr_regions(game_id, False)
+            store.close(5.0)
+            store = DataStore(base)
+            after_restart = store.list_ocr_regions(game_id, False)
+            persisted_r2 = next(item for item in after_restart if item["id"] == "r2")
+            persisted_r3 = next(item for item in after_restart if item["id"] == "r3")
+            storage_details = {
+                "initial": [item["id"] for item in initial],
+                "after_drag": [item["id"] for item in after_drag],
+                "after_append": [item["id"] for item in after_append],
+                "after_restart": [item["id"] for item in after_restart],
+                "priorities": [item["priority"] for item in after_restart],
+                "fixed_value": persisted_r2["relation_config"].get("fixed_value"),
+                "compare_region_id": persisted_r3["relation_config"].get("compare_region_id"),
+            }
+        finally:
+            store.close(5.0)
+    storage_passed = bool(
+        storage_details.get("initial") == ["r1", "r2", "r3"]
+        and storage_details.get("after_drag") == ["r3", "r1", "r2"]
+        and storage_details.get("after_append") == ["r3", "r1", "r2", "r4"]
+        and storage_details.get("after_restart") == ["r3", "r1", "r2", "r4"]
+        and storage_details.get("priorities") == [0, 1, 2, 3]
+        and storage_details.get("fixed_value") == 100.0
+        and storage_details.get("compare_region_id") == "r1"
+    )
+    record("numeric_priority_persistence_and_append", storage_passed, storage_details)
+
+    migration_details = {}
+    with tempfile.TemporaryDirectory(prefix="ugai-numeric-migration-") as folder:
+        base = Path(folder)
+        db_path = base / "universal_game_ai.db"
+        connection = sqlite3.connect(db_path)
+        connection.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+        connection.execute("INSERT INTO meta(key,value) VALUES('schema_version','14')")
+        connection.execute(
+            "CREATE TABLE games(id TEXT PRIMARY KEY,name TEXT NOT NULL COLLATE NOCASE UNIQUE,"
+            "created REAL NOT NULL,needs_review INTEGER NOT NULL DEFAULT 0,last_review REAL)"
+        )
+        connection.execute("INSERT INTO games VALUES('g','Legacy',1,0,NULL)")
+        connection.execute(
+            "CREATE TABLE ocr_regions(id TEXT PRIMARY KEY,game_id TEXT NOT NULL,created REAL NOT NULL,"
+            "updated REAL NOT NULL,region_norm TEXT NOT NULL,region_type TEXT NOT NULL,"
+            "number_format TEXT NOT NULL,goal_relation TEXT NOT NULL,relation_config TEXT NOT NULL,"
+            "target_min REAL,target_max REAL,special_value REAL,special_meaning TEXT NOT NULL,"
+            "reset_meaning TEXT NOT NULL,unit TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,"
+            "last_text TEXT NOT NULL,last_value REAL,last_confidence REAL NOT NULL DEFAULT 0,"
+            "stable_frames INTEGER NOT NULL DEFAULT 0,checksum TEXT NOT NULL)"
+        )
+        for index, region_id in enumerate(("r1", "r2", "r3")):
+            connection.execute(
+                "INSERT INTO ocr_regions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    region_id,
+                    "g",
+                    1.0,
+                    10.0 + index * 0.000001,
+                    "[0.1,0.1,0.2,0.1]",
+                    "number",
+                    "auto",
+                    "higher_better",
+                    '{"preference":"higher_better"}',
+                    None,
+                    None,
+                    None,
+                    "uncertain",
+                    "uncertain",
+                    "",
+                    1,
+                    "",
+                    None,
+                    0.0,
+                    0,
+                    "legacy",
+                ),
+            )
+        connection.commit()
+        connection.close()
+        store = DataStore(base)
+        try:
+            migrated = store.list_ocr_regions("g", False)
+            schema_version = store.db.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()[0]
+            migration_details = {
+                "ids": [item["id"] for item in migrated],
+                "priorities": [item["priority"] for item in migrated],
+                "schema_version": schema_version,
+            }
+        finally:
+            store.close(5.0)
+    migration_passed = bool(
+        migration_details.get("ids") == ["r1", "r2", "r3"]
+        and migration_details.get("priorities") == [0, 1, 2]
+        and migration_details.get("schema_version") == str(DATABASE_SCHEMA_VERSION)
+    )
+    record("numeric_priority_migration_from_v14", migration_passed, migration_details)
+    return all(item["passed"] for item in checks.values()), checks
+
+
 _ORIGINAL_LOGIC_SUITE_STRICT = logic_contract_suite
 def logic_contract_suite():
     passed, checks = _ORIGINAL_LOGIC_SUITE_STRICT()
@@ -54500,6 +53595,8 @@ def logic_contract_suite():
     )
     tracking_passed, tracking_evidence = numeric_tracking_reacquisition_contract()
     record("numeric_region_hard_reacquisition", tracking_passed, tracking_evidence)
+    numeric_passed, numeric_evidence = numeric_priority_contract_suite()
+    record("numeric_priority_and_preference_contracts", numeric_passed, numeric_evidence)
     storage_passed, storage_evidence = storage_transaction_contract_suite()
     record("transactional_game_and_ocr_storage", storage_passed, storage_evidence)
     return all(item["passed"] for item in checks.values()), checks
