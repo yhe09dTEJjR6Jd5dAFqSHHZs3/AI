@@ -189,10 +189,10 @@ AI_WORKER_PROTOCOL_VERSION = 6
 RUNTIME_INSTALL_PROTOCOL_VERSION = 2
 REVIEW_PROCESS_PROTOCOL_VERSION = 2
 TEST_WORKER_PROTOCOL_VERSION = 2
-STATIC_CONTRACT_VERSION = 13
+STATIC_CONTRACT_VERSION = 14
 EXTERNAL_REQUIREMENT_SPEC_JSON = (
-    '{"default_buttons":["选择文件夹","检查文件完整性","游戏名称","选择窗口","人","做题","升级","AI"],'
-    '"capture_toggles":["鼠标","键盘","手柄","声音"],"success_confirmation_surface":"main_window",'
+    '{"default_buttons":["文件夹","文件","游戏名称","选择窗口","人","数","升级","AI"],'
+    '"capture_toggles":["鼠标","键盘","手柄","声音"],"numeric_region_editor":true,"success_confirmation_surface":"main_window",'
     '"error_confirmation_surface":"modal","promotion_requires_human_baseline":true}'
 )
 EXTERNAL_REQUIREMENT_SPEC = json.loads(EXTERNAL_REQUIREMENT_SPEC_JSON)
@@ -803,7 +803,7 @@ class UserMessageCatalog:
         return f"数据库、WAL与SHM恢复备份已保存到：{path}"
 
 
-MODE_LABELS = {ModeId.COLLECT: "人", ModeId.UPGRADE: "升级", ModeId.AI: "AI", ModeId.QUIZ: "做题"}
+MODE_LABELS = {ModeId.COLLECT: "人", ModeId.UPGRADE: "升级", ModeId.AI: "AI", ModeId.QUIZ: "数"}
 MODE_BY_LABEL = {label: mode.value for mode, label in MODE_LABELS.items()}
 
 
@@ -990,7 +990,7 @@ STRICT_ACCEPTANCE_ITEMS = (
     "人",
     "升级",
     "AI",
-    "做题",
+    "数",
     "弹窗",
     "停止",
     "单实例与目录锁",
@@ -1032,15 +1032,20 @@ STRICT_ACCEPTANCE_CASES = {
     "人": ("client_only_real_mouse", "capture_modalities_closed_loop"),
     "升级": ("socket_blocked", "model_optimized", "pool_optimized", "deterministic_seed"),
     "AI": ("all_coordinates_in_client", "immutable_snapshot_change_stop"),
-    "做题": (
-        "structured_questions_only",
-        "action_question",
-        "numeric_region_question",
-        "ocr_confirmation",
-        "numeric_relation_question",
-        "submit_required",
-        "finish_button",
-        "escape",
+    "数": (
+        "single_capture_before_editor",
+        "region_create_edit_delete_select",
+        "default_white_half_transparent",
+        "blank_deselect",
+        "inside_move",
+        "edge_resize",
+        "corner_resize",
+        "per_region_color_and_opacity",
+        "coarse_annotation_tolerance",
+        "human_ai_hidden_adaptive_tracking",
+        "all_numeric_preferences",
+        "cross_region_comparison",
+        "occlusion_and_reacquisition",
     ),
     "弹窗": ("confirm_only", "success_status_only", "error_confirm_only"),
     "停止": (
@@ -1097,7 +1102,7 @@ STRICT_ACCEPTANCE_CASES = {
 SAMPLE_IMAGE_VERSION = 1
 NEURAL_FEATURE_VERSION = 3
 MODEL_MAX_BYTES = 256 * 1024 * 1024
-REQUIRED_DEFAULT_BUTTONS = {"选择文件夹", "检查文件完整性", "游戏名称", "选择窗口", "人", "升级", "AI", "做题"}
+REQUIRED_DEFAULT_BUTTONS = {"文件夹", "文件", "游戏名称", "选择窗口", "人", "数", "升级", "AI"}
 REQUIRED_CAPTURE_TOGGLES = ("鼠标", "键盘", "手柄", "声音")
 AUTHORITATIVE_DATA_PATHS = (
     "universal_game_ai.db",
@@ -4903,9 +4908,9 @@ class ControlStateMachine:
             if self.state != MODE_IDLE:
                 raise RuntimeError("当前已有操作正在运行，请先停止")
             normalized = normalize_mode_id(name)
-            if normalized != "检查文件完整性" and not self.data_ready:
+            if normalized != "文件" and not self.data_ready:
                 raise RuntimeError("请先选择并确认文件夹")
-            if normalized != "检查文件完整性" and not self.runtime_ready:
+            if normalized != "文件" and not self.runtime_ready:
                 raise RuntimeError("请先完成文件完整性检查")
             self.state = MODE_STARTING
             self.name = normalized
@@ -12477,7 +12482,7 @@ class KeyboardMonitor:
                             if self.on_escape is not None:
                                 try:
                                     self.on_escape(dict(event))
-                                except Exception as error:
+                                except RECOVERABLE_ERRORS as error:
                                     record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
                     else:
                         with self.key_lock:
@@ -21344,10 +21349,10 @@ class GuidanceWindow:
             app.lifecycle.mark_running()
             app.api.block_input()
             app.set_input_status("已锁定")
-            app.status.set("做题已开始：按当前题目选择结构化答案并点击“提交”；点击“结束做题”或按ESC结束")
+            app.status.set("数已开始：按当前题目选择结构化答案并点击“提交”；点击“结束数”或按ESC结束")
             win = tk.Toplevel(app.root)
             app.ask_window = win
-            win.title("做题")
+            win.title("数")
             fit_window(win, 820, 780, 600, 460)
             win.transient(app.root)
             win.bind("<Unmap>", lambda event: buffer.set_preview_active(False))
@@ -21383,7 +21388,7 @@ class GuidanceWindow:
             tools.pack(fill="x", pady=(8, 0))
             submit_button = ttk.Button(tools, text="提交", state="disabled")
             submit_button.pack(side="left", fill="x", expand=True, ipady=6)
-            end_button = ttk.Button(tools, text="结束做题", command=lambda: app.close_ask(reason="completed"))
+            end_button = ttk.Button(tools, text="结束数", command=lambda: app.close_ask(reason="completed"))
             end_button.pack(side="left", padx=(8, 0), ipadx=18, ipady=6)
             state = {
                 "frame": None,
@@ -21543,7 +21548,7 @@ class GuidanceWindow:
                 for widget, value in zip(state.get("buttons", []), question.get("options", [])):
                     widget.configure(text=("✓ " if value is option else "") + option_label(question, value))
                 submit_button.configure(state="normal")
-                app.status.set("做题中：已选择" + str(option.get("code", "")) + "，请点击“提交”")
+                app.status.set("数中：已选择" + str(option.get("code", "")) + "，请点击“提交”")
 
             def render_current_question():
                 question = current_question()
@@ -21681,7 +21686,7 @@ class GuidanceWindow:
                     schedule(45, poll_question)
                     return
                 if packet.get("error"):
-                    app.status.set("做题等待可用画面：" + str(packet["error"]))
+                    app.status.set("数等待可用画面：" + str(packet["error"]))
                     producer.request(state["recent_actions"], state["state_since"])
                     schedule(160, poll_question)
                     return
@@ -21706,7 +21711,7 @@ class GuidanceWindow:
                     state["state_since"] = time.monotonic()
                 counts = app.ask_counts or {}
                 app.status.set(
-                    "做题中：动作保存"
+                    "数中：动作保存"
                     + str(counts.get("saved", 0))
                     + "，重复"
                     + str(counts.get("duplicates", 0))
@@ -21743,7 +21748,7 @@ class GuidanceWindow:
             win.wait_visibility()
             win.focus_force()
         except RECOVERABLE_ERRORS as error:
-            app._fail_active_mode("做题界面创建失败：" + str(error))
+            app._fail_active_mode("数界面创建失败：" + str(error))
         finally:
             if created is not None:
                 created.set()
@@ -21967,7 +21972,7 @@ class TeachingController:
         historical = []
         for index, item in enumerate(samples):
             if index % 64 == 0 and app.should_stop():
-                raise InputStopped("做题初始化已停止")
+                raise InputStopped("数初始化已停止")
             action = normalize_action(item.get("a"))
             semantic = sample_semantic_action(item)
             if feature_valid(item.get("f")) and action and semantic:
@@ -22062,12 +22067,12 @@ class TeachingController:
                 if packet and not packet.get("error") and packet.get("frame") is not None:
                     initial = packet
                 elif packet and packet.get("error"):
-                    app.set_status("做题初始化等待画面：" + str(packet["error"]))
+                    app.set_status("数初始化等待画面：" + str(packet["error"]))
                     producer.request(deque(["<START>", "<START>"], maxlen=4), time.monotonic())
             if app.should_stop():
-                raise InputStopped("做题初始化已停止")
+                raise InputStopped("数初始化已停止")
             if initial is None:
-                raise CaptureUnavailable("做题初始化未在限定时间内生成第一道题")
+                raise CaptureUnavailable("数初始化未在限定时间内生成第一道题")
             created = threading.Event()
             app.ui(
                 lambda: app._create_ask_window(
@@ -22083,7 +22088,7 @@ class TeachingController:
             )
             while not created.wait(0.05):
                 if app.should_stop():
-                    raise InputStopped("做题初始化已停止")
+                    raise InputStopped("数初始化已停止")
             while not app.should_stop():
                 try:
                     command = answer_queue.get(timeout=0.05)
@@ -22093,7 +22098,7 @@ class TeachingController:
                 try:
                     kind = str(command.get("kind", ""))
                     if kind != "quiz_group":
-                        raise RuntimeError("做题主流程仅接受结构化题组，并要求每题选择后提交")
+                        raise RuntimeError("数主流程仅接受结构化题组，并要求每题选择后提交")
                     frame = command.get("frame") or {}
                     answers = [value for value in command.get("answers", []) if isinstance(value, dict)]
                     recent_actions = command.get("recent_actions") or ["<START>", "<START>"]
@@ -22140,7 +22145,7 @@ class TeachingController:
                         result = {"saved": False, "action": None}
                     elif action_value == "choose":
                         if not frame.get("usable_for_teaching"):
-                            raise CaptureUnavailable("当前画面不可用于做题")
+                            raise CaptureUnavailable("当前画面不可用于数")
                         temporal = app.build_temporal_context(buffer, frame, recent_actions, state_since)
                         temporal["previous_action_changed_frame"] = True
                         policy = str(entry.get("repeat_policy", "one_shot"))
@@ -22181,7 +22186,7 @@ class TeachingController:
                         )
                         action = normalize_action(entry.get("coordinate_action")) or normalize_action(semantic)
                         if not semantic or not action:
-                            raise RuntimeError("做题动作无效")
+                            raise RuntimeError("数动作无效")
                         context.update(semantic_context_payload(frame, semantic))
                         active_learning_label = str(entry.get("active_learning_label", ""))
                         context.update(
@@ -22260,7 +22265,7 @@ class TeachingController:
                     if callback:
                         app.ui(lambda callback=callback, result=result: callback(result, None))
                 except Exception as error:
-                    message = "做题数据库或题目处理失败：" + str(error)
+                    message = "数数据库或题目处理失败：" + str(error)
                     if callback:
                         app.ui(lambda callback=callback, message=message: callback(None, message))
                     app.request_mode_stop("failed", message)
@@ -22282,7 +22287,7 @@ class TeachingController:
             "numeric_relations": 0,
         }
         summary = (
-            "做题已结束：动作保存"
+            "数已结束：动作保存"
             + str(counts.get("saved", 0))
             + "，重复未保存"
             + str(counts.get("duplicates", 0))
@@ -22391,6 +22396,9 @@ class OCRRegionRepository:
 
     def save(self, gid, payload):
         return self.store.save_ocr_region(gid, payload)
+
+    def replace(self, gid, payloads):
+        return self.store.replace_ocr_regions(gid, payloads)
 
     def list(self, gid, enabled_only=True):
         return self.store.list_ocr_regions(gid, enabled_only)
@@ -23632,6 +23640,372 @@ class DataStoreGameTaskMixin:
         self.model_cache.pop(game_id, None)
         return int(cursor.rowcount or 0) > 0
 
+    def _decode_model_asset_document(self, payload):
+        try:
+            raw = bounded_decompress(payload, 64 * 1024 * 1024)
+            value = json.loads(raw.decode("utf-8"))
+            return value if isinstance(value, dict) else {}
+        except RECOVERABLE_ERRORS:
+            return {}
+
+    def _collect_relative_paths_from_value(self, value):
+        result = set()
+
+        def add(candidate):
+            text = str(candidate or "").strip().replace("\\", "/")
+            if not text or "\x00" in text or "://" in text:
+                return
+            path = Path(text)
+            if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+                return
+            lowered = text.casefold()
+            if "/types/" in "/" + lowered or Path(text).name.casefold().startswith("shared_"):
+                return
+            result.add(Path(*path.parts))
+
+        def visit(item, key=""):
+            if isinstance(item, dict):
+                for child_key, child in item.items():
+                    token = str(child_key).casefold()
+                    if (
+                        token in {"relative_path", "path", "file", "artifact_path", "bundle_path"}
+                        and isinstance(child, str)
+                    ):
+                        add(child)
+                    elif (
+                        token in {"paths", "files", "artifact_paths", "bundle_paths"}
+                        and isinstance(child, (list, tuple))
+                    ):
+                        for candidate in child:
+                            if isinstance(candidate, str):
+                                add(candidate)
+                    visit(child, token)
+            elif isinstance(item, (list, tuple)):
+                for child in item:
+                    visit(child, key)
+
+        visit(value)
+        return result
+
+    def _model_asset_documents(self):
+        rows = []
+        with self.lock:
+            for table in ("models", "model_backups"):
+                if not self._table_exists(table):
+                    continue
+                rows.extend(
+                    (str(row["game_id"]), row["payload"])
+                    for row in iter_rows(self.db.execute("SELECT game_id,payload FROM " + table), 64)
+                )
+        return [(game_id, self._decode_model_asset_document(payload)) for game_id, payload in rows]
+
+    def _game_asset_tokens(self, game_ids):
+        tokens = set()
+        for game_id in game_ids:
+            text = str(game_id)
+            digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+            tokens.update({text.casefold(), digest, digest[:16], digest[:24], digest[:32]})
+            normalized = normalized_identifier(text, "game", 96).casefold()
+            if len(normalized) >= 8:
+                tokens.add(normalized)
+        return {token for token in tokens if len(token) >= 8}
+
+    def _safe_asset_path(self, relative):
+        base = self.base.resolve()
+        candidate = (base / Path(relative)).resolve()
+        if not candidate.is_relative_to(base) or candidate == base:
+            raise RuntimeError("游戏资产路径超出用户确认目录")
+        if candidate in {self.db_path.resolve(), (self.base / ".ugai.lock").resolve()}:
+            raise RuntimeError("禁止将数据库或目录锁作为游戏资产删除")
+        reject_reparse_points(base, candidate)
+        return candidate
+
+    def _collect_game_asset_paths(self, game_ids):
+        deleting = {str(value) for value in game_ids}
+        tokens = self._game_asset_tokens(deleting)
+        documents = self._model_asset_documents()
+        other_tensor_paths = set()
+        target_tensor_paths = set()
+        paths = set()
+        for game_id, document in documents:
+            document_paths = self._collect_relative_paths_from_value(document)
+            tensor = document.get("tensor_bundle") if isinstance(document.get("tensor_bundle"), dict) else {}
+            tensor_path = str(tensor.get("relative_path", ""))
+            if tensor_path:
+                normalized_tensor = Path(tensor_path)
+                if game_id in deleting:
+                    target_tensor_paths.add(normalized_tensor)
+                else:
+                    other_tensor_paths.add(normalized_tensor)
+            if game_id in deleting:
+                paths.update(document_paths)
+        with self.lock:
+            if self._table_exists("vision_models"):
+                for row in iter_rows(
+                    self.db.execute(
+                        "SELECT game_id,relative_path FROM vision_models WHERE game_id IN ("
+                        + ",".join("?" for _ in deleting)
+                        + ")",
+                        tuple(sorted(deleting)),
+                    ),
+                    64,
+                ) if deleting else ():
+                    relative = Path(str(row["relative_path"]))
+                    paths.add(relative)
+                    paths.add(Path(str(relative) + ".json"))
+            for table, column in (
+                ("game_profiles", "payload"),
+                ("game_tasks", "payload"),
+                ("guidance_events", "payload"),
+                ("ocr_regions", "relation_config"),
+                ("ocr_observations", "semantic_event"),
+            ):
+                if not deleting or not self._table_exists(table):
+                    continue
+                query = (
+                    "SELECT game_id," + column + " AS payload FROM " + table + " WHERE game_id IN ("
+                    + ",".join("?" for _ in deleting)
+                    + ")"
+                )
+                for row in iter_rows(self.db.execute(query, tuple(sorted(deleting))), 128):
+                    try:
+                        value = json.loads(str(row["payload"]))
+                    except RECOVERABLE_ERRORS:
+                        continue
+                    paths.update(self._collect_relative_paths_from_value(value))
+        paths.difference_update(other_tensor_paths)
+        paths.update(target_tensor_paths - other_tensor_paths)
+        for game_id in deleting:
+            digest = hashlib.sha256(game_id.encode("utf-8", "replace")).hexdigest()
+            paths.add(Path("replays") / digest[:24])
+            paths.add(online_acceptance_relative_path(game_id))
+            paths.add(Path("models") / "vision" / "adapters" / "games" / (digest + ".json"))
+            paths.add(Path("models") / "task_graph" / (digest[:16] + ".json"))
+            paths.add(Path("audit") / "corrective_learning" / ("pending_" + digest[:16] + ".json"))
+            paths.add(Path("audit") / "corrective_learning" / ("history_" + digest[:16] + ".jsonl"))
+            vision_root = self.base / "models" / "vision"
+            if vision_root.is_dir():
+                for candidate in vision_root.glob(digest + ".*"):
+                    try:
+                        paths.add(candidate.relative_to(self.base))
+                    except ValueError:
+                        continue
+        pruned_roots = {".trash", "runtime", "project", "backups", "quarantine", "runtime.current"}
+        for root, directories, files in os.walk(self.base):
+            root_path = Path(root)
+            relative_root = root_path.relative_to(self.base)
+            directories[:] = [
+                name
+                for name in directories
+                if name not in pruned_roots
+                and not name.startswith("runtime.staging.")
+                and not is_reparse_point(root_path / name)
+            ]
+            names = list(directories) + list(files)
+            for name in names:
+                candidate = root_path / name
+                try:
+                    relative = candidate.relative_to(self.base)
+                except ValueError:
+                    continue
+                folded = relative.as_posix().casefold()
+                if any(token in folded for token in tokens):
+                    paths.add(relative)
+        resolved = []
+        for relative in paths:
+            try:
+                candidate = self._safe_asset_path(relative)
+            except RECOVERABLE_ERRORS as error:
+                self.logger.write("GAME_ASSET_PATH_REJECTED", error, details={"path": str(relative)})
+                continue
+            if candidate.exists():
+                resolved.append(candidate)
+                if candidate.suffix.casefold() == ".safetensors":
+                    metadata = Path(str(candidate) + ".json")
+                    if metadata.exists():
+                        resolved.append(metadata)
+        unique = sorted(set(resolved), key=lambda value: (len(value.parts), str(value).casefold()))
+        collapsed = []
+        for candidate in unique:
+            if any(candidate.is_relative_to(parent) for parent in collapsed):
+                continue
+            collapsed.append(candidate)
+        return collapsed
+
+    def _stage_game_assets(self, game_ids):
+        transaction_id = uuid.uuid4().hex
+        transaction_root = self.base / ".trash" / transaction_id
+        files_root = transaction_root / "files"
+        moved = []
+        try:
+            for source in self._collect_game_asset_paths(game_ids):
+                relative = source.relative_to(self.base)
+                destination = files_root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, destination)
+                moved.append((source, destination))
+            manifest = {
+                "transaction_id": transaction_id,
+                "game_ids": sorted(str(value) for value in game_ids),
+                "created": time.time(),
+                "moved": [source.relative_to(self.base).as_posix() for source, _ in moved],
+            }
+            transaction_root.mkdir(parents=True, exist_ok=True)
+            durable_atomic_write(
+                transaction_root / "manifest.json",
+                json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+                self.base,
+            )
+            return {"transaction_id": transaction_id, "root": transaction_root, "moved": moved}
+        except RECOVERABLE_ERRORS:
+            self._restore_staged_game_assets({"root": transaction_root, "moved": moved})
+            raise
+
+    def _restore_staged_game_assets(self, staged):
+        errors = []
+        for source, destination in reversed(list(staged.get("moved", []))):
+            try:
+                if destination.exists():
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(destination, source)
+            except RECOVERABLE_ERRORS as error:
+                errors.append((str(source), str(error)))
+        root = staged.get("root")
+        if root:
+            try:
+                shutil.rmtree(root, ignore_errors=False)
+            except FileNotFoundError:
+                pass
+            except RECOVERABLE_ERRORS as error:
+                errors.append((str(root), str(error)))
+        if errors:
+            raise StorageError("恢复已暂存游戏文件失败：" + json.dumps(errors, ensure_ascii=False))
+
+    def _purge_staged_game_assets(self, staged):
+        root = staged.get("root")
+        if not root:
+            return True
+        try:
+            shutil.rmtree(root)
+            parent = root.parent
+            if parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
+            return True
+        except FileNotFoundError:
+            return True
+        except RECOVERABLE_ERRORS as error:
+            self.logger.write(
+                "GAME_TRASH_PURGE_DEFERRED",
+                error,
+                details={"transaction_id": str(staged.get("transaction_id", "")), "path": str(root)},
+            )
+            return False
+
+    def recover_game_trash_transactions(self):
+        trash = self.base / ".trash"
+        if not trash.is_dir():
+            return {"restored": 0, "purged": 0, "failed": 0}
+        result = {"restored": 0, "purged": 0, "failed": 0}
+        for transaction_root in sorted(path for path in trash.iterdir() if path.is_dir()):
+            files_root = transaction_root / "files"
+            manifest_path = transaction_root / "manifest.json"
+            manifest = {}
+            try:
+                if manifest_path.is_file():
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if not isinstance(manifest, dict):
+                        manifest = {}
+            except RECOVERABLE_ERRORS as error:
+                self.logger.write(
+                    "GAME_TRASH_MANIFEST_INVALID",
+                    error,
+                    details={"path": str(manifest_path)},
+                )
+                manifest = {}
+            game_ids = {
+                str(value)
+                for value in manifest.get("game_ids", [])
+                if str(value)
+            }
+            with self.lock:
+                existing = {
+                    str(row[0])
+                    for row in self.db.execute(
+                        "SELECT id FROM games WHERE id IN ("
+                        + ",".join("?" for _ in game_ids)
+                        + ")",
+                        tuple(sorted(game_ids)),
+                    )
+                } if game_ids else set()
+            should_restore = not game_ids or bool(existing)
+            if not should_restore:
+                if self._purge_staged_game_assets(
+                    {
+                        "root": transaction_root,
+                        "transaction_id": transaction_root.name,
+                        "moved": [],
+                    }
+                ):
+                    result["purged"] += 1
+                else:
+                    result["failed"] += 1
+                continue
+            moved = []
+            if files_root.is_dir():
+                for destination in sorted(
+                    (path for path in files_root.rglob("*") if path.is_file()),
+                    key=lambda value: len(value.parts),
+                ):
+                    relative = destination.relative_to(files_root)
+                    source = self._safe_asset_path(relative)
+                    moved.append((source, destination))
+                for destination in sorted(
+                    (path for path in files_root.rglob("*") if path.is_dir()),
+                    key=lambda value: len(value.parts),
+                ):
+                    if any(child.is_relative_to(destination) for _, child in moved):
+                        continue
+                    relative = destination.relative_to(files_root)
+                    source = self._safe_asset_path(relative)
+                    moved.append((source, destination))
+            conflicts = []
+            restorable = []
+            for source, destination in moved:
+                if source.exists():
+                    conflicts.append(str(source))
+                else:
+                    restorable.append((source, destination))
+            if conflicts:
+                result["failed"] += 1
+                self.logger.write(
+                    "GAME_TRASH_RECOVERY_CONFLICT",
+                    RuntimeError("恢复目标已存在"),
+                    details={"transaction_id": transaction_root.name, "paths": conflicts[:64]},
+                )
+                continue
+            try:
+                self._restore_staged_game_assets(
+                    {
+                        "root": transaction_root,
+                        "transaction_id": transaction_root.name,
+                        "moved": restorable,
+                    }
+                )
+                result["restored"] += 1
+            except RECOVERABLE_ERRORS as error:
+                result["failed"] += 1
+                self.logger.write(
+                    "GAME_TRASH_RECOVERY_FAILED",
+                    error,
+                    details={"transaction_id": transaction_root.name},
+                )
+        try:
+            if trash.is_dir() and not any(trash.iterdir()):
+                trash.rmdir()
+        except RECOVERABLE_ERRORS as error:
+            self.logger.write("GAME_TRASH_ROOT_CLEANUP_FAILED", error)
+        return result
+
     def games(self):
         with self.lock:
             rows = list(
@@ -23675,7 +24049,8 @@ class DataStoreGameTaskMixin:
                 }
             )
         keep = {item["id"] for item in cleaned}
-        if selected not in keep:
+        selected_id = None if selected in {None, ""} else str(selected)
+        if selected_id is not None and selected_id not in keep:
             raise RuntimeError("所选游戏不存在")
         with self.lock:
             existing = {str(row[0]) for row in self.db.execute("SELECT id FROM games")}
@@ -23691,27 +24066,54 @@ class DataStoreGameTaskMixin:
                     self.writer_error = None
                     self._notify_writer_error(None)
             self.writer_condition.notify_all()
+        staged = None
         try:
             self.sample_write_barrier()
-            with self.critical_transaction():
-                self.db.execute(
-                    "INSERT INTO config_backups(created,payload) VALUES(?,?)",
-                    (time.time(), json.dumps(self._config_snapshot(), ensure_ascii=False, separators=(",", ":"))),
-                )
-                self.db.execute(
-                    "DELETE FROM config_backups WHERE id NOT IN (SELECT id FROM config_backups ORDER BY id DESC LIMIT 5)"
-                )
-                for gid in deleting:
-                    self.db.execute("DELETE FROM games WHERE id=?", (gid,))
-                    self.model_cache.pop(gid, None)
-                    self._invalidate_sample_caches(gid)
-                for item in cleaned:
+            staged = (
+                self._stage_game_assets(deleting)
+                if deleting
+                else {"moved": [], "root": None, "transaction_id": ""}
+            )
+            try:
+                with self.critical_transaction():
                     self.db.execute(
-                        "INSERT INTO games(id,name,created,needs_review,last_review) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,created=excluded.created,needs_review=excluded.needs_review,last_review=excluded.last_review",
-                        (item["id"], item["name"], item["created"], item["needs_review"], item["last_review"]),
+                        "INSERT INTO config_backups(created,payload) VALUES(?,?)",
+                        (time.time(), json.dumps(self._config_snapshot(), ensure_ascii=False, separators=(",", ":"))),
                     )
-                self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('selected_game',?)", (selected,))
-            return {"deleted_games": sorted(deleting), "discarded_pending_samples": len(removed_pending)}
+                    self.db.execute(
+                        "DELETE FROM config_backups WHERE id NOT IN (SELECT id FROM config_backups ORDER BY id DESC LIMIT 5)"
+                    )
+                    for gid in deleting:
+                        self.db.execute("DELETE FROM games WHERE id=?", (gid,))
+                    for item in cleaned:
+                        self.db.execute(
+                            "INSERT INTO games(id,name,created,needs_review,last_review) VALUES(?,?,?,?,?) "
+                            "ON CONFLICT(id) DO UPDATE SET name=excluded.name,created=excluded.created,"
+                            "needs_review=excluded.needs_review,last_review=excluded.last_review",
+                            (item["id"], item["name"], item["created"], item["needs_review"], item["last_review"]),
+                        )
+                    if selected_id is None:
+                        self.db.execute("DELETE FROM meta WHERE key='selected_game'")
+                    else:
+                        self.db.execute(
+                            "INSERT OR REPLACE INTO meta(key,value) VALUES('selected_game',?)",
+                            (selected_id,),
+                        )
+            except RECOVERABLE_ERRORS:
+                if staged is not None:
+                    self._restore_staged_game_assets(staged)
+                raise
+            trash_removed = self._purge_staged_game_assets(staged) if staged is not None else True
+            for gid in deleting:
+                self.model_cache.pop(gid, None)
+                self._invalidate_sample_caches(gid)
+            return {
+                "deleted_games": sorted(deleting),
+                "discarded_pending_samples": len(removed_pending),
+                "deleted_asset_count": len(staged.get("moved", [])) if staged else 0,
+                "trash_removed": bool(trash_removed),
+                "selected_game": selected_id,
+            }
         finally:
             with self.pending_lock:
                 self.blocked_game_ids.difference_update(deleting)
@@ -23719,35 +24121,15 @@ class DataStoreGameTaskMixin:
 
     def delete_game(self, gid):
         game_id = str(gid)
-        with self.pending_lock:
-            self.blocked_game_ids.add(game_id)
-            before = len(self.pending_samples)
-            self.pending_samples = [item for item in self.pending_samples if item.get("gid") != game_id]
-            self._rebuild_pending_indexes_locked()
-            removed = before - len(self.pending_samples)
-            if not self.pending_samples:
-                self.pending_event.clear()
-                if self.writer_inflight == 0 and self.writer_error:
-                    self.writer_error = None
-                    self._notify_writer_error(None)
-            self.writer_condition.notify_all()
-        try:
-            self.sample_write_barrier()
-            with self.critical_transaction():
-                row = self.db.execute("SELECT 1 FROM games WHERE id=?", (game_id,)).fetchone()
-                if not row:
-                    return False
-                self.db.execute("DELETE FROM games WHERE id=?", (game_id,))
-                selected = self.db.execute("SELECT value FROM meta WHERE key='selected_game'").fetchone()
-                if selected and str(selected[0]) == game_id:
-                    self.db.execute("DELETE FROM meta WHERE key='selected_game'")
-            self.model_cache.pop(game_id, None)
-            self._invalidate_sample_caches(game_id)
-            return True
-        finally:
-            with self.pending_lock:
-                self.blocked_game_ids.discard(game_id)
-                self.writer_condition.notify_all()
+        games = [item for item in self.games() if str(item.get("id")) != game_id]
+        if len(games) == len(self.games()):
+            return False
+        current = self.selected_game()
+        selected = str(current["id"]) if current and str(current["id"]) != game_id else None
+        if selected is None and games:
+            selected = str(games[0]["id"])
+        result = self.replace_games(games, selected)
+        return bool(game_id in result.get("deleted_games", []))
 
     def update_game(self, gid, **changes):
         allowed = {"name", "created", "needs_review", "last_review"}
@@ -26482,11 +26864,15 @@ class DataStoreOCRVisionMixin:
         if norm[2] <= 0 or norm[3] <= 0 or norm[0] + norm[2] > 1.000001 or norm[1] + norm[3] > 1.000001:
             raise ValueError("OCR区域必须位于确认内容区域内")
         existing = None
+        requested_id = str(value.get("id", "")).strip()
         for item in self.list_ocr_regions(gid, False):
-            if _rect_iou(item["region_norm"], norm) >= 0.82:
+            if requested_id and str(item.get("id", "")) == requested_id:
                 existing = item
                 break
-        region_id = str(existing.get("id")) if existing else uuid.uuid4().hex
+            if not requested_id and _rect_iou(item["region_norm"], norm) >= 0.82:
+                existing = item
+                break
+        region_id = requested_id or (str(existing.get("id")) if existing else uuid.uuid4().hex)
         created = safe_float(existing.get("created"), time.time()) if existing else time.time()
         now = time.time()
         row = {
@@ -26552,6 +26938,130 @@ class DataStoreOCRVisionMixin:
         row["checksum"] = checksum
         return row
 
+    def replace_ocr_regions(self, gid, complete_region_list):
+        self._ensure_writable()
+        game_id = str(gid)
+        payloads = list(complete_region_list or [])
+        with self.lock:
+            if not self.db.execute("SELECT 1 FROM games WHERE id=?", (game_id,)).fetchone():
+                raise RuntimeError("游戏不存在")
+            existing_rows = {
+                str(row["id"]): dict(row)
+                for row in iter_rows(
+                    self.db.execute(
+                        "SELECT id,created,last_text,last_value,last_confidence,stable_frames FROM ocr_regions WHERE game_id=?",
+                        (game_id,),
+                    )
+                )
+            }
+        normalized = []
+        ids = set()
+        now = time.time()
+        for index, payload in enumerate(payloads):
+            value = dict(payload) if isinstance(payload, dict) else {}
+            region_id = str(value.get("id") or uuid.uuid4().hex).strip()
+            if not region_id or region_id in ids:
+                raise ValueError("OCR区域ID重复或无效")
+            ids.add(region_id)
+            norm = value.get("region_norm")
+            if not isinstance(norm, (list, tuple)) or len(norm) != 4:
+                raise ValueError("OCR区域坐标无效")
+            norm = [round(max(0.0, min(1.0, safe_float(item))), 8) for item in norm]
+            if norm[2] <= 0 or norm[3] <= 0 or norm[0] + norm[2] > 1.000001 or norm[1] + norm[3] > 1.000001:
+                raise ValueError("OCR区域必须位于确认内容区域内")
+            existing = existing_rows.get(region_id, {})
+            config = normalize_relation_config(value.get("relation_config", {}))
+            relation = str(value.get("goal_relation", config.get("preference", "uncertain")))
+            compare_id = str(config.get("compare_region_id", ""))
+            row = {
+                "id": region_id,
+                "game_id": game_id,
+                "created": safe_float(existing.get("created"), safe_float(value.get("created"), now)),
+                "updated": now + index * 0.000001,
+                "region_norm": norm,
+                "region_type": str(value.get("region_type", "number")),
+                "number_format": str(value.get("number_format", "auto")),
+                "goal_relation": relation,
+                "relation_config": config,
+                "target_min": safe_float(value.get("target_min")) if finite_number(value.get("target_min")) else None,
+                "target_max": safe_float(value.get("target_max")) if finite_number(value.get("target_max")) else None,
+                "special_value": (
+                    safe_float(value.get("special_value"))
+                    if finite_number(value.get("special_value"))
+                    else None
+                ),
+                "special_meaning": str(value.get("special_meaning", "uncertain")),
+                "reset_meaning": str(value.get("reset_meaning", "uncertain")),
+                "unit": str(value.get("unit", "")),
+                "enabled": 1 if value.get("enabled", True) else 0,
+                "last_text": str(
+                    value.get("recognized_text", value.get("last_text", existing.get("last_text", "")))
+                )[:256],
+                "last_value": (
+                    safe_float(value.get("last_value"))
+                    if finite_number(value.get("last_value"))
+                    else existing.get("last_value")
+                ),
+                "last_confidence": safe_float(
+                    value.get(
+                        "confidence",
+                        value.get("last_confidence", existing.get("last_confidence", 0.0)),
+                    ),
+                    0.0,
+                    0.0,
+                    1.0,
+                ),
+                "stable_frames": safe_int(value.get("stable_frames", existing.get("stable_frames", 0)), 0, 0, 1000),
+                "compare_region_id": compare_id,
+            }
+            normalized.append(row)
+        for row in normalized:
+            compare_id = row.pop("compare_region_id")
+            if row["goal_relation"] in NUMERIC_COMPARISON_RELATIONS:
+                if not compare_id or compare_id == row["id"] or compare_id not in ids:
+                    raise ValueError("跨区域数字偏好必须引用同一完整保存列表中的另一区域")
+            elif compare_id and compare_id not in ids:
+                row["relation_config"]["compare_region_id"] = ""
+            row["checksum"] = hashlib.sha256(canonical_bytes(ocr_region_checksum_payload(row))).hexdigest()
+        sql = (
+            "INSERT INTO ocr_regions("
+            "id,game_id,created,updated,region_norm,region_type,number_format,"
+            "goal_relation,relation_config,target_min,target_max,special_value,special_meaning,"
+            "reset_meaning,unit,enabled,last_text,last_value,last_confidence,stable_frames,checksum) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        )
+        with self.critical_transaction():
+            self.db.execute("DELETE FROM ocr_regions WHERE game_id=?", (game_id,))
+            for row in normalized:
+                self.db.execute(
+                    sql,
+                    (
+                        row["id"],
+                        row["game_id"],
+                        row["created"],
+                        row["updated"],
+                        json.dumps(row["region_norm"], separators=(",", ":")),
+                        row["region_type"],
+                        row["number_format"],
+                        row["goal_relation"],
+                        json.dumps(row["relation_config"], ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                        row["target_min"],
+                        row["target_max"],
+                        row["special_value"],
+                        row["special_meaning"],
+                        row["reset_meaning"],
+                        row["unit"],
+                        row["enabled"],
+                        row["last_text"],
+                        row["last_value"],
+                        row["last_confidence"],
+                        row["stable_frames"],
+                        row["checksum"],
+                    ),
+                )
+            self.db.execute("UPDATE games SET needs_review=1 WHERE id=?", (game_id,))
+        return [dict(row) for row in normalized]
+
     def list_ocr_regions(self, gid, enabled_only=True):
         query = (
             "SELECT * FROM ocr_regions WHERE game_id=?"
@@ -26591,6 +27101,23 @@ class DataStoreOCRVisionMixin:
                 removed += max(
                     0, int(self.db.execute("DELETE FROM ocr_regions WHERE id=?", (region_id,)).rowcount or 0)
                 )
+            if removed:
+                self.db.execute("UPDATE games SET needs_review=1 WHERE id=?", (str(gid),))
+        return removed
+
+    def delete_ocr_region(self, gid, region_id):
+        self._ensure_writable()
+        with self.lock, self.db:
+            removed = max(
+                0,
+                int(
+                    self.db.execute(
+                        "DELETE FROM ocr_regions WHERE game_id=? AND id=?",
+                        (str(gid), str(region_id)),
+                    ).rowcount
+                    or 0
+                ),
+            )
             if removed:
                 self.db.execute("UPDATE games SET needs_review=1 WHERE id=?", (str(gid),))
         return removed
@@ -26834,6 +27361,7 @@ class DataStore(
             return
         self._initialize_schema()
         self._migrate_legacy()
+        self.recover_game_trash_transactions()
         mode = str(self.db.execute("PRAGMA journal_mode").fetchone()[0]).lower()
         if mode != "wal":
             raise RuntimeError("文件系统不支持SQLite WAL，实际模式为" + mode)
@@ -26983,23 +27511,37 @@ class GameSelectionDialog:
         def confirm():
             nonlocal working_selected
             selection = box.curselection()
-            if not selection:
-                app.show_error("请重新选择一个仍存在的游戏；删除当前游戏后不能提交无效选择")
-                return
-            chosen = working_games[selection[0]]
-            working_selected = chosen["id"]
+            chosen = None
+            if working_games:
+                if not selection:
+                    app.show_error("请先选择一个仍存在的游戏，或删除全部游戏后再确认")
+                    return
+                chosen = working_games[selection[0]]
+                working_selected = chosen["id"]
+            else:
+                working_selected = None
             result = app.store.replace_games(working_games, working_selected)
             clear_runtime_isolation()
             app.window_generation += 1
             app.selected_window = None
-            app.selected_game = dict(chosen)
+            app.selected_game = dict(chosen) if chosen is not None else None
+            app.selected_numeric_region_id = ""
             app._refresh_all()
             deleted = len(result.get("deleted_games", [])) if isinstance(result, dict) else 0
-            app.status.set(
-                "已提交游戏列表并选择："
-                + chosen["name"]
-                + ("；已删除" + str(deleted) + "个游戏及其全部数据" if deleted else "")
-            )
+            assets = safe_int(result.get("deleted_asset_count"), 0) if isinstance(result, dict) else 0
+            if chosen is None:
+                app.status.set(
+                    "已删除全部游戏及相关数据"
+                    + ("；已清理" + str(assets) + "项磁盘资产" if assets else "")
+                    + "；请新建游戏"
+                )
+            else:
+                app.status.set(
+                    "已提交游戏列表并选择："
+                    + chosen["name"]
+                    + ("；已删除" + str(deleted) + "个游戏及其全部数据" if deleted else "")
+                    + ("；已清理" + str(assets) + "项磁盘资产" if assets else "")
+                )
             app.close_dialog(win, state)
 
         def refuse_close():
@@ -27925,6 +28467,924 @@ class TaskSettingsDialog:
         win.focus_force()
 
 
+NUMERIC_PREFERENCE_OPTIONS = OrderedDict(
+    (
+        ("保持不变", "keep_same"),
+        ("越大越好", "higher_better"),
+        ("越小越好", "lower_better"),
+        ("增量越大越好", "increase_more_better"),
+        ("增量越小越好", "increase_less_better"),
+        ("减量越大越好", "decrease_more_better"),
+        ("减量越小越好", "decrease_less_better"),
+        ("大于另一个识别区域内的数字", "greater_than_region"),
+        ("小于另一个识别区域内的数字", "less_than_region"),
+        ("等于另一个识别区域内的数字", "equal_to_region"),
+    )
+)
+NUMERIC_PREFERENCE_LABELS = {value: label for label, value in NUMERIC_PREFERENCE_OPTIONS.items()}
+NUMERIC_COMPARISON_RELATIONS = {"greater_than_region", "less_than_region", "equal_to_region"}
+NUMERIC_OVERLAY_DEFAULT_COLOR = "#FFFFFF"
+NUMERIC_OVERLAY_DEFAULT_OPACITY = 0.50
+NUMERIC_TRACKING_TEMPLATE_W = 16
+NUMERIC_TRACKING_TEMPLATE_H = 8
+NUMERIC_TRACKING_HISTORY_LIMIT = 5
+NUMERIC_TRACKING_LOCAL_LOST_FRAMES = 4
+NUMERIC_TRACKING_EXPANDED_LOST_FRAMES = 12
+NUMERIC_TRACKING_GLOBAL_STRIDE_RATIO = 0.16
+NUMERIC_TRACKING_CONFIRM_FRAMES = 3
+NUMERIC_TRACKING_TEMPLATE_UPDATE_FRAMES = 6
+NUMERIC_TRACKING_PERSIST_FRAMES = 45
+
+
+def _valid_overlay_color(value):
+    token = str(value or "").strip().upper()
+    if re.fullmatch(r"#[0-9A-F]{6}", token):
+        return token
+    return NUMERIC_OVERLAY_DEFAULT_COLOR
+
+
+def _hex_rgb(value):
+    token = _valid_overlay_color(value)
+    return tuple(int(token[index : index + 2], 16) for index in (1, 3, 5))
+
+
+def _clamp_region_norm(norm, minimum=0.015):
+    values = list(norm) if isinstance(norm, (list, tuple)) and len(norm) == 4 else [0.35, 0.42, 0.30, 0.16]
+    x = max(0.0, min(1.0, safe_float(values[0], 0.35)))
+    y = max(0.0, min(1.0, safe_float(values[1], 0.42)))
+    width = max(float(minimum), min(1.0, safe_float(values[2], 0.30)))
+    height = max(float(minimum), min(1.0, safe_float(values[3], 0.16)))
+    if x + width > 1.0:
+        x = max(0.0, 1.0 - width)
+    if y + height > 1.0:
+        y = max(0.0, 1.0 - height)
+    return [round(x, 8), round(y, 8), round(width, 8), round(height, 8)]
+
+
+def _region_descriptor(rgb, width, height, norm, out_w=NUMERIC_TRACKING_TEMPLATE_W, out_h=NUMERIC_TRACKING_TEMPLATE_H):
+    raw = preview_rgb_bytes(rgb)
+    width = safe_int(width, 0, 1, 8192)
+    height = safe_int(height, 0, 1, 8192)
+    if raw is None or len(raw) != width * height * 3:
+        return b""
+    x, y, region_w, region_h = _clamp_region_norm(norm)
+    left = max(0, min(width - 1, int(round(x * (width - 1)))))
+    top = max(0, min(height - 1, int(round(y * (height - 1)))))
+    right = max(left + 1, min(width, int(round((x + region_w) * width))))
+    bottom = max(top + 1, min(height, int(round((y + region_h) * height))))
+    values = bytearray()
+    for out_y in range(max(1, int(out_h))):
+        source_y = min(bottom - 1, top + int((out_y + 0.5) * (bottom - top) / max(1, int(out_h))))
+        for out_x in range(max(1, int(out_w))):
+            source_x = min(right - 1, left + int((out_x + 0.5) * (right - left) / max(1, int(out_w))))
+            offset = (source_y * width + source_x) * 3
+            red, green, blue = raw[offset : offset + 3]
+            values.append((77 * red + 150 * green + 29 * blue) >> 8)
+    return bytes(values)
+
+
+def _descriptor_distance(first, second):
+    if not first or not second or len(first) != len(second):
+        return 1.0
+    first_mean = statistics.fmean(first)
+    second_mean = statistics.fmean(second)
+    contrast = max(18.0, statistics.pstdev(first) + statistics.pstdev(second))
+    centered = statistics.fmean(abs((a - first_mean) - (b - second_mean)) for a, b in zip(first, second))
+    brightness = abs(first_mean - second_mean) * 0.20
+    return max(0.0, min(1.5, (centered + brightness) / contrast))
+
+
+def _tracking_scaled_norm(norm, center_x, center_y, scale_x, scale_y):
+    _, _, width, height = _clamp_region_norm(norm)
+    candidate_w = max(0.015, min(1.0, width * max(0.35, min(2.4, float(scale_x)))))
+    candidate_h = max(0.015, min(1.0, height * max(0.35, min(2.4, float(scale_y)))))
+    return _clamp_region_norm(
+        [center_x - candidate_w * 0.5, center_y - candidate_h * 0.5, candidate_w, candidate_h]
+    )
+
+
+def _candidate_tracking_norms(norm, lost_count):
+    x, y, width, height = _clamp_region_norm(norm)
+    lost = max(0, safe_int(lost_count, 0, 0, 1000))
+    center_x = x + width * 0.5
+    center_y = y + height * 0.5
+    radius_x = min(0.46, max(width * 0.12, 0.012) * (1.0 + min(lost, 16) * 0.38))
+    radius_y = min(0.46, max(height * 0.18, 0.012) * (1.0 + min(lost, 16) * 0.42))
+    if lost < NUMERIC_TRACKING_LOCAL_LOST_FRAMES:
+        offset_levels = (-1.0, 0.0, 1.0)
+        scale_x_values = (0.94, 1.0, 1.06)
+        scale_y_values = (0.94, 1.0, 1.06)
+    else:
+        offset_levels = (-1.0, -0.5, 0.0, 0.5, 1.0)
+        scale_x_values = (0.72, 0.86, 1.0, 1.18, 1.42)
+        scale_y_values = (0.72, 0.86, 1.0, 1.18, 1.42)
+    result = []
+    seen = set()
+    for offset_y in offset_levels:
+        for offset_x in offset_levels:
+            candidate_center_x = center_x + offset_x * radius_x
+            candidate_center_y = center_y + offset_y * radius_y
+            for scale_x in scale_x_values:
+                for scale_y in scale_y_values:
+                    candidate = _tracking_scaled_norm(
+                        norm,
+                        candidate_center_x,
+                        candidate_center_y,
+                        scale_x,
+                        scale_y,
+                    )
+                    key = tuple(round(item, 5) for item in candidate)
+                    if key not in seen:
+                        seen.add(key)
+                        result.append(candidate)
+    return result
+
+
+def _encode_tracking_template(descriptor):
+    return base64.b64encode(bytes(descriptor)).decode("ascii") if descriptor else ""
+
+
+def _decode_tracking_templates(definition):
+    config = normalize_relation_config(definition.get("relation_config", {}))
+    expected = safe_int(config.get("tracking_template_w"), NUMERIC_TRACKING_TEMPLATE_W) * safe_int(
+        config.get("tracking_template_h"), NUMERIC_TRACKING_TEMPLATE_H
+    )
+    tokens = config.get("tracking_templates", [])
+    if not isinstance(tokens, list):
+        tokens = []
+    legacy = str(config.get("tracking_template", ""))
+    if legacy:
+        tokens = [legacy, *tokens]
+    result = []
+    seen = set()
+    for token in tokens:
+        try:
+            raw = base64.b64decode(str(token).encode("ascii"), validate=True)
+        except (ValueError, UnicodeError):
+            continue
+        digest = hashlib.sha256(raw).hexdigest()
+        if len(raw) == expected and digest not in seen:
+            seen.add(digest)
+            result.append(raw)
+        if len(result) >= NUMERIC_TRACKING_HISTORY_LIMIT:
+            break
+    return result
+
+
+def _decode_tracking_template(definition):
+    templates = _decode_tracking_templates(definition)
+    return templates[0] if templates else b""
+
+
+def _tracking_template_distance(templates, descriptor):
+    if not descriptor:
+        return 1.5
+    values = [_descriptor_distance(template, descriptor) for template in templates if template]
+    return min(values) if values else 1.5
+
+
+def _global_tracking_norms(norm):
+    _, _, width, height = _clamp_region_norm(norm)
+    scale_x_values = (0.62, 0.82, 1.0, 1.3, 1.7)
+    scale_y_values = (0.62, 0.82, 1.0, 1.3, 1.7)
+    result = []
+    seen = set()
+    stride_x = max(0.075, min(0.16, width * NUMERIC_TRACKING_GLOBAL_STRIDE_RATIO + 0.055))
+    stride_y = max(0.095, min(0.18, height * NUMERIC_TRACKING_GLOBAL_STRIDE_RATIO + 0.075))
+    rows = max(6, min(9, int(math.ceil(1.0 / stride_y))))
+    columns = max(9, min(13, int(math.ceil(1.0 / stride_x))))
+    for row in range(rows):
+        center_y = (row + 0.5) / rows
+        for column in range(columns):
+            center_x = (column + 0.5) / columns
+            for scale_x in scale_x_values:
+                for scale_y in scale_y_values:
+                    candidate = _tracking_scaled_norm(norm, center_x, center_y, scale_x, scale_y)
+                    key = tuple(round(item, 5) for item in candidate)
+                    if key not in seen:
+                        seen.add(key)
+                        result.append(candidate)
+    return result
+
+
+def _refine_tracking_norms(norm):
+    x, y, width, height = _clamp_region_norm(norm)
+    center_x = x + width * 0.5
+    center_y = y + height * 0.5
+    result = []
+    seen = set()
+    for offset_y in (-0.20, -0.10, 0.0, 0.10, 0.20):
+        for offset_x in (-0.20, -0.10, 0.0, 0.10, 0.20):
+            for scale_x in (0.86, 1.0, 1.16):
+                for scale_y in (0.86, 1.0, 1.16):
+                    candidate = _tracking_scaled_norm(
+                        norm,
+                        center_x + offset_x * width,
+                        center_y + offset_y * height,
+                        scale_x,
+                        scale_y,
+                    )
+                    key = tuple(round(item, 6) for item in candidate)
+                    if key not in seen:
+                        seen.add(key)
+                        result.append(candidate)
+    return result
+
+
+def _rank_tracking_candidates(rgb, width, height, templates, candidates, maximum):
+    ranked = []
+    for candidate in candidates:
+        descriptor = _region_descriptor(rgb, width, height, candidate)
+        ranked.append((_tracking_template_distance(templates, descriptor), candidate, descriptor))
+    ranked.sort(key=lambda item: (item[0], -item[1][2] * item[1][3]))
+    return ranked[: max(1, int(maximum))]
+
+
+def _adaptive_region_candidates(frame, definition, state):
+    rgb = preview_rgb_bytes(frame.get("preview_rgb")) if isinstance(frame, dict) else None
+    width = safe_int(frame.get("preview_width"), PREVIEW_W, 1, 8192) if isinstance(frame, dict) else PREVIEW_W
+    height = safe_int(frame.get("preview_height"), PREVIEW_H, 1, 8192) if isinstance(frame, dict) else PREVIEW_H
+    current = _clamp_region_norm(state.get("norm", definition.get("region_norm")))
+    templates = list(state.get("templates") or _decode_tracking_templates(definition))
+    if not templates and state.get("template"):
+        templates = [state.get("template")]
+    if rgb is None or not templates:
+        return [(0.0, current, b"")]
+    lost = max(0, safe_int(state.get("lost", 0), 0, 0, 1000))
+    local = _rank_tracking_candidates(
+        rgb,
+        width,
+        height,
+        templates,
+        _candidate_tracking_norms(current, lost),
+        16 if lost >= NUMERIC_TRACKING_LOCAL_LOST_FRAMES else 8,
+    )
+    if lost < NUMERIC_TRACKING_EXPANDED_LOST_FRAMES:
+        return local[:8]
+    global_ranked = _rank_tracking_candidates(rgb, width, height, templates, _global_tracking_norms(current), 8)
+    refined = []
+    for _, candidate, _ in global_ranked:
+        refined.extend(_refine_tracking_norms(candidate))
+    refined_ranked = _rank_tracking_candidates(rgb, width, height, templates, refined, 16)
+    merged = local + global_ranked + refined_ranked
+    best_by_norm = {}
+    for item in merged:
+        key = tuple(round(value, 6) for value in item[1])
+        previous = best_by_norm.get(key)
+        if previous is None or item[0] < previous[0]:
+            best_by_norm[key] = item
+    return sorted(best_by_norm.values(), key=lambda item: item[0])[:12]
+
+def numeric_tracking_reacquisition_contract():
+    width = 320
+    height = 180
+
+    def make_frame(norm=None):
+        data = bytearray(width * height * 3)
+        if norm is not None:
+            x, y, region_w, region_h = _clamp_region_norm(norm)
+            left = max(0, min(width - 1, int(x * width)))
+            top = max(0, min(height - 1, int(y * height)))
+            right = max(left + 1, min(width, int((x + region_w) * width)))
+            bottom = max(top + 1, min(height, int((y + region_h) * height)))
+            for row in range(top, bottom):
+                for column in range(left, right):
+                    unit_x = (column - left) / max(1, right - left - 1)
+                    unit_y = (row - top) / max(1, bottom - top - 1)
+                    value = int(25 + 180 * (0.7 * unit_x + 0.3 * unit_y))
+                    if 0.08 < unit_x < 0.16 or 0.41 < unit_x < 0.53 or 0.78 < unit_x < 0.91:
+                        value = 245 - value // 4
+                    if 0.12 < unit_y < 0.24 or 0.63 < unit_y < 0.78:
+                        value = 210 - value // 3
+                    if (int(unit_x * 11) + 2 * int(unit_y * 7)) % 7 == 0:
+                        value = min(255, value + 30)
+                    offset = (row * width + column) * 3
+                    data[offset : offset + 3] = bytes((value, min(255, value + 8), max(0, value - 8)))
+        return {"preview_rgb": bytes(data), "preview_width": width, "preview_height": height}
+
+    initial = [0.08, 0.32, 100.0 / width, 30.0 / height]
+    shifted = [0.48, 0.32, 100.0 / width, 30.0 / height]
+    resized = [0.48, 0.32, 160.0 / width, 45.0 / height]
+    initial_frame = make_frame(initial)
+    template = _region_descriptor(initial_frame["preview_rgb"], width, height, initial)
+    definition = {
+        "region_norm": initial,
+        "relation_config": {
+            "tracking_template": _encode_tracking_template(template),
+            "tracking_templates": [_encode_tracking_template(template)],
+            "tracking_template_w": NUMERIC_TRACKING_TEMPLATE_W,
+            "tracking_template_h": NUMERIC_TRACKING_TEMPLATE_H,
+        },
+    }
+    blank_ranked = _adaptive_region_candidates(
+        make_frame(None),
+        definition,
+        {"norm": initial, "templates": [template], "lost": 30},
+    )
+    shifted_ranked = _adaptive_region_candidates(
+        make_frame(shifted),
+        definition,
+        {"norm": initial, "templates": [template], "lost": 30},
+    )
+    shifted_best = shifted_ranked[0][1]
+    resized_ranked = _adaptive_region_candidates(
+        make_frame(resized),
+        definition,
+        {"norm": shifted_best, "templates": [template], "lost": NUMERIC_TRACKING_EXPANDED_LOST_FRAMES},
+    )
+    resized_best = resized_ranked[0][1]
+    shifted_iou = _rect_iou(shifted_best, shifted)
+    resized_iou = _rect_iou(resized_best, resized)
+    blank_distance = safe_float(blank_ranked[0][0], 0.0) if blank_ranked else 0.0
+    confirmation_bound = NUMERIC_TRACKING_CONFIRM_FRAMES
+    passed = bool(
+        shifted_iou >= 0.75
+        and resized_iou >= 0.55
+        and blank_distance >= 0.70
+        and confirmation_bound <= 3
+    )
+    return passed, {
+        "horizontal_shift_ratio": 0.40,
+        "occluded_frames": 30,
+        "initial_pixels": [100, 30],
+        "resized_pixels": [160, 45],
+        "shift_reacquired_iou": shifted_iou,
+        "shift_required_iou": 0.75,
+        "resize_reacquired_iou": resized_iou,
+        "resize_required_iou": 0.55,
+        "blank_template_distance": blank_distance,
+        "blank_minimum_distance": 0.70,
+        "confirmation_frames": confirmation_bound,
+        "maximum_confirmation_frames": 3,
+        "assertion_passed": passed,
+    }
+
+
+def _blend_numeric_overlays(rgb, width, height, regions):
+    raw = preview_rgb_bytes(rgb)
+    if raw is None or len(raw) != int(width) * int(height) * 3:
+        raw = bytes(int(width) * int(height) * 3)
+    output = bytearray(raw)
+    for region in regions:
+        norm = _clamp_region_norm(region.get("region_norm"))
+        relation_config = normalize_relation_config(region.get("relation_config", {}))
+        color = _hex_rgb(relation_config.get("overlay_color", NUMERIC_OVERLAY_DEFAULT_COLOR))
+        opacity = safe_float(
+            relation_config.get("overlay_opacity", NUMERIC_OVERLAY_DEFAULT_OPACITY),
+            NUMERIC_OVERLAY_DEFAULT_OPACITY,
+            0.0,
+            1.0,
+        )
+        if opacity <= 0.0:
+            continue
+        left = max(0, min(width - 1, int(norm[0] * width)))
+        top = max(0, min(height - 1, int(norm[1] * height)))
+        right = max(left + 1, min(width, int(math.ceil((norm[0] + norm[2]) * width))))
+        bottom = max(top + 1, min(height, int(math.ceil((norm[1] + norm[3]) * height))))
+        inverse = 1.0 - opacity
+        for row in range(top, bottom):
+            offset = (row * width + left) * 3
+            for _ in range(left, right):
+                output[offset] = int(output[offset] * inverse + color[0] * opacity)
+                output[offset + 1] = int(output[offset + 1] * inverse + color[1] * opacity)
+                output[offset + 2] = int(output[offset + 2] * inverse + color[2] * opacity)
+                offset += 3
+    return bytes(output)
+
+
+class NumericRegionEditor:
+    HANDLE_NAMES = ("nw", "n", "ne", "e", "se", "s", "sw", "w")
+
+    def __init__(self, app, frame):
+        self.app = app
+        self.frame = dict(frame)
+        self.game = app.require_game()
+        self.preview_width = safe_int(self.frame.get("preview_width"), PREVIEW_W, 1, 8192)
+        self.preview_height = safe_int(self.frame.get("preview_height"), PREVIEW_H, 1, 8192)
+        self.preview_rgb = preview_rgb_bytes(self.frame.get("preview_rgb")) or bytes(
+            self.preview_width * self.preview_height * 3
+        )
+        self.canvas_width = 640
+        self.canvas_height = 360
+        self.scale_x = self.canvas_width / self.preview_width
+        self.scale_y = self.canvas_height / self.preview_height
+        self.original_ids = {str(item.get("id")) for item in app.store.list_ocr_regions(self.game["id"], False)}
+        self.regions = [self._normalize_region(item) for item in app.store.list_ocr_regions(self.game["id"], False)]
+        self.selected_id = self.regions[0]["id"] if self.regions else None
+        self.drag_state = None
+        self.photo = None
+        self.closed = False
+        self.win = tk.Toplevel(app.root)
+        self.win.title("数字识别区域")
+        fit_window(self.win, 1080, 720, 900, 620)
+        self.win.transient(app.root)
+        self.win.protocol("WM_DELETE_WINDOW", self.cancel_and_close)
+        self.win.bind("<Escape>", lambda event: self.cancel_and_close())
+        self._build()
+        self.refresh_all()
+        self.win.wait_visibility()
+        self.win.grab_set()
+        self.win.focus_force()
+
+    def _normalize_region(self, item):
+        value = dict(item) if isinstance(item, dict) else {}
+        config = normalize_relation_config(value.get("relation_config", {}))
+        region_id = str(value.get("id") or uuid.uuid4().hex)
+        config["display_name"] = str(
+            config.get("display_name")
+            or "数字区域" + str(len(getattr(self, "regions", ())) + 1)
+        )
+        config["overlay_color"] = _valid_overlay_color(config.get("overlay_color"))
+        config["overlay_opacity"] = safe_float(
+            config.get("overlay_opacity", NUMERIC_OVERLAY_DEFAULT_OPACITY),
+            NUMERIC_OVERLAY_DEFAULT_OPACITY,
+            0.0,
+            1.0,
+        )
+        preference = str(config.get("preference") or value.get("goal_relation") or "keep_same")
+        if preference not in NUMERIC_PREFERENCE_LABELS:
+            preference = "keep_same"
+        config["preference"] = preference
+        config["compare_region_id"] = str(config.get("compare_region_id", ""))
+        value.update(
+            {
+                "id": region_id,
+                "game_id": str(self.game["id"]),
+                "region_norm": _clamp_region_norm(value.get("region_norm")),
+                "region_type": "number",
+                "number_format": str(value.get("number_format", "auto")),
+                "goal_relation": preference,
+                "relation_config": config,
+                "enabled": 1,
+            }
+        )
+        return value
+
+    def _build(self):
+        outer = ttk.Frame(self.win, padding=12)
+        outer.pack(fill="both", expand=True)
+        top = ttk.Frame(outer)
+        top.pack(fill="both", expand=True)
+        left = ttk.LabelFrame(top, text="区域", padding=8)
+        left.pack(side="left", fill="y", padx=(0, 10))
+        self.listbox = tk.Listbox(left, width=28, exportselection=False)
+        self.listbox.pack(fill="both", expand=True)
+        self.listbox.bind("<<ListboxSelect>>", self._list_selected)
+        tools = ttk.Frame(left)
+        tools.pack(fill="x", pady=(8, 0))
+        ttk.Button(tools, text="新建", command=self.new_region).grid(row=0, column=0, sticky="ew", padx=2)
+        ttk.Button(tools, text="编辑", command=self.edit_region).grid(row=0, column=1, sticky="ew", padx=2)
+        ttk.Button(tools, text="删除", command=self.delete_region).grid(
+            row=1, column=0, sticky="ew", padx=2, pady=(4, 0)
+        )
+        ttk.Button(tools, text="选择", command=self.select_from_list).grid(
+            row=1, column=1, sticky="ew", padx=2, pady=(4, 0)
+        )
+        for column in range(2):
+            tools.columnconfigure(column, weight=1)
+
+        right = ttk.Frame(top)
+        right.pack(side="left", fill="both", expand=True)
+        ttk.Label(
+            right,
+            text=(
+                "覆盖数字的大致位置即可。点击覆盖层选中；点击空白取消；"
+                "拖内部移动；拖边缘或角点缩放。"
+            ),
+            wraplength=760,
+        ).pack(anchor="w", pady=(0, 6))
+        self.canvas = tk.Canvas(
+            right,
+            width=self.canvas_width,
+            height=self.canvas_height,
+            bg="black",
+            highlightthickness=1,
+            highlightbackground="#777777",
+            cursor="crosshair",
+        )
+        self.canvas.pack(anchor="center")
+        self.canvas.bind("<Button-1>", self.canvas_press)
+        self.canvas.bind("<B1-Motion>", self.canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.canvas_release)
+
+        form = ttk.LabelFrame(outer, text="所选区域设置", padding=10)
+        form.pack(fill="x", pady=(10, 0))
+        self.name_var = tk.StringVar()
+        self.preference_var = tk.StringVar(value="保持不变")
+        self.compare_var = tk.StringVar()
+        self.opacity_var = tk.DoubleVar(value=50.0)
+        self.color_text = tk.StringVar(value=NUMERIC_OVERLAY_DEFAULT_COLOR)
+        ttk.Label(form, text="名称").grid(row=0, column=0, sticky="w")
+        self.name_entry = ttk.Entry(form, textvariable=self.name_var, width=22)
+        self.name_entry.grid(row=0, column=1, sticky="ew", padx=(6, 12))
+        ttk.Label(form, text="数字偏好").grid(row=0, column=2, sticky="w")
+        self.preference_box = ttk.Combobox(
+            form,
+            textvariable=self.preference_var,
+            values=list(NUMERIC_PREFERENCE_OPTIONS),
+            state="readonly",
+            width=28,
+        )
+        self.preference_box.grid(row=0, column=3, sticky="ew", padx=(6, 12))
+        self.preference_box.bind("<<ComboboxSelected>>", lambda event: self._preference_changed())
+        ttk.Label(form, text="另一区域").grid(row=0, column=4, sticky="w")
+        self.compare_box = ttk.Combobox(form, textvariable=self.compare_var, state="readonly", width=24)
+        self.compare_box.grid(row=0, column=5, sticky="ew", padx=(6, 0))
+
+        ttk.Label(form, text="颜色").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        color_row = ttk.Frame(form)
+        color_row.grid(row=1, column=1, sticky="ew", padx=(6, 12), pady=(8, 0))
+        ttk.Label(color_row, textvariable=self.color_text, width=10).pack(side="left")
+        ttk.Button(color_row, text="选择颜色", command=self.choose_color).pack(side="left", padx=(6, 0))
+        ttk.Label(form, text="透明度").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        self.opacity_scale = tk.Scale(
+            form,
+            from_=0,
+            to=100,
+            resolution=1,
+            orient="horizontal",
+            variable=self.opacity_var,
+            showvalue=True,
+            command=lambda value: self.apply_form(live=True),
+            length=260,
+        )
+        self.opacity_scale.grid(row=1, column=3, columnspan=2, sticky="ew", padx=(6, 12), pady=(8, 0))
+        ttk.Button(form, text="应用编辑", command=self.apply_form).grid(row=1, column=5, sticky="e", pady=(8, 0))
+        for column in (1, 3, 5):
+            form.columnconfigure(column, weight=1)
+
+        bottom = ttk.Frame(outer)
+        bottom.pack(fill="x", pady=(10, 0))
+        self.info = tk.StringVar(value="")
+        ttk.Label(bottom, textvariable=self.info, wraplength=820).pack(side="left", fill="x", expand=True)
+        ttk.Button(bottom, text="取消", command=self.cancel_and_close).pack(side="right")
+        ttk.Button(bottom, text="保存", command=self.save_and_close).pack(side="right", padx=(0, 8))
+
+    def current(self):
+        for region in self.regions:
+            if str(region.get("id")) == str(self.selected_id):
+                return region
+        return None
+
+    def display_name(self, region):
+        config = normalize_relation_config(region.get("relation_config", {}))
+        return str(config.get("display_name") or "数字区域")
+
+    def refresh_list(self):
+        self.listbox.delete(0, "end")
+        selected_index = None
+        for index, region in enumerate(self.regions):
+            label = self.display_name(region)
+            preference = NUMERIC_PREFERENCE_LABELS.get(str(region.get("goal_relation")), "保持不变")
+            self.listbox.insert("end", label + "  ·  " + preference)
+            if str(region.get("id")) == str(self.selected_id):
+                selected_index = index
+        if selected_index is not None:
+            self.listbox.selection_set(selected_index)
+            self.listbox.see(selected_index)
+
+    def refresh_form(self):
+        region = self.current()
+        state = "normal" if region is not None else "disabled"
+        if region is None:
+            self.name_var.set("")
+            self.preference_var.set("保持不变")
+            self.compare_var.set("")
+            self.color_text.set(NUMERIC_OVERLAY_DEFAULT_COLOR)
+            self.opacity_var.set(50.0)
+            self.compare_box.configure(values=(), state="disabled")
+            return
+        config = normalize_relation_config(region.get("relation_config", {}))
+        self.name_var.set(str(config.get("display_name", "数字区域")))
+        relation = str(config.get("preference", region.get("goal_relation", "keep_same")))
+        self.preference_var.set(NUMERIC_PREFERENCE_LABELS.get(relation, "保持不变"))
+        self.color_text.set(_valid_overlay_color(config.get("overlay_color")))
+        self.opacity_var.set(
+            safe_float(config.get("overlay_opacity", NUMERIC_OVERLAY_DEFAULT_OPACITY), 0.5, 0.0, 1.0) * 100.0
+        )
+        options = []
+        target_by_display = {}
+        for item in self.regions:
+            if str(item.get("id")) == str(region.get("id")):
+                continue
+            display = self.display_name(item) + " [" + str(item.get("id"))[:6] + "]"
+            options.append(display)
+            target_by_display[display] = str(item.get("id"))
+        self.compare_target_by_display = target_by_display
+        self.compare_box.configure(values=options)
+        target_id = str(config.get("compare_region_id", ""))
+        chosen = next((display for display, rid in target_by_display.items() if rid == target_id), "")
+        self.compare_var.set(chosen)
+        self._preference_changed(update=False)
+
+    def refresh_canvas(self):
+        composite = _blend_numeric_overlays(self.preview_rgb, self.preview_width, self.preview_height, self.regions)
+        ppm = (
+            b"P6\n"
+            + str(self.preview_width).encode("ascii")
+            + b" "
+            + str(self.preview_height).encode("ascii")
+            + b"\n255\n"
+            + composite
+        )
+        image = tk.PhotoImage(data=base64.b64encode(ppm).decode("ascii"), format="PPM")
+        zoom_x = max(1, int(round(self.scale_x)))
+        zoom_y = max(1, int(round(self.scale_y)))
+        scaled = image.zoom(zoom_x, zoom_y)
+        self.photo = (image, scaled)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, image=scaled, anchor="nw")
+        for region in self.regions:
+            x, y, width, height = self.canvas_rect(region)
+            selected = str(region.get("id")) == str(self.selected_id)
+            config = normalize_relation_config(region.get("relation_config", {}))
+            color = _valid_overlay_color(config.get("overlay_color"))
+            self.canvas.create_rectangle(
+                x,
+                y,
+                x + width,
+                y + height,
+                outline="#00E5FF" if selected else color,
+                width=3 if selected else 1,
+            )
+            self.canvas.create_text(
+                x + 4,
+                y + 4,
+                text=self.display_name(region),
+                fill="#00E5FF" if selected else color,
+                anchor="nw",
+                font=("Microsoft YaHei UI", 9, "bold"),
+            )
+            if selected:
+                for _, hx, hy in self.handle_points(region):
+                    self.canvas.create_rectangle(hx - 5, hy - 5, hx + 5, hy + 5, fill="white", outline="#007A8C")
+
+    def refresh_all(self):
+        self.refresh_list()
+        self.refresh_form()
+        self.refresh_canvas()
+        self.info.set(
+            "已定义 "
+            + str(len(self.regions))
+            + " 个区域；初始覆盖层为白色、50%透明度。"
+            + "人和AI运行时覆盖层隐藏，后台自动跟踪位置与大小。"
+        )
+
+    def canvas_rect(self, region):
+        x, y, width, height = _clamp_region_norm(region.get("region_norm"))
+        return x * self.canvas_width, y * self.canvas_height, width * self.canvas_width, height * self.canvas_height
+
+    def handle_points(self, region):
+        x, y, width, height = self.canvas_rect(region)
+        return (
+            ("nw", x, y),
+            ("n", x + width / 2, y),
+            ("ne", x + width, y),
+            ("e", x + width, y + height / 2),
+            ("se", x + width, y + height),
+            ("s", x + width / 2, y + height),
+            ("sw", x, y + height),
+            ("w", x, y + height / 2),
+        )
+
+    def hit_handle(self, region, px, py):
+        for name, hx, hy in self.handle_points(region):
+            if abs(px - hx) <= 9 and abs(py - hy) <= 9:
+                return name
+        return None
+
+    def hit_region(self, px, py):
+        for region in reversed(self.regions):
+            x, y, width, height = self.canvas_rect(region)
+            if x <= px <= x + width and y <= py <= y + height:
+                return region
+        return None
+
+    def canvas_press(self, event):
+        selected = self.current()
+        handle = self.hit_handle(selected, event.x, event.y) if selected is not None else None
+        target = selected if handle else self.hit_region(event.x, event.y)
+        if target is None:
+            self.selected_id = None
+            self.drag_state = None
+            self.refresh_all()
+            return
+        self.selected_id = str(target.get("id"))
+        if handle is None:
+            handle = "move"
+        self.drag_state = {
+            "mode": handle,
+            "start": (event.x / self.canvas_width, event.y / self.canvas_height),
+            "norm": list(_clamp_region_norm(target.get("region_norm"))),
+        }
+        self.refresh_all()
+
+    def canvas_drag(self, event):
+        region = self.current()
+        if region is None or not self.drag_state:
+            return
+        start_x, start_y = self.drag_state["start"]
+        current_x = max(0.0, min(1.0, event.x / self.canvas_width))
+        current_y = max(0.0, min(1.0, event.y / self.canvas_height))
+        dx, dy = current_x - start_x, current_y - start_y
+        x, y, width, height = self.drag_state["norm"]
+        mode = self.drag_state["mode"]
+        minimum = 0.015
+        if mode == "move":
+            x = max(0.0, min(1.0 - width, x + dx))
+            y = max(0.0, min(1.0 - height, y + dy))
+        else:
+            left, top, right, bottom = x, y, x + width, y + height
+            if "w" in mode:
+                left = max(0.0, min(right - minimum, left + dx))
+            if "e" in mode:
+                right = min(1.0, max(left + minimum, right + dx))
+            if "n" in mode:
+                top = max(0.0, min(bottom - minimum, top + dy))
+            if "s" in mode:
+                bottom = min(1.0, max(top + minimum, bottom + dy))
+            x, y, width, height = left, top, right - left, bottom - top
+        region["region_norm"] = _clamp_region_norm([x, y, width, height], minimum)
+        self.refresh_canvas()
+
+    def canvas_release(self, event):
+        self.drag_state = None
+        self._refresh_tracking_template(self.current())
+        self.refresh_list()
+
+    def _list_selected(self, event=None):
+        selection = self.listbox.curselection()
+        if selection and selection[0] < len(self.regions):
+            self.selected_id = str(self.regions[selection[0]].get("id"))
+            self.refresh_form()
+            self.refresh_canvas()
+
+    def select_from_list(self):
+        self._list_selected()
+        self.canvas.focus_set()
+
+    def new_region(self):
+        index = len(self.regions) + 1
+        offset = min(0.24, (index - 1) * 0.025)
+        region = self._normalize_region(
+            {
+                "id": uuid.uuid4().hex,
+                "region_norm": [0.35 + offset, 0.42 + offset, 0.30, 0.16],
+                "goal_relation": "keep_same",
+                "relation_config": {
+                    "display_name": "数字区域" + str(index),
+                    "overlay_color": NUMERIC_OVERLAY_DEFAULT_COLOR,
+                    "overlay_opacity": NUMERIC_OVERLAY_DEFAULT_OPACITY,
+                    "preference": "keep_same",
+                    "compare_region_id": "",
+                },
+            }
+        )
+        self.regions.append(region)
+        self.selected_id = region["id"]
+        self._refresh_tracking_template(region)
+        self.refresh_all()
+        self.name_entry.focus_set()
+        self.name_entry.selection_range(0, "end")
+
+    def edit_region(self):
+        if self.current() is None:
+            self.info.set("请先选择一个覆盖层或列表项")
+            return
+        self.name_entry.focus_set()
+        self.name_entry.selection_range(0, "end")
+
+    def delete_region(self):
+        region = self.current()
+        if region is None:
+            self.info.set("请先选择要删除的区域")
+            return
+        self.regions = [item for item in self.regions if str(item.get("id")) != str(region.get("id"))]
+        for item in self.regions:
+            config = normalize_relation_config(item.get("relation_config", {}))
+            if str(config.get("compare_region_id")) == str(region.get("id")):
+                config["compare_region_id"] = ""
+                if str(config.get("preference")) in NUMERIC_COMPARISON_RELATIONS:
+                    config["preference"] = "keep_same"
+                    item["goal_relation"] = "keep_same"
+                item["relation_config"] = config
+        self.selected_id = self.regions[0]["id"] if self.regions else None
+        self.refresh_all()
+
+    def _preference_changed(self, update=True):
+        relation = NUMERIC_PREFERENCE_OPTIONS.get(self.preference_var.get(), "keep_same")
+        enabled = relation in NUMERIC_COMPARISON_RELATIONS and bool(getattr(self, "compare_target_by_display", {}))
+        self.compare_box.configure(state="readonly" if enabled else "disabled")
+        if not enabled:
+            self.compare_var.set("")
+        if update:
+            self.apply_form(live=True)
+
+    def choose_color(self):
+        region = self.current()
+        if region is None:
+            return
+        try:
+            from tkinter import colorchooser
+
+            chosen = colorchooser.askcolor(
+                color=self.color_text.get(), parent=self.win, title="选择覆盖层颜色"
+            )[1]
+        except (ImportError, tk.TclError):
+            chosen = None
+        if chosen:
+            self.color_text.set(_valid_overlay_color(chosen))
+            self.apply_form(live=True)
+
+    def apply_form(self, live=False):
+        region = self.current()
+        if region is None:
+            return
+        config = normalize_relation_config(region.get("relation_config", {}))
+        name = self.name_var.get().strip() or self.display_name(region)
+        config["display_name"] = name[:80]
+        config["overlay_color"] = _valid_overlay_color(self.color_text.get())
+        config["overlay_opacity"] = safe_float(self.opacity_var.get(), 50.0, 0.0, 100.0) / 100.0
+        relation = NUMERIC_PREFERENCE_OPTIONS.get(self.preference_var.get(), "keep_same")
+        config["preference"] = relation
+        if relation in NUMERIC_COMPARISON_RELATIONS:
+            target = getattr(self, "compare_target_by_display", {}).get(self.compare_var.get(), "")
+            config["compare_region_id"] = str(target)
+        else:
+            config["compare_region_id"] = ""
+        region["goal_relation"] = relation
+        region["relation_config"] = config
+        if not live:
+            self._refresh_tracking_template(region)
+        self.refresh_list()
+        self.refresh_canvas()
+
+    def _refresh_tracking_template(self, region):
+        if region is None:
+            return
+        descriptor = _region_descriptor(
+            self.preview_rgb,
+            self.preview_width,
+            self.preview_height,
+            region.get("region_norm"),
+        )
+        if not descriptor:
+            return
+        config = normalize_relation_config(region.get("relation_config", {}))
+        templates = [_encode_tracking_template(descriptor)]
+        for template in _decode_tracking_templates(region):
+            encoded = _encode_tracking_template(template)
+            if encoded and encoded not in templates:
+                templates.append(encoded)
+            if len(templates) >= NUMERIC_TRACKING_HISTORY_LIMIT:
+                break
+        config.update(
+            {
+                "tracking_template": templates[0],
+                "tracking_templates": templates,
+                "tracking_template_w": NUMERIC_TRACKING_TEMPLATE_W,
+                "tracking_template_h": NUMERIC_TRACKING_TEMPLATE_H,
+                "tracking_search": "local_template_expanded_then_global_coarse_to_fine",
+                "tracking_independent_scales": True,
+                "tracking_occlusion_recovery": True,
+                "tracking_update_confirmation_frames": NUMERIC_TRACKING_CONFIRM_FRAMES,
+                "tracking_persist_stable": bool(config.get("tracking_persist_stable", False)),
+            }
+        )
+        region["relation_config"] = config
+
+    def _close_without_saving(self):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.win.grab_release()
+        except tk.TclError:
+            pass
+        self.win.destroy()
+
+    def cancel_and_close(self):
+        self.app.status.set("已取消数字识别区域编辑，未保存任何修改")
+        self._close_without_saving()
+
+    def save_and_close(self):
+        if self.closed:
+            return
+        try:
+            self.apply_form(live=False)
+            for region in self.regions:
+                self._refresh_tracking_template(region)
+            saved = self.app.store.replace_ocr_regions(self.game["id"], self.regions)
+            self.app.selected_numeric_region_id = str(self.selected_id or "")
+            self.app.status.set("数字识别区域已保存：" + str(len(saved)) + " 个")
+            self.app._refresh_all()
+        except RECOVERABLE_ERRORS as error:
+            self.app.show_error("保存数字识别区域失败：" + str(error))
+            return
+        self._close_without_saving()
+
+
+
 class AppServiceBase:
     __slots__ = ("app",)
 
@@ -27973,17 +29433,17 @@ class AppUiService(AppServiceBase):
         ttk.Label(setup, textvariable=self.data_dir_text, wraplength=740).grid(
             row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10)
         )
-        choose = ttk.Button(setup, text="选择文件夹", command=self.choose_data_directory, style="Primary.TButton")
+        choose = ttk.Button(setup, text="文件夹", command=self.choose_data_directory, style="Primary.TButton")
         integrity = ttk.Button(
-            setup, text="检查文件完整性", command=self.start_integrity_check, style="Workflow.TButton"
+            setup, text="文件", command=self.start_integrity_check, style="Workflow.TButton"
         )
         choose.grid(row=1, column=0, sticky="ew", padx=(0, 6))
         integrity.grid(row=1, column=1, sticky="ew", padx=(6, 0))
         setup.columnconfigure(0, weight=1)
         setup.columnconfigure(1, weight=1)
         self.directory_button = choose
-        self.control_buttons["选择文件夹"] = choose
-        self.control_buttons["检查文件完整性"] = integrity
+        self.control_buttons["文件夹"] = choose
+        self.control_buttons["文件"] = integrity
         self.controls.extend([choose, integrity])
 
         flow = ttk.LabelFrame(outer, text="操作流程", style="Card.TLabelframe")
@@ -27992,9 +29452,9 @@ class AppUiService(AppServiceBase):
             ("游戏名称", self.open_game_dialog),
             ("选择窗口", self.open_window_dialog),
             (MODE_LABELS[ModeId.COLLECT], self.start_learning),
+            (MODE_LABELS[ModeId.QUIZ], self.start_ask),
             (MODE_LABELS[ModeId.UPGRADE], self.start_sleep),
             (MODE_LABELS[ModeId.AI], self.start_training),
-            (MODE_LABELS[ModeId.QUIZ], self.start_ask),
         ]
         for index, (name, command) in enumerate(primary_specs):
             button = ttk.Button(flow, text=name, command=command, style="Workflow.TButton")
@@ -28481,7 +29941,7 @@ class AppUiService(AppServiceBase):
         result = {
             "unchanged": False,
             "signature": signature,
-            "game_text": game.get("name", "未选择") if game_ready else "未选择",
+            "game_text": game.get("name", "未选择") if game_ready else "请新建游戏",
             "window_text": "未选择",
             "window_detail": "PID：-  类名：-  客户区：-  游戏区域：-",
             "capture_text": "采集方式：未检测",
@@ -28804,6 +30264,23 @@ class AppUiService(AppServiceBase):
 
     def open_window_dialog(self):
         return WindowSelectionDialog(self).open()
+
+    def open_numeric_region_dialog(self):
+        if self.mode:
+            self.show_error("请先按ESC结束当前模式")
+            return
+        try:
+            self.require_ai_runtime()
+            self.require_game()
+            target = self.require_window(False)
+            self.status.set("正在对当前游戏区域截图一次…")
+            self.root.update_idletasks()
+            frame = self.api.capture_gray(target, False, False, True)
+            if not frame.get("capture_valid") or preview_rgb_bytes(frame.get("preview_rgb")) is None:
+                raise CaptureUnavailable("当前游戏区域截图不可用")
+            NumericRegionEditor(self.app, frame)
+        except RECOVERABLE_ERRORS as error:
+            self.show_error("无法打开数字识别区域：" + str(error))
 
     def open_task_dialog(self):
         return TaskSettingsDialog(self).open()
@@ -29267,7 +30744,7 @@ class AppLifecycleService(AppServiceBase):
             return
         if result.status == "failed" or error:
             self.show_error(error or result.summary)
-        elif result.status == "completed" and name in {"检查文件完整性", MODE_LABELS[ModeId.UPGRADE]}:
+        elif result.status == "completed" and name in {"文件", MODE_LABELS[ModeId.UPGRADE]}:
             self.show_main_confirmation(name, result.summary)
         else:
             self.status.set(result.summary)
@@ -29479,7 +30956,7 @@ class AppLifecycleService(AppServiceBase):
                 self.ai_worker.request_stop()
             except RECOVERABLE_ERRORS as error:
                 record_cleanup_error("BEST_EFFORT_EXCEPTION", error)
-        if name == "检查文件完整性" and self.runtime_installer is not None:
+        if name == "文件" and self.runtime_installer is not None:
             try:
                 self.runtime_installer.stop()
             except RECOVERABLE_ERRORS as error:
@@ -31416,7 +32893,7 @@ class AppModeService(AppServiceBase):
         if self.mode != ModeId.QUIZ.value and self.ask_window is None:
             return
         status = "completed" if str(reason) == "completed" else "stopped"
-        text = "用户结束做题" if status == "completed" else "做题已停止"
+        text = "用户结束数" if status == "completed" else "数已停止"
         self.request_mode_stop(status, text)
 
 
@@ -31565,7 +33042,7 @@ class AppStorageService(AppServiceBase):
         if self.mode_state != MODE_IDLE or self.closing:
             self.show_error("运行模式期间不能切换文件夹")
             return
-        button = self.control_buttons.get("选择文件夹")
+        button = self.control_buttons.get("文件夹")
         candidate = self.prepared_directory
         if candidate is not None:
             if button is not None:
@@ -31585,7 +33062,7 @@ class AppStorageService(AppServiceBase):
                 self.progress_value.set(0.0)
                 self._restore_directory_display()
                 if button is not None:
-                    button.configure(text="选择文件夹")
+                    button.configure(text="文件夹")
                 self._update_control_availability()
                 self.show_error("确认切换失败，原目录未改变：" + str(error))
                 return
@@ -31594,7 +33071,7 @@ class AppStorageService(AppServiceBase):
             self.pending_directory = None
             self.lifecycle.set_directory_phase("ready")
             if button is not None:
-                button.configure(text="选择文件夹")
+                button.configure(text="文件夹")
             self.data_dir_text.set(str(self.data_directory))
             self.progress_value.set(100.0)
             self.status.set("文件夹已确认：" + str(self.data_directory))
@@ -31660,7 +33137,7 @@ class AppStorageService(AppServiceBase):
             self.progress_value.set(0.0)
             self._restore_directory_display()
             if button is not None:
-                button.configure(text="选择文件夹")
+                button.configure(text="文件夹")
             self._update_control_availability()
             if not self.closing and not isinstance(error, InputStopped):
                 self.show_error("目录准备失败，当前目录未改变：" + str(error))
@@ -31847,7 +33324,7 @@ class AppStorageService(AppServiceBase):
                 "sha256": target_main_hash,
                 "popup": False,
                 "global_input_lock": False,
-                "button_sequence": ["选择文件夹", "确认"],
+                "button_sequence": ["文件夹", "确认"],
             }
             for case in (
                 "folder_picker_direct",
@@ -32222,10 +33699,10 @@ class AppStorageService(AppServiceBase):
         else:
             visual_panel = "未就绪"
             if self.store is None:
-                self.confidence_text.set("离线AI运行库：请先选择文件夹")
+                self.confidence_text.set("离线AI运行库：请先文件夹")
             else:
                 self.confidence_text.set(
-                    "离线AI运行库未就绪，请点击“检查文件完整性”；视觉="
+                    "离线AI运行库未就绪，请点击“文件”；视觉="
                     + str(getattr(vision, "error", "未初始化"))
                     + "；OCR="
                     + str(getattr(ocr, "error", "未初始化"))
@@ -32293,7 +33770,7 @@ class AppStorageService(AppServiceBase):
             self.show_error("请先选择并确认文件夹")
             return False
         return self._start_mode_transaction(
-            "检查文件完整性", self.integrity_check_worker, False, False, "正在检查并补齐独立运行库文件；按ESC可提前结束"
+            "文件", self.integrity_check_worker, False, False, "正在自动检查、下载、修复并删除无效文件；按ESC可提前结束"
         )
 
     def start_download(self):
@@ -32356,7 +33833,7 @@ class AppStorageService(AppServiceBase):
         )
         return ModeResult(
             "completed",
-            "文件完整性检查完成；视觉："
+            "文件处理完成；视觉："
             + vision_text
             + "；OCR："
             + ocr_text
@@ -32421,6 +33898,8 @@ class App:
         return self.ui_service.open_game_dialog(*args, **kwargs)
     def open_window_dialog(self, *args, **kwargs):
         return self.ui_service.open_window_dialog(*args, **kwargs)
+    def open_numeric_region_dialog(self, *args, **kwargs):
+        return self.ui_service.open_numeric_region_dialog(*args, **kwargs)
     def open_task_dialog(self, *args, **kwargs):
         return self.ui_service.open_task_dialog(*args, **kwargs)
     def open_data_dialog(self, *args, **kwargs):
@@ -32518,7 +33997,7 @@ class App:
     def basic_actions(self, *args, **kwargs):
         return self.mode_service.basic_actions(*args, **kwargs)
     def start_ask(self, *args, **kwargs):
-        return self.mode_service.start_ask(*args, **kwargs)
+        return self.ui_service.open_numeric_region_dialog(*args, **kwargs)
     def _create_ask_window(self, *args, **kwargs):
         return self.mode_service._create_ask_window(*args, **kwargs)
     def close_ask(self, *args, **kwargs):
@@ -32603,6 +34082,7 @@ class App:
         self.active_ocr_monitor = None
         self.selected_game = None
         self.selected_window = None
+        self.selected_numeric_region_id = ""
         self.window_recommendation = None
         self.window_generation = 0
         self.mode_session_id = ""
@@ -32664,7 +34144,7 @@ class App:
         self.review_controller = ReviewController(self)
         self.training_controller = TrainingController(self)
         self.teaching_controller = TeachingController(self)
-        self.status = tk.StringVar(value="请选择文件夹")
+        self.status = tk.StringVar(value="请文件夹")
         self.header_status_text = tk.StringVar(value="当前：待配置")
         self.data_dir_text = tk.StringVar(value="未选择")
         self.game_text = tk.StringVar(value="未选择")
@@ -32743,8 +34223,8 @@ class App:
         directory_phase = self.lifecycle.directory_phase
         directory_busy = directory_phase in {"preparing", "prepared"}
         mapping = {
-            "选择文件夹": not running and directory_phase != "preparing",
-            "检查文件完整性": not running and data_ready and not directory_busy,
+            "文件夹": not running and directory_phase != "preparing",
+            "文件": not running and data_ready and not directory_busy,
             "游戏名称": not running and runtime_ready and not directory_busy,
             "选择窗口": not running and runtime_ready and game_ready and not directory_busy,
             MODE_LABELS[ModeId.COLLECT]: not running
@@ -32782,10 +34262,10 @@ class App:
                 }
             )
         recommended = (
-            "选择文件夹"
+            "文件夹"
             if not data_ready or directory_phase == "prepared"
             else (
-                "检查文件完整性"
+                "文件"
                 if not runtime_ready
                 else "游戏名称" if not game_ready else "选择窗口" if not window_ready else MODE_LABELS[ModeId.COLLECT]
             )
@@ -33114,7 +34594,7 @@ class App:
             "passed",
             {"mode": str(name), "release_called": True, "forced": details.get("forced_processes", [])},
         )
-        if str(name) == "检查文件完整性":
+        if str(name) == "文件":
             runtime = details.get("runtime", {}) if isinstance(details.get("runtime"), dict) else {}
             embedded = (
                 runtime.get("resolution_source") == "embedded"
@@ -33671,7 +35151,7 @@ class WindowsSmokeTest:
 
     def _set_manual_requirements(self):
         self.context.report["manual_required"] = [
-            "按真实顺序完成：原生文件夹选择器选择与取消、确认、运行所选目录main.py、检查文件完整性、游戏增删改选确认、选择雷电与普通窗口确认、人、做题、升级、AI；普通成功流程不得出现确认弹窗",
+            "按真实顺序完成：原生文件夹选择器选择与取消、确认、运行所选目录main.py、文件、游戏增删改选确认、选择雷电与普通窗口确认、人、数、升级、AI；普通成功流程不得出现确认弹窗",
             "在数据库复制、SHA-256校验、schema迁移和原子替换阶段分别强制结束进程，确认旧目录完整、临时目录清理且可安全重试",
             "在STARTING、RUNNING、STOPPING阶段分别按ESC，测量ESC到输入锁定、全部鼠标键/键盘键/手柄轴释放的P99延迟",
             "使用真实外部鼠标、键盘和XInput手柄验证采集、人工干预停机、反向顺序释放与进程异常退出释放",
@@ -33767,7 +35247,7 @@ class WindowsSmokeTest:
             "inline_confirm": True,
             "success_popup": False,
             "global_input_lock": False,
-            "buttons": ["选择文件夹", "确认"],
+            "buttons": ["文件夹", "确认"],
         }
         for case in (
             "folder_picker_direct",
@@ -34175,7 +35655,7 @@ def run_acceptance_test(path=None):
 
 EXTENSION_SCHEMA_VERSION = 5
 VISION_ARCHITECTURE_VERSION = 3
-OCR_SEMANTIC_VERSION = 2
+OCR_SEMANTIC_VERSION = 3
 
 
 class SemanticEventHub:
@@ -38861,7 +40341,7 @@ class OfflineOCRRuntime:
         if not self.ready:
             self._load_runtime()
         if not self.ready:
-            raise RuntimeError("OCR运行库不可用，请先点击“检查文件完整性”：" + self.error)
+            raise RuntimeError("OCR运行库不可用，请先点击“文件”：" + self.error)
         return True
 
     def _array(self, rgb, width, height):
@@ -40609,6 +42089,323 @@ class OCRMonitor:
 
     def alive(self):
         return bool(self.thread and self.thread.is_alive())
+
+def _evaluate_extended_numeric_preference(definition, parsed, runtime_context, event):
+    if not isinstance(parsed, dict) or not parsed.get("valid") or not finite_number(parsed.get("value")):
+        return event
+    current = safe_float(parsed.get("value"))
+    previous = event.get("previous_numeric_value")
+    delta = current - safe_float(previous) if finite_number(previous) else None
+    relation = str(definition.get("goal_relation", "keep_same"))
+    config = normalize_relation_config(definition.get("relation_config", {}))
+    tolerance = max(1e-6, abs(current) * 0.0005)
+    if relation == "keep_same":
+        event["status"] = "stable_preferred"
+        if delta is not None:
+            event["progress"] = 0.25 if abs(delta) <= tolerance else -min(1.0, abs(delta) / max(1.0, abs(current)))
+    elif relation in {"increase_more_better", "increase_less_better", "decrease_more_better", "decrease_less_better"}:
+        event["status"] = relation
+        if delta is not None:
+            magnitude = min(1.0, abs(delta) / max(1.0, abs(safe_float(previous))))
+            if relation == "increase_more_better":
+                event["progress"] = magnitude if delta > tolerance else -magnitude if delta < -tolerance else 0.0
+            elif relation == "increase_less_better":
+                event["progress"] = (
+                    1.0 / (1.0 + magnitude * 10.0)
+                    if delta > tolerance
+                    else -1.0 if delta < -tolerance else 0.0
+                )
+            elif relation == "decrease_more_better":
+                event["progress"] = magnitude if delta < -tolerance else -magnitude if delta > tolerance else 0.0
+            else:
+                event["progress"] = (
+                    1.0 / (1.0 + magnitude * 10.0)
+                    if delta < -tolerance
+                    else -1.0 if delta > tolerance else 0.0
+                )
+    elif relation in NUMERIC_COMPARISON_RELATIONS:
+        region_values = runtime_context.get("region_values", {}) if isinstance(runtime_context, dict) else {}
+        target_id = str(config.get("compare_region_id", ""))
+        other = region_values.get(target_id)
+        if finite_number(other):
+            other_value = safe_float(other)
+            close = abs(current - other_value) <= max(1e-6, max(abs(current), abs(other_value), 1.0) * 0.001)
+            satisfied = (
+                current > other_value
+                if relation == "greater_than_region"
+                else current < other_value
+                if relation == "less_than_region"
+                else close
+            )
+            event["status"] = "comparison_satisfied" if satisfied else "comparison_unsatisfied"
+            event["progress"] = 1.0 if satisfied else -1.0
+            event["comparison_region_id"] = target_id
+            event["comparison_value"] = other_value
+        else:
+            event["status"] = "comparison_target_unreadable"
+            event["progress"] = 0.0
+    return event
+
+
+_ORIGINAL_OCR_SEMANTIC_EVALUATE = OCRSemanticEngine.evaluate
+
+
+def _extended_ocr_semantic_evaluate(self, definition, parsed, runtime_context=None):
+    context = dict(runtime_context) if isinstance(runtime_context, dict) else {}
+    event = _ORIGINAL_OCR_SEMANTIC_EVALUATE(self, definition, parsed, context)
+    return _evaluate_extended_numeric_preference(definition, parsed, context, event)
+
+
+OCRSemanticEngine.evaluate = _extended_ocr_semantic_evaluate
+
+
+def _adaptive_ocr_monitor_run(self):
+    try:
+        game = self.app.require_game()
+        definitions = [dict(item) for item in self.app.store.list_ocr_regions(game["id"], True)]
+        if not definitions:
+            return
+        states = {}
+        for item in definitions:
+            region_id = str(item["id"])
+            norm = _clamp_region_norm(item.get("region_norm"))
+            templates = _decode_tracking_templates(item)
+            states[region_id] = {
+                "norm": norm,
+                "templates": templates,
+                "template": templates[0] if templates else b"",
+                "lost": 0,
+                "pending_norm": None,
+                "pending_count": 0,
+                "high_confidence_frames": 0,
+                "stable_tracking_frames": 0,
+                "persisted_norm": list(norm),
+                "last_persisted": 0.0,
+            }
+        while not self.stop_event.is_set() and not self.app.should_stop():
+            frame = self.frame_buffer.latest(None, 1.0)
+            if frame is None or frame.get("time") == self.last_stamp or not frame.get("capture_valid"):
+                self.stop_event.wait(0.12)
+                continue
+            self.last_stamp = frame.get("time")
+            observations = {}
+            for definition in definitions:
+                if self.stop_event.is_set() or self.app.should_stop():
+                    break
+                region_id = str(definition["id"])
+                state = states[region_id]
+                ranked = _adaptive_region_candidates(frame, definition, state)
+                best_payload = None
+                best_quality = -10.0
+                for rank, (distance, candidate_norm, descriptor) in enumerate(ranked[:8]):
+                    try:
+                        recognized = self.app.ocr_runtime.recognize_region(frame, candidate_norm)
+                    except RECOVERABLE_ERRORS as error:
+                        if rank == 0:
+                            self.app.store.log_error(
+                                "OCR_TRACKING_RECOGNITION_FAILED",
+                                error,
+                                mode=self.app.mode,
+                                game_id=game["id"],
+                            )
+                        continue
+                    parsed = (
+                        parse_ocr_number(recognized.get("text"), definition.get("number_format", "auto"))
+                        if definition.get("region_type") == "number"
+                        else {"valid": False}
+                    )
+                    confidence = safe_float(recognized.get("confidence", 0.0), 0.0, 0.0, 1.0)
+                    quality = (
+                        confidence
+                        + (0.72 if parsed.get("valid") else 0.0)
+                        - min(1.2, distance) * 0.42
+                        - rank * 0.018
+                    )
+                    if best_payload is None or quality > best_quality:
+                        best_quality = quality
+                        best_payload = (recognized, parsed, candidate_norm, descriptor, distance)
+                    if parsed.get("valid") and confidence >= 0.72 and distance <= 0.72:
+                        break
+                if best_payload is None:
+                    state["lost"] = min(1000, state.get("lost", 0) + 1)
+                    state["pending_norm"] = None
+                    state["pending_count"] = 0
+                    state["high_confidence_frames"] = 0
+                    state["stable_tracking_frames"] = 0
+                    continue
+                recognized, parsed, candidate_norm, descriptor, distance = best_payload
+                consensus = self.consensus.update(
+                    region_id,
+                    recognized.get("text", ""),
+                    parsed.get("value") if isinstance(parsed, dict) else None,
+                    recognized.get("confidence", 0.0),
+                )
+                if parsed.get("valid") and finite_number(consensus.get("value")):
+                    parsed = dict(parsed)
+                    parsed["value"] = safe_float(consensus.get("value"))
+                    parsed["confidence"] = max(
+                        safe_float(parsed.get("confidence", 0.0), 0.0),
+                        safe_float(consensus.get("confidence", 0.0), 0.0),
+                    )
+                    parsed["consensus_text"] = str(consensus.get("text", ""))
+                    parsed["stable_frames"] = safe_int(consensus.get("stable_frames"), 0)
+                    parsed["temporal_disagreement"] = bool(consensus.get("conflict"))
+                consensus_confidence = safe_float(consensus.get("confidence"), 0.0, 0.0, 1.0)
+                confident = bool(parsed.get("valid") and consensus_confidence >= 0.34 and distance <= 1.08)
+                if confident:
+                    pending = state.get("pending_norm")
+                    if pending is not None and _rect_iou(pending, candidate_norm) >= 0.58:
+                        state["pending_count"] = min(1000, state.get("pending_count", 0) + 1)
+                        state["pending_norm"] = _clamp_region_norm(
+                            [
+                                pending[index] * 0.62 + candidate_norm[index] * 0.38
+                                for index in range(4)
+                            ]
+                        )
+                    else:
+                        state["pending_norm"] = _clamp_region_norm(candidate_norm)
+                        state["pending_count"] = 1
+                    state["high_confidence_frames"] = (
+                        min(1000, state.get("high_confidence_frames", 0) + 1)
+                        if consensus_confidence >= 0.58
+                        else 0
+                    )
+                    if state["pending_count"] >= NUMERIC_TRACKING_CONFIRM_FRAMES:
+                        committed = _clamp_region_norm(state["pending_norm"])
+                        previous = list(state["norm"])
+                        state["norm"] = committed
+                        definition["region_norm"] = list(committed)
+                        state["lost"] = 0
+                        state["stable_tracking_frames"] = (
+                            min(10000, state.get("stable_tracking_frames", 0) + 1)
+                            if _rect_iou(previous, committed) >= 0.88
+                            else 1
+                        )
+                    if (
+                        descriptor
+                        and state["high_confidence_frames"] >= NUMERIC_TRACKING_TEMPLATE_UPDATE_FRAMES
+                        and consensus_confidence >= 0.64
+                    ):
+                        templates = list(state.get("templates", []))
+                        nearest = min(
+                            (_descriptor_distance(template, descriptor) for template in templates),
+                            default=2.0,
+                        )
+                        if nearest >= 0.035:
+                            templates.insert(0, bytes(descriptor))
+                        elif templates:
+                            closest_index = min(
+                                range(len(templates)),
+                                key=lambda index: _descriptor_distance(templates[index], descriptor),
+                            )
+                            old = templates[closest_index]
+                            templates[closest_index] = bytes(
+                                int(old_value * 0.86 + new_value * 0.14)
+                                for old_value, new_value in zip(old, descriptor)
+                            )
+                        else:
+                            templates = [bytes(descriptor)]
+                        state["templates"] = templates[:NUMERIC_TRACKING_HISTORY_LIMIT]
+                        state["template"] = state["templates"][0]
+                        config = normalize_relation_config(definition.get("relation_config", {}))
+                        encoded = [_encode_tracking_template(value) for value in state["templates"] if value]
+                        config["tracking_templates"] = encoded
+                        config["tracking_template"] = encoded[0] if encoded else ""
+                        definition["relation_config"] = config
+                        state["high_confidence_frames"] = 0
+                    config = normalize_relation_config(definition.get("relation_config", {}))
+                    should_persist = bool(config.get("tracking_persist_stable", False))
+                    moved = _rect_iou(state.get("persisted_norm", state["norm"]), state["norm"]) < 0.88
+                    now = time.monotonic()
+                    if (
+                        should_persist
+                        and moved
+                        and state.get("stable_tracking_frames", 0) >= NUMERIC_TRACKING_PERSIST_FRAMES
+                        and now - state.get("last_persisted", 0.0) >= 30.0
+                    ):
+                        persisted = dict(definition)
+                        persisted["region_norm"] = list(state["norm"])
+                        self.app.store.save_ocr_region(game["id"], persisted)
+                        state["persisted_norm"] = list(state["norm"])
+                        state["last_persisted"] = now
+                else:
+                    state["lost"] = min(1000, state.get("lost", 0) + 1)
+                    state["pending_norm"] = None
+                    state["pending_count"] = 0
+                    state["high_confidence_frames"] = 0
+                    state["stable_tracking_frames"] = 0
+                observations[region_id] = {
+                    "definition": definition,
+                    "recognized": recognized,
+                    "parsed": parsed,
+                    "consensus": consensus,
+                    "tracked_norm": list(state["norm"]),
+                    "candidate_norm": list(candidate_norm),
+                    "candidate_confirm_frames": state.get("pending_count", 0),
+                    "lost_frames": state["lost"],
+                    "tracking_distance": distance,
+                }
+            region_values = {
+                region_id: item["parsed"].get("value")
+                for region_id, item in observations.items()
+                if isinstance(item.get("parsed"), dict)
+                and item["parsed"].get("valid")
+                and finite_number(item["parsed"].get("value"))
+            }
+            for region_id, item in observations.items():
+                definition = item["definition"]
+                parsed = item["parsed"]
+                consensus = item["consensus"]
+                runtime_context = {
+                    "task_phase": str(frame.get("task_phase", "unknown")),
+                    "subgoal_id": str(frame.get("subgoal_id", "")),
+                    "terminal_state": str(frame.get("terminal_state", "")),
+                    "recent_actions": list(frame.get("recent_actions", []))[-8:],
+                    "region_values": region_values,
+                    "tracked_norm": item["tracked_norm"],
+                    "candidate_norm": item["candidate_norm"],
+                    "candidate_confirm_frames": item["candidate_confirm_frames"],
+                    "lost_frames": item["lost_frames"],
+                    "tracking_distance": item["tracking_distance"],
+                }
+                event = (
+                    OCR_SEMANTIC_ENGINE.evaluate(definition, parsed, runtime_context)
+                    if definition.get("region_type") == "number"
+                    else {
+                        "terminal": "",
+                        "progress": 0.0,
+                        "status": "text_only",
+                        "reset": "",
+                        "semantic_version": OCR_SEMANTIC_VERSION,
+                    }
+                )
+                event["ocr_temporal_disagreement"] = bool(consensus.get("conflict"))
+                event["stable_frames"] = safe_int(consensus.get("stable_frames"), 0)
+                event["tracked_region_norm"] = item["tracked_norm"]
+                event["tracking_candidate_norm"] = item["candidate_norm"]
+                event["tracking_candidate_confirm_frames"] = item["candidate_confirm_frames"]
+                event["tracking_lost_frames"] = item["lost_frames"]
+                event["tracking_template_distance"] = item["tracking_distance"]
+                SEMANTIC_EVENT_HUB.publish(game["id"], region_id, event)
+                now = time.monotonic()
+                if now - self.last_saved[region_id] >= 0.8:
+                    self.last_saved[region_id] = now
+                    self.app.store.append_ocr_observation(
+                        game["id"],
+                        region_id,
+                        item["recognized"].get("text", ""),
+                        parsed,
+                        consensus.get("confidence", item["recognized"].get("confidence", 0.0)),
+                        consensus.get("stable_frames", 0),
+                        event,
+                    )
+            self.stop_event.wait(0.18 if self.purpose == "training" else 0.3)
+    finally:
+        if self.app.store is not None:
+            self.app.store.close_current_thread()
+
+
+OCRMonitor._run = _adaptive_ocr_monitor_run
 
 
 class ScreenNumericKeypad:
@@ -50631,7 +52428,17 @@ def replay_contract_suite():
         "required_fields": fields_present,
         "unsafe_false_release_detected": unsafe_detected,
         "action_type_diversity": action_diversity,
-        "unsafe_probe": unsafe_result,
+        "unsafe_probe": {
+            "observed": bool(unsafe_result.get("passed")),
+            "expected": False,
+            "assertion_passed": unsafe_detected,
+            "details": {
+                "dangerous_action_false_release_count": safe_int(
+                    unsafe_result.get("dangerous_action_false_release_count"), 0
+                ),
+                "checksum_valid": bool(unsafe_result.get("checksum_valid")),
+            },
+        },
     }
 
 
@@ -52361,6 +54168,215 @@ def _strict_portfolio_build(cls, experiences, limit=MAX_TRAINING_SAMPLES):
 ExperienceReplayPortfolio.build = _strict_portfolio_build
 
 
+def storage_transaction_contract_suite():
+    details = {}
+    passed = False
+    with tempfile.TemporaryDirectory(prefix="ugai-storage-contract-") as folder:
+        base = Path(folder)
+        store = DataStore(base)
+        try:
+            first = {
+                "id": "contract-delete-game-0001",
+                "name": "Delete",
+                "created": 1.0,
+                "needs_review": False,
+                "last_review": None,
+            }
+            second = {
+                "id": "contract-keep-game-00002",
+                "name": "Keep",
+                "created": 2.0,
+                "needs_review": False,
+                "last_review": None,
+            }
+            store.replace_games([first, second], first["id"])
+            shared_relative = Path("models/tensors/shared-contract.safetensors")
+            unique_relative = Path("models/tensors/unique-contract.safetensors")
+            for relative in (shared_relative, unique_relative):
+                path = base / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(relative.as_posix().encode("utf-8"))
+
+            def model_payload(game_id, tensor_path):
+                raw = json.dumps(
+                    {
+                        "game_id": game_id,
+                        "tensor_bundle": {"relative_path": tensor_path.as_posix()},
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                return zlib.compress(raw, 9)
+
+            rows = (
+                (first["id"], "complete", unique_relative),
+                (first["id"], "partial", shared_relative),
+                (second["id"], "complete", shared_relative),
+            )
+            for game_id, slot, tensor_path in rows:
+                payload = model_payload(game_id, tensor_path)
+                store.db.execute(
+                    "INSERT INTO models("
+                    "game_id,slot,saved,created,prototype_count,validation,payload,checksum"
+                    ") VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        game_id,
+                        slot,
+                        1.0,
+                        1.0,
+                        0,
+                        "{}",
+                        payload,
+                        hashlib.sha256(payload).hexdigest(),
+                    ),
+                )
+            store.db.commit()
+            digest = hashlib.sha256(first["id"].encode("utf-8")).hexdigest()
+            replay = base / "replays" / digest[:24] / "bundle.json.z"
+            replay.parent.mkdir(parents=True, exist_ok=True)
+            replay.write_bytes(b"bundle")
+            deletion = store.replace_games([second], second["id"])
+            shared_tensor_retained = (base / shared_relative).exists()
+            deletion_passed = bool(
+                first["id"] in deletion.get("deleted_games", [])
+                and not (base / unique_relative).exists()
+                and shared_tensor_retained
+                and not replay.exists()
+                and store.selected_game()["id"] == second["id"]
+            )
+            rollback_game = {
+                "id": "contract-rollback-game-3",
+                "name": "Rollback",
+                "created": 3.0,
+                "needs_review": False,
+                "last_review": None,
+            }
+            store.replace_games([second, rollback_game], rollback_game["id"])
+            rollback_digest = hashlib.sha256(
+                rollback_game["id"].encode("utf-8")
+            ).hexdigest()
+            rollback_asset = base / "replays" / rollback_digest[:24] / "bundle.json.z"
+            rollback_asset.parent.mkdir(parents=True, exist_ok=True)
+            rollback_asset.write_bytes(b"rollback")
+            store.db.execute(
+                "CREATE TRIGGER contract_fail_game_delete BEFORE DELETE ON games "
+                "WHEN OLD.id='contract-rollback-game-3' "
+                "BEGIN SELECT RAISE(ABORT,'forced'); END"
+            )
+            store.db.commit()
+            rollback_failed = False
+            try:
+                store.replace_games([second], second["id"])
+            except sqlite3.Error:
+                rollback_failed = True
+            store.db.execute("DROP TRIGGER contract_fail_game_delete")
+            store.db.commit()
+            rollback_passed = bool(
+                rollback_failed
+                and rollback_asset.exists()
+                and any(
+                    item["id"] == rollback_game["id"]
+                    for item in store.games()
+                )
+            )
+            regions = [
+                {
+                    "id": "region-a",
+                    "region_norm": [0.1, 0.1, 0.2, 0.1],
+                    "goal_relation": "higher_better",
+                    "relation_config": {"preference": "higher_better"},
+                },
+                {
+                    "id": "region-b",
+                    "region_norm": [0.5, 0.1, 0.2, 0.1],
+                    "goal_relation": "greater_than_region",
+                    "relation_config": {
+                        "preference": "greater_than_region",
+                        "compare_region_id": "region-a",
+                    },
+                },
+            ]
+            store.replace_ocr_regions(rollback_game["id"], regions)
+            store.db.execute(
+                "CREATE TRIGGER contract_fail_ocr_insert BEFORE INSERT ON ocr_regions "
+                "WHEN NEW.id='region-fail' BEGIN SELECT RAISE(ABORT,'forced'); END"
+            )
+            store.db.commit()
+            ocr_failed = False
+            try:
+                store.replace_ocr_regions(
+                    rollback_game["id"],
+                    [
+                        {
+                            "id": "region-ok",
+                            "region_norm": [0.2, 0.2, 0.2, 0.1],
+                            "goal_relation": "keep_same",
+                            "relation_config": {},
+                        },
+                        {
+                            "id": "region-fail",
+                            "region_norm": [0.5, 0.2, 0.2, 0.1],
+                            "goal_relation": "keep_same",
+                            "relation_config": {},
+                        },
+                    ],
+                )
+            except sqlite3.Error:
+                ocr_failed = True
+            store.db.execute("DROP TRIGGER contract_fail_ocr_insert")
+            store.db.commit()
+            remaining_regions = sorted(
+                item["id"]
+                for item in store.list_ocr_regions(rollback_game["id"], False)
+            )
+            ocr_passed = bool(
+                ocr_failed
+                and remaining_regions == ["region-a", "region-b"]
+            )
+            delete_all = store.replace_games([], None)
+            nullable_passed = bool(
+                not store.games()
+                and store.selected_game() is None
+                and delete_all.get("selected_game") is None
+            )
+            passed = bool(
+                deletion_passed
+                and rollback_passed
+                and ocr_passed
+                and nullable_passed
+            )
+            details = {
+                "two_phase_delete": {
+                    "observed": deletion_passed,
+                    "expected": True,
+                    "assertion_passed": deletion_passed,
+                    "deleted_asset_count": safe_int(
+                        deletion.get("deleted_asset_count"), 0
+                    ),
+                    "shared_tensor_retained": shared_tensor_retained,
+                },
+                "delete_rollback": {
+                    "observed": rollback_failed,
+                    "expected": True,
+                    "assertion_passed": rollback_passed,
+                },
+                "ocr_replace_rollback": {
+                    "observed": ocr_failed,
+                    "expected": True,
+                    "assertion_passed": ocr_passed,
+                    "remaining_regions": remaining_regions,
+                },
+                "nullable_selected_game": {
+                    "observed": store.selected_game(),
+                    "expected": None,
+                    "assertion_passed": nullable_passed,
+                },
+            }
+        finally:
+            store.close(5.0)
+    details["assertion_passed"] = passed
+    return passed, details
+
+
 _ORIGINAL_LOGIC_SUITE_STRICT = logic_contract_suite
 def logic_contract_suite():
     passed, checks = _ORIGINAL_LOGIC_SUITE_STRICT()
@@ -52482,6 +54498,10 @@ def logic_contract_suite():
             "protocol": AI_WORKER_PROTOCOL_VERSION,
         },
     )
+    tracking_passed, tracking_evidence = numeric_tracking_reacquisition_contract()
+    record("numeric_region_hard_reacquisition", tracking_passed, tracking_evidence)
+    storage_passed, storage_evidence = storage_transaction_contract_suite()
+    record("transactional_game_and_ocr_storage", storage_passed, storage_evidence)
     return all(item["passed"] for item in checks.values()), checks
 
 
